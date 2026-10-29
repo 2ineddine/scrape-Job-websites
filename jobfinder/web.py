@@ -1,0 +1,241 @@
+"""web.py - text helpers, URL import, SSRF protection and the polite HTTP fetcher."""
+from __future__ import annotations
+
+import ipaddress
+import re
+import socket
+import time
+import unicodedata
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+import warnings
+
+import requests
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# --------------------------------------------------------------------------- text helpers
+def norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "")
+    return "".join(c for c in s if not unicodedata.combining(c)).lower().replace("\u2019", "'").strip()
+
+
+def _wb(word: str, text: str) -> bool:
+    return bool(word) and re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", text) is not None
+
+
+def html_to_text(html: str) -> str:
+    return re.sub(r"\s+", " ", BeautifulSoup(html or "", "html.parser").get_text(" ")).strip()
+
+
+# --------------------------------------------------------------------------- URL import / SSRF
+def normalize_url(url: str) -> str:
+    p = urlparse(url.strip())
+    host = (p.hostname or "").lower()
+    try:
+        port = p.port
+    except ValueError:
+        port = None
+    netloc = host if port in (None, 80, 443) else f"{host}:{port}"
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+         if not k.lower().startswith("utm_") and k.lower() not in ("gclid", "fbclid")]
+    path = re.sub(r"/{2,}", "/", p.path or "/")
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return urlunparse((p.scheme.lower(), netloc, path, "", urlencode(q), ""))
+
+
+def syntactic_ok(url: str) -> bool:
+    """Offline URL screening (no DNS): http(s) only, no localhost / private IP literals."""
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        if p.scheme not in ("http", "https") or not host or p.username or p.password:
+            return False
+        if host == "localhost" or host.endswith((".localhost", ".internal", ".local")):
+            return False
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return "." in host
+    except ValueError:
+        return False
+
+
+def check_url(url: str):
+    """Full SSRF check including DNS resolution. Returns (ok, reason)."""
+    if not syntactic_ok(url):
+        return False, "blocked scheme/host"
+    p = urlparse(url)
+    try:
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False, "dns resolution failed"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global or ip.is_multicast:
+            return False, f"resolves to non-public address {ip}"
+    return True, ""
+
+
+def _unescape(s: str) -> str:
+    s = s.replace("\\/", "/")
+    s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    s = s.replace("\\x26", "&").replace("&amp;", "&")
+    return s.replace("\\", "").rstrip(".,;)")
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract http(s) URLs from JS arrays / quoted strings / hrefs. Never executes JavaScript."""
+    found = []
+    for m in re.finditer(r"""["'`](https?:\\?/\\?/[^"'`\s<>]+)["'`]""", text or "", re.I):
+        found.append(_unescape(m.group(1)))
+    try:
+        for a in BeautifulSoup(text or "", "html.parser").find_all("a", href=True):
+            if a["href"].lower().startswith(("http://", "https://")):
+                found.append(a["href"].strip())
+    except Exception:  # malformed markup must never crash the import
+        pass
+    seen, out = set(), []
+    for u in found:
+        if not syntactic_ok(u):
+            continue
+        n = normalize_url(u)
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+# --------------------------------------------------------------------------- fetcher
+class AccessError(Exception):
+    pass
+
+
+BOT = "JobSearchAssistant"  # the name robots.txt rules are checked against
+# A browser-compatible User-Agent: many career sites serve an empty page to unknown clients. The bot name stays in it.
+UA = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 {BOT}/2.0"
+_ANTIBOT = re.compile(r"cf-challenge|are you a robot|verify you are human|checking your browser|perfdrive|captcha-delivery", re.I)
+
+
+class Robots:
+    """robots.txt as RFC 9309 reads it: the group for our bot name (else '*'), the LONGEST matching rule wins, Allow wins
+    a tie, '*' and '$' wildcards. (urllib.robotparser takes the first rule: 'Disallow: /' then 'Allow: /careers' would
+    wrongly refuse /careers.)"""
+
+    def __init__(self, text=""):
+        groups, agents, in_rules = {}, [], False  # two groups for the same agent are merged
+        self.sitemaps = re.findall(r"(?im)^\s*sitemap:\s*(\S+)", text)
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            k, v = (x.strip() for x in line.split(":", 1))
+            k = k.lower()
+            if k == "user-agent":
+                if in_rules:
+                    agents, in_rules = [], False
+                agents.append(v.lower())
+                groups.setdefault(v.lower(), [])
+            elif k in ("allow", "disallow") and agents:
+                in_rules = True
+                for a in agents:
+                    if v:
+                        groups[a].append((k == "allow", v))
+        bot = BOT.lower()
+        self.rules = next((r for a, r in groups.items() if a != "*" and a in bot), groups.get("*", []))
+
+    @staticmethod
+    def _match(pattern, path):
+        rx = re.escape(pattern).replace(r"\*", ".*")
+        rx = rx[:-2] + "$" if rx.endswith(r"\$") else rx
+        return re.match(rx, path) is not None
+
+    def allowed(self, url) -> bool:
+        p = urlparse(url)
+        path = (p.path or "/") + (f"?{p.query}" if p.query else "")
+        best = (-1, True)
+        for allow, pat in self.rules:
+            if self._match(pat, path) and (len(pat), allow) > best:
+                best = (len(pat), allow)
+        return best[1]
+
+
+class Fetcher:
+    def __init__(self, cfg, note=None):
+        self.cfg, self.note = cfg, note or (lambda m: None)
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
+        self.last, self.robots = {}, {}
+
+    def _wait(self, host):
+        gap = self.cfg["delay"] - (time.time() - self.last.get(host, 0))
+        if gap > 0:
+            time.sleep(gap)
+        self.last[host] = time.time()
+
+    def robots_ok(self, url) -> bool:
+        if not self.cfg["respect_robots"]:
+            return True
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}"
+        if origin not in self.robots:
+            try:
+                r = self.request("GET", origin + "/robots.txt", _robots=True)
+                self.robots[origin] = Robots(r.text if r.status_code == 200 else "")
+            except Exception:
+                self.robots[origin] = Robots()
+        return self.robots[origin].allowed(url)
+
+    def sitemaps(self, url) -> list:
+        """The sitemaps a website declares in its robots.txt (else /sitemap.xml)."""
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}"
+        self.robots_ok(origin + "/")
+        return self.robots[origin].sitemaps if origin in self.robots and self.robots[origin].sitemaps else [origin + "/sitemap.xml"]
+
+    def get(self, url, **kw) -> requests.Response:
+        return self.request("GET", url, **kw)
+
+    def post_json(self, url, payload) -> requests.Response:
+        return self.request("POST", url, json=payload, headers={"Accept": "application/json"})
+
+    def request(self, method, url, _robots=False, **kw) -> requests.Response:
+        if not _robots and not self.robots_ok(url):
+            raise AccessError("access_restricted: disallowed by robots.txt")
+        for attempt in range(self.cfg["retries"] + 1):
+            cur = url
+            try:
+                for _ in range(6):  # manual redirects, each hop re-validated (SSRF)
+                    ok, why = check_url(cur)
+                    if not ok:
+                        raise AccessError(f"access_restricted: {why}")
+                    self._wait(urlparse(cur).hostname)
+                    r = self.s.request(method, cur, timeout=self.cfg["timeout"], allow_redirects=False, **kw)
+                    if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                        cur, method = urljoin(cur, r.headers["Location"]), ("GET" if r.status_code == 303 else method)
+                        continue
+                    break
+                else:
+                    raise AccessError("too many redirects")
+                # an anti-bot page is small; a normal page that merely loads a captcha script for its forms is not one
+                challenge = r.status_code == 200 and len(r.text) < 30000 and _ANTIBOT.search(r.text[:30000])
+                if r.status_code in (401, 403) or challenge:
+                    raise AccessError(f"access_restricted: HTTP {r.status_code} / anti-bot page - inspect manually")
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < self.cfg["retries"]:
+                    time.sleep(min(2 ** attempt * 2, 20))
+                    continue
+                if r.status_code >= 400:
+                    raise ConnectionError(f"HTTP {r.status_code}")
+                if "charset" not in (r.headers.get("content-type") or "").lower() and r.encoding in (None, "ISO-8859-1"):
+                    r.encoding = r.apparent_encoding or "utf-8"  # no charset sent: guess from the bytes, not latin-1
+                return r
+            except requests.exceptions.SSLError as e:
+                raise ConnectionError("source_unreachable: invalid HTTPS certificate on the website") from e
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt >= self.cfg["retries"]:
+                    raise ConnectionError(f"source_unreachable: {type(e).__name__}") from e
+                time.sleep(min(2 ** attempt * 2, 20))
+        raise ConnectionError("source_unreachable")

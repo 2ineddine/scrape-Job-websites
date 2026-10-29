@@ -1,0 +1,5 @@
+api_keys.txt
+data/
+.venv/
+__pycache__/
+.pytest_cache/

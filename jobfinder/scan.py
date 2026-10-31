@@ -166,6 +166,8 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         pages, found, status, err, stale = 0, 0, "completed", "", 0
         stale_max = int(cfg.get("stale_pages", 2))
         prog.say(f"START {label}")
+        t_site = time.time()
+        st.deadline = t_site + cfg.get("max_site_duration", 1200)  # also stops job-page opening inside a list page
         try:
             for pg in crawl_source(fetcher, src.url, cfg, known, st):
                 pages += 1
@@ -212,6 +214,9 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                     break
                 if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
                     status = "partially_completed"
+                    break
+                if time.time() - t_site > cfg.get("max_site_duration", 1200):  # one website never holds a whole run
+                    status, err = "partially_completed", "time limit for this website reached"
                     break
         except AccessError as e:
             status, err = "blocked", str(e)

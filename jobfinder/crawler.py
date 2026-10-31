@@ -8,34 +8,61 @@ Order for every website (crawl_source):
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from datetime import timedelta
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from .adapters import (ADAPTERS, Page, _Budget, _open_detail, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
+from .adapters import (ADAPTERS, NOT_JOB, Page, _Budget, _open_detail, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
                        detect_one_hop, embedded_jobs, guess_board, jobs_from_json, worth_opening)
-from .classify import is_boilerplate_title
+from .classify import classify_location, is_boilerplate_title
 from .sitefilters import filtered_url
 from .dates import _UPDATE_WORDS, _dayfirst, parse_date, text_publication_date
 from .config import utcnow
-from .web import UA, AccessError, check_url, norm, normalize_url, syntactic_ok
+from .urlclean import is_job_board
+from .web import PARSER, UA, AccessError, check_url, norm, normalize_url, syntactic_ok
 
 _ATS_HOSTS = ("greenhouse", "lever.co", "ashby", "smartrecruiters", "myworkdayjobs", "breezy.hr", "recruitee", "teamtailor",
               "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters")
 
 
-def _job_links(soup, base, exclude):
+_GENDER = re.compile(r"[(\[]?\b(?:h\s*/\s*f|f\s*/\s*h|m\s*/\s*f|f\s*/\s*m|h\s*/\s*f\s*/\s*[xn]|f\s*/\s*h\s*/\s*[xn]|"
+                     r"m\s*/\s*w\s*/\s*d|w\s*/\s*m\s*/\s*d|all genders)\b[)\]]?", re.I)
+_CONTRACT = re.compile(r"\b(?:cdi|cdd|stage|stagiaire|internship|intern|alternance|apprenti\w*|th[eè]se|phd|post-?doc\w*|"
+                       r"vie|freelance)\b", re.I)
+
+
+def _looks_like_job_title(text) -> bool:
+    """'Ingénieur DevOps Réseau Cloud (F/H)', 'Stage - Data Scientist 6 mois': an offer, whatever its URL
+    ('/node/23383'). A gender mark is enough; a contract word only in a title-length text (not the menu 'Stages')."""
+    if not 8 <= len(text) <= 160:
+        return False
+    return bool(_GENDER.search(text)) or (len(text) >= 20 and bool(_CONTRACT.search(text)))
+
+
+_PLACEHOLDER = re.compile(r"@@|\{\{|\}\}|\$\{|%7B%7B|%24%7B|/:[a-z]\w*(?:/|$)|\[[a-z]\w*\]", re.I)
+
+
+def _job_links(soup, base, exclude, by_text=True):
     host = urlparse(base).hostname
     out = []
+    site = ".".join((host or "").split(".")[-2:])
     for a in soup.find_all("a", href=True):
+        if _PLACEHOLDER.search(a["href"]):
+            continue  # a template link ('/offers/@@LINK@@', '/job/{{id}}'): the real links come with JavaScript
         u = urljoin(base, a["href"])
         pu = urlparse(u)
+        if "//" in pu.path:  # '/fr/jobs//ingenieur-ia': same page as '/fr/jobs/ingenieur-ia'
+            pu = pu._replace(path=re.sub(r"/{2,}", "/", pu.path))
+            u = urlunparse(pu)
         ats = any(x in (pu.hostname or "") for x in _ATS_HOSTS)
-        jobish = is_job_path(pu.path) or (ats and re.search(r"\d{5,}|[0-9a-f]{8}-[0-9a-f]{4}", pu.path))
+        text = a.get_text(" ", strip=True)
+        jobish = (is_job_path(pu.path) or (ats and re.search(r"\d{5,}|[0-9a-f]{8}-[0-9a-f]{4}", pu.path))
+                  or (by_text and len(pu.path) > 2 and not NOT_JOB.search(pu.path) and _looks_like_job_title(text)))
         if pu.scheme in ("http", "https") and jobish and normalize_url(u) not in exclude:
-            if pu.hostname == host or ats:
+            if pu.hostname == host or ats or (pu.hostname or "").endswith("." + site) or pu.hostname == site:
                 nu = normalize_url(u)
                 if nu not in out and nu != normalize_url(base):
                     out.append(nu)
@@ -89,13 +116,25 @@ def render_js(f, url, cfg):
                 pg.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
+            try:  # a cookie banner often covers the list and its buttons
+                ok = pg.get_by_role("button", name=re.compile(r"^(tout accepter|accepter( tout| et fermer)?|j'accepte|"
+                                                              r"accept( all)?( cookies)?|allow all|i agree|ok)$", re.I))
+                if ok.count() and ok.first.is_visible():
+                    ok.first.click(timeout=3000)
+                    pg.wait_for_timeout(800)
+            except Exception:
+                pass
+            clicks = True
             for _ in range(8):
                 btn = pg.get_by_role("button", name=re.compile(r"load more|show more|voir plus|charger plus|afficher plus|"
-                                                               r"plus d'offres|more jobs", re.I))
-                if btn.count() and btn.first.is_visible():
-                    btn.first.click(timeout=4000)
-                else:
-                    pg.mouse.wheel(0, 4000)
+                                                               r"plus d'offres|more jobs|plus de r[ée]sultats", re.I))
+                try:
+                    if clicks and btn.count() and btn.first.is_visible():
+                        btn.first.click(timeout=4000)
+                    else:
+                        pg.mouse.wheel(0, 4000)
+                except Exception:
+                    clicks = False  # the button cannot be clicked (covered, disabled): scrolling only
                 pg.wait_for_timeout(700)
             html = pg.content()
             b.close()
@@ -149,18 +188,50 @@ def _card_dates(soup, base, now=None, dayfirst=None):
     return out
 
 
+def _card_location(soup, base, url, title=""):
+    """The place written on the job's card in the list ('CDI | Gard (30) | Bagnols Sur Cèze'), for job pages without one."""
+    for a in soup.find_all("a", href=True):
+        if normalize_url(urljoin(base, a["href"])) != url:
+            continue
+        box = a
+        for _ in range(3):
+            if box.parent is None or len(box.parent.get_text(" ", strip=True)) > 600:
+                break
+            box = box.parent
+        for part in box.get_text("|", strip=True).split("|"):
+            part = part.strip()
+            if part and part != title.strip() and len(part) <= 60 and classify_location(part)["location_verified"]:
+                return part
+        return ""
+    return ""
+
+
 def _card_title(soup, base, url):
     for a in soup.find_all("a", href=True):
         if normalize_url(urljoin(base, a["href"])) == url:
             # a whole card can be the link: its heading is the title, not 'Location : ... Job Category : Marketing'
             head = a.find(["h1", "h2", "h3", "h4", "h5"]) or a.find(class_=re.compile(r"title", re.I))
             t = (head or a).get_text(" ", strip=True)
+            box = a
+            for _ in range(4):  # 'Lire la suite' / 'Read more': the title is the heading of the card around the button
+                if not _CTA.fullmatch(t):
+                    break
+                box = box.parent
+                if box is None:
+                    return ""
+                h = box.find(["h1", "h2", "h3", "h4", "h5"]) or box.find(class_=re.compile(r"title", re.I))
+                t = h.get_text(" ", strip=True) if h else t
+            if _CTA.fullmatch(t):
+                return ""
             t = _CARD_LABELS.split(t, 1)[0].strip() or t
             if 3 <= len(t) <= 200:
                 return t
     return ""
 
 
+_CTA = re.compile(r"\s*(lire la suite|en savoir plus|voir (?:l'|l’)?offre|voir le poste|d[ée]couvrir(?: l'offre)?|postuler|"
+                  r"read more|learn more|see (?:the )?(?:job|offer)|view (?:job|offer|details)|apply(?: now)?|details?|"
+                  r"plus d'infos?|more)\s*[>›→]?\s*", re.I)
 _CARD_LABELS = re.compile(r"\s+(?:offer published|published on|posted on|date de publication|publi[ée]e? le|location\s*:|"
                           r"lieu\s*:|localisation\s*:|job category\s*:|cat[ée]gorie\s*:|contract type\s*:|type de contrat\s*:)",
                           re.I)
@@ -204,9 +275,26 @@ def _parent_list(url):
 _DATE_SORT = re.compile(r"[?&](?:sort|sortby|sort_by|order|orderby|tri)=(?:[^&]*date|[^&]*recent|[^&]*newest|[^&]*publi)", re.I)
 
 
+def _real_links(jobs, links):
+    """Page data often gives a bare slug or id ('Ingenieur-FPGA-F-H', 90901): the page's own link that contains it
+    ('/offers/90901/Ingenieur-FPGA-F-H') is the real address of the offer."""
+    have = set(links)
+    for j in jobs:
+        if normalize_url(j["url"]) in have:
+            continue
+        keys = [k for k in (urlparse(j["url"]).path.rstrip("/").rsplit("/", 1)[-1], str(j.get("platform_id") or ""))
+                if len(k) >= 4]
+        hit = next((lk for k in keys for lk in links if k in urlparse(lk).path.split("/")), None)
+        if hit:
+            if j.get("apply_url") == j["url"]:
+                j["apply_url"] = hit
+            j["url"] = hit
+    return jobs
+
+
 def crawl_generic(f, url, cfg, known, st):
     seen_pages, seen_links, page_url, n, details, guessed_next, rendered = set(), set(known), url, 0, 0, False, False
-    budget, filtered = _Budget(cfg, st), False
+    budget, filtered, retry = _Budget(cfg, st), False, False
     by_date = bool(_DATE_SORT.search(url))  # the URL already asks the website for its newest offers first
     while page_url:
         guessed, guessed_next = guessed_next, False
@@ -222,7 +310,7 @@ def crawl_generic(f, url, cfg, known, st):
             dead, err = False, None
             try:
                 r = f.get(page_url)
-                soup = BeautifulSoup(r.text, "html.parser")
+                soup = BeautifulSoup(r.text, PARSER)
                 dead = n == 1 and _error_page(soup)
             except ConnectionError as e:
                 if not (n == 1 and re.search(r"HTTP 40[49]|HTTP 410", str(e))):
@@ -242,7 +330,7 @@ def crawl_generic(f, url, cfg, known, st):
                 fu, used = filtered_url(soup, page_url, cfg)
                 if fu and normalize_url(fu) != key and f.robots_ok(fu):
                     try:
-                        s2 = BeautifulSoup(f.get(fu).text, "html.parser")
+                        s2 = BeautifulSoup(f.get(fu).text, PARSER)
                         if _job_links(s2, fu, set()) or _jsonld_jobs(s2, fu) or embedded_jobs(s2, fu):
                             f.note(f"website filters used: {', '.join(used)} ({fu[:100]})")
                             soup, page_url, key = s2, fu, normalize_url(fu)
@@ -254,15 +342,27 @@ def crawl_generic(f, url, cfg, known, st):
                         f.note(f"website filters not usable: {str(e)[:80]}")
             jobs = _jsonld_jobs(soup, page_url) or embedded_jobs(soup, page_url)
             links = _job_links(soup, page_url, set())
-            if not jobs and not links and n == 1 and not rendered:  # empty without JavaScript: render it once
+            if not jobs and (len(links) < 3 or retry) and n == 1 and not rendered:  # (nearly) empty without JavaScript
                 rendered = True
                 html2, net = render_js(f, page_url, cfg)
                 if html2:
-                    soup = BeautifulSoup(html2, "html.parser")
-                    jobs = _jsonld_jobs(soup, page_url) or embedded_jobs(soup, page_url) or net
-                    links = _job_links(soup, page_url, set())
-                    if jobs or links:
+                    soup2 = BeautifulSoup(html2, PARSER)
+                    jobs2 = _jsonld_jobs(soup2, page_url) or embedded_jobs(soup2, page_url) or net
+                    links2 = _job_links(soup2, page_url, set())
+                    if len(jobs2) + len(links2) > len(jobs) + len(links):  # keep the richer of the two pages
+                        soup, jobs, links = soup2, jobs2, links2
                         f.note(f"page rendered with JavaScript: {len(jobs)} jobs, {len(links)} job links")
+            if jobs and links:
+                jobs = _real_links(jobs, links)
+            if n == 1 and jobs and not is_job_board(url):  # offers published on a job platform: read there, with their exact dates
+                plats = [p for p in (detect_from_url(j.get("apply_url") or "") for j in jobs[:50]) if p and p[0] in ADAPTERS]
+                plat = plats[0] if plats else None
+                if plat and sum(str(p) == str(plat) for p in plats) * 2 < min(len(jobs), 50) and any(j.get("date") for j in jobs):
+                    plat = None  # only a few links there, and the page gives dates: the page is the source
+                if plat:
+                    f.note(f"the offers of this page are published on {plat[0]} ('{str(plat[1])[:40]}'): reading them there")
+                    st.redirect, st.held = plat, jobs
+                    return
             new_links = [u for u in links if u not in seen_links]
             seen_links.update(links)
             gate = cfg.get("_gate")
@@ -272,6 +372,9 @@ def crawl_generic(f, url, cfg, known, st):
             if not jobs:
                 older = False
                 for lk in new_links:
+                    if st.deadline and time.time() > st.deadline:
+                        st.details_capped = True  # this website's time is up
+                        break
                     if lk in known or details >= cfg["max_details_per_source"] or not f.robots_ok(lk):
                         continue
                     cd = cards.get(lk)
@@ -286,7 +389,9 @@ def crawl_generic(f, url, cfg, known, st):
                     try:
                         dhtml = f.get(lk).text
                         job = _parse_detail(dhtml, lk, card=cd)
-                        if job["provenance"] == "html-fallback" and len(_job_links(BeautifulSoup(dhtml, "html.parser"), lk, set())) >= 8:
+                        job["location"] = job["location"] or _card_location(soup, page_url, lk, job["title"])
+                        # a list page has many offer ADDRESSES ('similar offers' titles on a real offer do not count)
+                        if job["provenance"] == "html-fallback" and len(_job_links(BeautifulSoup(dhtml, PARSER), lk, set(), False)) >= 8:
                             continue  # the link opened another list ('Account Executive jobs', '170 jobs found'), not a job
                         jobs.append(job)
                     except AccessError:
@@ -296,6 +401,11 @@ def crawl_generic(f, url, cfg, known, st):
             jobs = [_open_detail(f, cfg, j, budget) if j["provenance"] == "network-json" and len(j["description"]) < 300
                     and normalize_url(j["url"]) not in known and "jbid=" not in j["url"] else j for j in jobs]
             jobs = _drop_listing_pages(jobs, soup)
+            if n == 1 and not jobs and not page_out and not rendered and not retry:
+                retry = True  # the links of the static page gave no offer (menus): read the page again, rendered
+                seen_pages.discard(key)
+                n = 0
+                continue
             yield Page(key, page_url, jobs, out=page_out, seen=page_seen, sorted=by_date)
             if not new_links and not jobs and n > 1:
                 return  # no new content: reliable end condition
@@ -303,6 +413,8 @@ def crawl_generic(f, url, cfg, known, st):
             if not nxt and re.search(r"[?&](page|p|pg|start|offset)=\d+", page_url) and (new_links or jobs):
                 nxt = re.sub(r"([?&](?:page|p|pg)=)(\d+)", lambda m: m[1] + str(int(m[2]) + 1), page_url)
                 guessed_next = nxt != page_url
+            if nxt and not urlparse(nxt).scheme.startswith("http") and not re.search(r"\(\s*'?[1-9]", nxt):
+                nxt = None  # 'javascript:;' / 'javascript:void(0)': no next page behind it
             if nxt and (not urlparse(nxt).scheme.startswith("http") or not f.robots_ok(nxt)):
                 st.more_pages = True  # 'javascript:pagination(2)' or a page robots.txt closes: the sitemap lists the rest
                 f.note(f"the next list page cannot be opened ({nxt[:60]}): the website's sitemap is read instead")
@@ -375,7 +487,7 @@ def crawl_sitemap(f, url, cfg, known, st):
             break
         if not worth_opening(cfg, {"title": _slug_title(u), "date": None}):
             continue
-        if details >= cfg["max_details_per_source"]:
+        if details >= cfg["max_details_per_source"] or (st.deadline and time.time() > st.deadline):
             st.details_capped = True
             break
         details += 1
@@ -405,6 +517,8 @@ def detect_platform(f, url):
     except Exception:
         return "generic", url  # the generic crawler reports the error itself
     found = detect_from_page(f, url, html)
+    if is_job_board(url):  # its page names the platforms of the employers it lists: only Talentsoft can be its own
+        return found if found and found[0] == "talentsoft" else ("generic", url)
     if not found:  # the job list page one link away names the platform (and every board: mirakl.com)
         hop = detect_one_hop(f, url, html)
         if hop:
@@ -452,6 +566,20 @@ def crawl_source(f, url, cfg, known, st):
             found += len(pg.jobs)
             got.update(normalize_url(j["url"]) for j in pg.jobs)
             yield pg
+        if st.redirect:
+            name, arg = st.redirect
+            st.platform = f"{name} (from the page's offers)"
+            try:
+                for pg in ADAPTERS[name](f, arg, cfg, known, st):
+                    found += len(pg.jobs)
+                    yield pg
+            except AccessError:
+                raise
+            except Exception as e:
+                f.note(f"{name} not readable ({str(e)[:100]}): the page's own offers are kept")
+            if not found:
+                found = len(st.held)
+                yield Page(url, url, st.held, ordered=False)
         if st.more_pages:
             for pg in crawl_sitemap(f, url, cfg, set(known) | got, st):
                 found += len(pg.jobs)

@@ -43,9 +43,9 @@ LIMITS = {
     "ai_site_filters": True, "site_filter_location": "France",
     "unknown_date_policy": "review",  # an offer without a publication date goes to 'To check'
     "include_remote_fr": True, "min_match": 0,
-    "delay": 1.0, "max_duration": 5400, "timeout": 25, "retries": 2, "respect_robots": True,
+    "delay": 1.0, "max_duration": 5400, "max_site_duration": 1200, "timeout": 25, "retries": 2, "respect_robots": True,
     "max_pages": 500, "max_details_per_source": 300, "stale_pages": 2, "parallel_sites": 4,
-    "max_ai_calls": 500, "max_ai_jobs_per_run": 150,
+    "max_ai_calls": 1200, "max_ai_jobs_per_run": 400,
     "thin_job_chars": 800, "job_text_chars": 9000, "ai_nav_max_steps": 150, "ai_filter_max_steps": 8,
 }
 

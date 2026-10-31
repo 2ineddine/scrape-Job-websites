@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ from .classify import analyze_title, classify_location, html_location, location_
 from .config import PROFILE_DEFAULT, utcnow
 from .dates import (NO_DATE, _content_text, _dayfirst, date_decision, html_date, merge_dates, parse_date, reconcile_date,
                     refine_raw_date)
-from .web import AccessError, html_to_text, norm, normalize_url, syntactic_ok
+from .web import PARSER, AccessError, html_to_text, norm, normalize_url, syntactic_ok
 
 
 # --------------------------------------------------------------------------- the common shapes
@@ -62,9 +63,12 @@ class Page:
 class ScanState:
     truncated: bool = False
     details_capped: bool = False  # the job-page budget ran out (the list itself was read to the end)
+    deadline: float = 0.0  # time.time() after which no more job page is opened for this website (0 = none)
     platform: str = ""
     out_known: set = field(default_factory=set)  # urls already known to be OUTSIDE the date range (never re-opened)
     stopped_by_date: bool = False
+    redirect: tuple | None = None  # (platform, argument): the page's offers live on this job platform, with their dates
+    held: list = field(default_factory=list)  # the page's own offers, kept in case that platform cannot be read
     more_pages: bool = False  # the list has more pages the crawler may not open (script links, robots.txt): use the sitemap
 
 
@@ -139,6 +143,9 @@ class _Budget:
         self.left, self.st = int(cfg["max_details_per_source"]), st
 
     def take(self) -> bool:
+        if self.st.deadline and time.time() > self.st.deadline:
+            self.st.details_capped = True  # this website's time is up: the offers keep their list data
+            return False
         if self.left <= 0:
             self.st.details_capped = True
             return False
@@ -212,14 +219,14 @@ _LOC = ("location", "locations", "locationtext", "locationstext", "primarylocati
         "addresscity", "state", "region", "regionvalue", "addressregion", "country", "countryname", "workplace", "address")
 _DATE = ("dateposted", "posteddate", "postedon", "postdate", "publisheddate", "publishedat", "publishdate", "publicationdate",
          "dateofpublication", "datepublished", "postingdate", "postingstartdate", "publicationstartdate", "pubdate", "onlinedate", "firstpublished",
-         "firstpublisheddate", "releasedate", "releaseddate", "searchabledate", "startdate", "createddate", "createdat",
+         "firstpublisheddate", "releasedate", "releaseddate", "searchabledate", "lastpublicationdate", "startdate", "createddate", "createdat",
          "datecreated", "created")
-_DATE_WEAK = {"createddate", "createdat", "datecreated", "created", "startdate"}  # record creation / start: often not the publication
+_DATE_WEAK = {"createddate", "createdat", "datecreated", "created", "startdate", "lastpublicationdate"}  # record creation / start: often not the publication
 _DESC = ("description", "jobdescription", "descriptionplain", "shortdescription", "summary", "content", "teaser",
          "descriptionteaser", "jobsummary")
 _DEPT = ("department", "team", "category", "function", "businessunit")
 _TYPE = ("employmenttype", "contracttype", "worktype", "commitment", "jobtype")
-_NAMEKEYS = {"name", "label", "text", "city", "region", "country", "state", "value", "displayname", "addresslocality",
+_NAMEKEYS = {"name", "label", "text", "city", "commune", "town", "ville", "region", "country", "state", "value", "displayname", "addresslocality",
              "addresscountry", "descriptor"}
 
 
@@ -272,12 +279,29 @@ def _abs_url(u, base):
     return urljoin(base, u)
 
 
+_PRODUCT_KEYS = {"price", "prices", "sku", "productid", "masterid", "addtocart", "currency", "pricerange", "instock"}
+
+
+def _strings(o, d=0):
+    """Every text value of a JSON item (two levels deep): where an apply link to a job platform may hide."""
+    if isinstance(o, str):
+        yield o
+    elif d < 2 and isinstance(o, dict):
+        for v in o.values():
+            yield from _strings(v, d + 1)
+    elif d < 2 and isinstance(o, list):
+        for v in o[:5]:
+            yield from _strings(v, d + 1)
+
+
 def _as_job(o, base):
     if not isinstance(o, dict):
         return None
     n = {}
     for k, v in o.items():
         n.setdefault(_k(k), v)
+    if _PRODUCT_KEYS & set(n):
+        return None  # a product of the website's shop or catalogue (Ubisoft's games), not an offer
         if str(k).startswith("field_"):  # Drupal: field_searchable_date
             n.setdefault(_k(k)[5:], v)
     title = html_to_text(_pick(n, _TITLE))
@@ -296,23 +320,32 @@ def _as_job(o, base):
             return None  # menus, facets, articles: not a job
         b = base.split("#")[0]
         url = f"{b}{'&' if '?' in b else '?'}jbid={jid}"
+    ats = next((u for u in _strings(o) if u.startswith("http") and detect_from_url(u)), "")  # its job-platform page
     raw = _raw(title, url, location=loc[:200], date_text=dd[3], date=dd[0], date_conf=dd[1], date_source=dd[2],
+               apply_url=ats or url,
                description=html_to_text(_pick(n, _DESC))[:15000],
                platform_id=jid, department=_pick(n, _DEPT), employment_type=_pick(n, _TYPE), conf=0.7,
                provenance="network-json")
     return refine_raw_date(raw)  # a 'Date de publication' written in the description beats the JSON field
 
 
-JOB_LINK = re.compile(r"/(?:nos-|our-|all-|les-|toutes-les-)?(jobs?|careers?|positions?|opportunit(?:y|ies)|offres?|emplois?|postes?|vacanc\w*|openings?|"
+JOB_LINK = re.compile(r"/(?:nos-|our-|all-|les-|toutes-les-|job-)?(jobs?|careers?|postes-?a-?pourvoir|positions?|opportunit(?:y|ies)|offres?|emplois?|postes?|vacanc\w*|openings?|"
                       r"postings?|annonces?|offer|offers|job-offers?(?:-[a-z]+)*|stellen\w*|stages?|internships?|sujets?|theses?|"
-                      r"offres-d-emploi|offres-demploi|offres-emploi)/[^/?#]+|/offre-de-emploi/emploi-[^/?#]+", re.I)
+                      r"offres?-(?:d-?)?emplois?)/[^/?#]+|/offre-de-emploi/emploi-[^/?#]+", re.I)
 # pages inside job folders that are lists, searches or tools, not offers
 NOT_JOB = re.compile(r"(?:^|/)(?:list|liste|list-of-jobs|search|searchjobs|recherche|ma-selection|selection|map|carte|alerts?|"
                      r"login|connexion|index|rss|feed|page|category|categories|tag|tags)(?:[-_.][\w-]*)?(?:\.\w{2,5})?/?$", re.I)
 
 
+_ID_IN_CAREERS = re.compile(r"/(?:carri[eè]res?|careers?|recrutement|recruitment|jobs?|emplois?)/(?:[^/]+/)*"
+                            r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{5,})(?:\.\w{2,5})?/?$", re.I)
+_PAGING = re.compile(r"/(?:page|p|seite|pagina)/\d+/?$", re.I)  # '.../page/2': the next page of a list
+
+
 def is_job_path(path) -> bool:
-    return bool(JOB_LINK.search(path)) and not NOT_JOB.search(path)
+    if _PAGING.search(path):
+        return False
+    return (bool(JOB_LINK.search(path)) and not NOT_JOB.search(path)) or bool(_ID_IN_CAREERS.search(path))
 
 
 def jobs_from_json(obj, base):
@@ -403,15 +436,28 @@ def _embedded_date(soup):
 
 
 # --------------------------------------------------------------------------- a single job page
+def _page_title(soup, url):
+    """<title> without the site's name: 'Data Engineer | Inetum' -> 'Data Engineer'."""
+    t = soup.title.get_text(" ", strip=True) if soup.title else ""
+    site = soup.find("meta", property="og:site_name")
+    names = {norm(site.get("content") or "")} if site else set()
+    names.add(norm((urlparse(url).hostname or "").split(".")[-2] if (urlparse(url).hostname or "").count(".") else ""))
+    parts = re.split(r"\s+[|–—-]\s+", t)
+    while len(parts) > 1 and (norm(parts[-1]) in names or any(n and n in norm(parts[-1]) for n in names)
+                              or re.search(r"career|carri|recrut|jobs?\b|emploi", parts[-1], re.I)):
+        parts.pop()
+    return " - ".join(parts).strip()
+
+
 def _parse_detail(html, url, now=None, card=None):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, PARSER)
     ld = _jsonld_jobs(soup, url)
     if ld:
         job = ld[0]
         job["url"] = job["apply_url"] = url
     else:
         h1 = soup.find("h1")
-        title = h1.get_text(" ", strip=True) if h1 else (soup.title.string.strip() if soup.title and soup.title.string else "")
+        title = h1.get_text(" ", strip=True) if h1 else _page_title(soup, url)
         job = _raw(title, url, description=_content_text(soup, "main", 15000), conf=0.4, provenance="html-fallback")
     if not job["location"]:
         job["location"] = html_location(soup) or location_from_text(job["description"])
@@ -636,10 +682,10 @@ def crawl_breezy(f, origin, cfg, known, st):
 
 def _smartrecruiters_pages(f, company, cfg, known, st):
     """careers.smartrecruiters.com/<company>: 24 offers per page; the job pages carry itemprop datePosted."""
-    budget, seen = _Budget(cfg, st), set()
+    budget, seen, older = _Budget(cfg, st), set(), False
     for n in range(cfg["max_pages"]):
         r = f.get(f"https://careers.smartrecruiters.com/{company}/api/more?page={n}")
-        soup, jobs = BeautifulSoup(r.text, "html.parser"), []
+        soup, jobs = BeautifulSoup(r.text, PARSER), []
         for li in soup.select("li.opening-job"):
             a = li.select_one("a[href]")
             if not a or not syntactic_ok(a["href"]) or normalize_url(a["href"]) in seen:
@@ -648,8 +694,12 @@ def _smartrecruiters_pages(f, company, cfg, known, st):
             seen.add(u)
             h = li.select_one("h4")
             raw = _raw((h or a).get_text(" ", strip=True), u, employer=company, conf=0.7, provenance="smartrecruiters-page")
-            jobs.append(_open_detail(f, cfg, raw, budget) if u not in known else raw)
-        yield Page(f"page={n}", r.url, jobs, ordered=False)
+            if older:
+                continue  # strictly newest first: every next offer is older too
+            raw = _open_detail(f, cfg, raw, budget) if u not in known else raw
+            jobs.append(raw)
+            older = bool(raw.get("date")) and raw_verdict(cfg, raw) is False
+        yield Page(f"page={n}", r.url, jobs, sorted=True)  # checked on six tenants: no out-of-order offer
         if not jobs:
             return
 
@@ -771,7 +821,9 @@ def crawl_workday(f, a, cfg, known, st):
                 except Exception as e:
                     f.note(f"workday detail failed {path}: {e}")
             jobs.append(raw)
-        yield Page(f"offset={offset}", api, jobs, total=-(-total // 20) if total else None, sorted=True)  # newest first
+        # newest first, but NOT strictly: some tenants pin a block of offers and restart the list after it (Accenture's page 2
+        # starts newer than page 1 ends), so only whole pages without any offer in the range end the list
+        yield Page(f"offset={offset}", api, jobs, total=-(-total // 20) if total else None)
         offset += 20
         if not posts or offset >= total:
             return
@@ -797,7 +849,7 @@ def _rmk_france(f, url, cfg):
     if not _wants_france(cfg) or "optionsFacetsDD_country" in url or "/go/" in urlparse(url).path:
         return url
     try:
-        soup = BeautifulSoup(f.get(_rmk_list(url)(0)).text, "html.parser")
+        soup = BeautifulSoup(f.get(_rmk_list(url)(0)).text, PARSER)
     except AccessError:
         raise
     except Exception:
@@ -818,7 +870,7 @@ def crawl_successfactors(f, url, cfg, known, st):
     page_url, budget, n, seen = _rmk_list(url), _Budget(cfg, st), 0, set()
     for _ in range(cfg["max_pages"]):
         r = f.get(page_url(n))
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, PARSER)
         df = _dayfirst(soup)
         rows = soup.select("tr.data-row") or soup.select("li.job-tile, div.job-tile")
         jobs = []
@@ -897,7 +949,7 @@ def crawl_icims(f, url, cfg, known, st):
     for n in range(cfg["max_pages"]):
         r = f.get(page_url(n))
         dayfirst = _icims_dayfirst(r.text, dayfirst)
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, PARSER)
         rows, jobs = soup.select(".iCIMS_JobsTable .row"), []
         for row in rows:
             a = row.select_one(".title a") or row.select_one("a[href*='/jobs/']")
@@ -1207,7 +1259,7 @@ _FEED_TITLE = re.compile(r"job|offre|emploi|career|carri|recrut|poste|vacanc|ope
 
 def detect_from_page(f, url, html):
     """The platform behind a company's own career page: its links, embeds, feeds and markers."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, PARSER)
     low = html.lower()
     for name, arg in (("jibe", _jibe_arg(url, html)), ("phenom", _phenom_arg(url, html))):
         if arg:  # before iCIMS / Workday: these sites link their apply forms there
@@ -1253,7 +1305,8 @@ def detect_from_page(f, url, html):
     for ln in soup.find_all("link", rel=lambda v: v and "alternate" in v):
         title = ln.get("title") or ""
         blog = re.fullmatch(r"/(?:\w{2}/)?feed/?", urlparse(urljoin(url, ln.get("href") or "")).path or "")
-        if ("rss" in (ln.get("type") or "") and ln.get("href") and _FEED_TITLE.search(title) and not blog
+        capped = re.search(r"/searchjobs", urlparse(url).path, re.I)  # Avature (Siemens): 20 unsorted offers, the list has all
+        if ("rss" in (ln.get("type") or "") and ln.get("href") and _FEED_TITLE.search(title) and not blog and not capped
                 and not re.search(r"comment", title, re.I)):
             flavor = "teamtailor" if "teamtailor" in low else "rss"
             return flavor, (urljoin(url, ln["href"]), flavor)
@@ -1268,7 +1321,7 @@ _LIST_LINK = re.compile(r"^(?:voir|see|view|browse|explore|toutes|all|nos|our|d�
 def detect_one_hop(f, url, html):
     """A careers home page whose 'See all jobs' link leads to the page that names the platform (mirakl.com/careers ->
     /company/careers/jobs/)."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, PARSER)
     host = urlparse(url).hostname
     for a in soup.find_all("a", href=True):
         u = urljoin(url, a["href"]).split("#")[0]
@@ -1297,7 +1350,7 @@ def guess_board(f, url):
     except Exception:
         return None
     low, host = html.lower(), urlparse(url).hostname or ""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, PARSER)
     site = soup.find("meta", property="og:site_name")
     words = re.split(r"[|\-–—:·,]", (site.get("content") if site else "") + "|" + (soup.title.get_text() if soup.title else ""))
     names = [re.sub(r"[^a-z0-9]", "", norm(w)) for w in words]

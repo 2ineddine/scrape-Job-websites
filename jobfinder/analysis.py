@@ -231,13 +231,25 @@ def analyze_pipeline(cfg, profile, keys, prog):
         rend.close()
 
 
+def _by_priority(jobs):
+    """The AI reads the most promising offers first, as a run or a free quota may end before the last one: titles in the
+    research fields, then offers with a proven date, then the newest."""
+    def key(j):
+        verdict = ((j.extra or {}).get("title_info") or {}).get("verdict")
+        return (verdict != "pass", j.status != "candidate", -(j.pub_date.timestamp() if j.pub_date else 0))
+    return sorted(jobs, key=key)
+
+
 def _pipeline(cfg, profile, keys, prog, fetcher, rend):
     reset_usage()
     prog.set(task="AI analysis", ai_msg="")
     with SessionLocal() as s:
         jobs = s.query(Job).filter(Job.status.in_(["candidate", "review"]), Job.relevance_score.is_(None)).all()
-        jobs = sorted(jobs, key=lambda x: x.status != "candidate")[:cfg["max_ai_jobs_per_run"]]  # candidates first
+        jobs, left = _by_priority(jobs), max(0, len(jobs) - cfg["max_ai_jobs_per_run"])
+        jobs = jobs[:cfg["max_ai_jobs_per_run"]]
         prog.set(ai_total=len(jobs), ai_done=0)
+        if left:
+            prog.say(f"{left} offers beyond the limit of {cfg['max_ai_jobs_per_run']} per run stay 'Not analysed'")
         relevant = lambda: s.query(Job).filter(Job.status.in_(["relevant", "review"]), Job.relevance_score.isnot(None)).count()
         failed = 0
         for j in jobs:

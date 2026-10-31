@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
-from bs4 import Comment
+from bs4 import Comment, NavigableString
 
 from .config import PRESET_DAYS, utcnow
 from .web import norm
@@ -483,17 +483,30 @@ def _is_relative(txt) -> bool:
 
 
 def _content_text(soup, scope="main", limit=30000):
-    """Visible text of the job content: scripts, navigation, footers and side columns ('similar jobs') are left out."""
+    """Visible text of the job content: scripts, navigation, footers and side columns ('similar jobs') are left out.
+    Computed once per page and scope (the date, location and offer checks all read it)."""
+    cache = soup.__dict__.setdefault("_jf_text", {})
+    if (scope, limit) not in cache:
+        cache[(scope, limit)] = _content_text_uncached(soup, scope, limit)
+    return cache[(scope, limit)]
+
+
+def _content_text_uncached(soup, scope, limit):
     root = soup.body or soup
     if scope == "main":
         root = soup.find("main") or soup.find(attrs={"role": "main"}) or soup.find("article") or root
-    parts = []
+    # menus, footers and side columns: marked once (a parent search per text would be quadratic on large pages)
+    skip = {id(x) for t in root.find_all(["nav", "footer", "aside"]) for x in t.descendants if isinstance(x, NavigableString)}
+    parts, size = [], 0
     for s in root.find_all(string=True):
         if isinstance(s, Comment) or s.parent is None or s.parent.name in ("script", "style", "noscript", "template", "head", "title"):
             continue
-        if s.find_parent(["nav", "footer", "aside"]):
+        if id(s) in skip:
             continue
         parts.append(str(s))
+        size += len(s)
+        if size > limit * 2:
+            break
     return re.sub(r"\s+", " ", " ".join(parts)).strip()[:limit]
 
 

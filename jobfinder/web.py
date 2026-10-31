@@ -1,6 +1,7 @@
 """web.py - text helpers, URL import, SSRF protection and the polite HTTP fetcher."""
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import re
 import socket
@@ -12,6 +13,9 @@ import warnings
 
 import requests
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
+
+# lxml parses large career pages many times faster than Python's own parser
+PARSER = "lxml" if importlib.util.find_spec("lxml") else "html.parser"
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -27,7 +31,7 @@ def _wb(word: str, text: str) -> bool:
 
 
 def html_to_text(html: str) -> str:
-    return re.sub(r"\s+", " ", BeautifulSoup(html or "", "html.parser").get_text(" ")).strip()
+    return re.sub(r"\s+", " ", BeautifulSoup(html or "", PARSER).get_text(" ")).strip()
 
 
 # --------------------------------------------------------------------------- URL import / SSRF
@@ -93,7 +97,7 @@ def extract_urls(text: str) -> list[str]:
     for m in re.finditer(r"""["'`](https?:\\?/\\?/[^"'`\s<>]+)["'`]""", text or "", re.I):
         found.append(_unescape(m.group(1)))
     try:
-        for a in BeautifulSoup(text or "", "html.parser").find_all("a", href=True):
+        for a in BeautifulSoup(text or "", PARSER).find_all("a", href=True):
             if a["href"].lower().startswith(("http://", "https://")):
                 found.append(a["href"].strip())
     except Exception:  # malformed markup must never crash the import
@@ -210,6 +214,8 @@ class Fetcher:
             try:
                 for _ in range(6):  # manual redirects, each hop re-validated (SSRF)
                     ok, why = check_url(cur)
+                    if not ok and why == "dns resolution failed":  # network / DNS trouble: retried, never 'blocked'
+                        raise requests.ConnectionError("the website's name could not be resolved (network or DNS problem)")
                     if not ok:
                         raise AccessError(f"access_restricted: {why}")
                     self._wait(urlparse(cur).hostname)
@@ -236,6 +242,7 @@ class Fetcher:
                 raise ConnectionError("source_unreachable: invalid HTTPS certificate on the website") from e
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt >= self.cfg["retries"]:
-                    raise ConnectionError(f"source_unreachable: {type(e).__name__}") from e
+                    why = str(e) if "could not be resolved" in str(e) else type(e).__name__
+                    raise ConnectionError(f"source_unreachable: {why}") from e
                 time.sleep(min(2 ** attempt * 2, 20))
         raise ConnectionError("source_unreachable")

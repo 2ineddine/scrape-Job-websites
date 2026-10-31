@@ -129,10 +129,12 @@ def step_websites(running, n):
         if n["sites"]:
             with SessionLocal() as s:
                 srcs = s.query(Source).all()
-            st.caption(f"**{len(srcs)} websites** ready. Loading another file replaces them.")
+            st.caption(f"**{len(srcs)} websites** ready. Loading another file replaces them. Search words, page numbers and "
+                       "tracking codes from a past search are removed from company URLs, so every website is read whole "
+                       "and filtered the same way; country filters and job-board searches are kept.")
             with st.expander("Websites and how each one was read"):
                 st.dataframe(pd.DataFrame([dict(website=x.label, host=urlparse(x.url).hostname, read_by=x.platform or "—",
-                                                status=x.status, offers=x.jobs_found, problem=x.last_error, url=x.url)
+                                                status=x.status, offers=x.jobs_found, note=x.last_error, url=x.url)
                                            for x in srcs]),
                              width="stretch", hide_index=True, height=min(38 + 35 * len(srcs), 420),
                              column_config={"url": st.column_config.LinkColumn("url", display_text="open")})

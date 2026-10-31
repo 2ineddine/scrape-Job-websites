@@ -217,3 +217,235 @@ def test_url_already_sorted_by_date():
     assert _DATE_SORT.search("https://www.alten.fr/carriere/jobs/?sortby=date&job_search=ia")
     assert _DATE_SORT.search("https://r.fr/offres?sortBy=date") and _DATE_SORT.search("https://x.fr/jobs?order=most_recent")
     assert not _DATE_SORT.search("https://x.fr/jobs?sort=relevance") and not _DATE_SORT.search("https://x.fr/jobs?page=2")
+
+
+def test_more_offer_links_are_recognised():
+    from jobfinder.adapters import is_job_path
+    from jobfinder.crawler import _job_links
+    assert is_job_path("/offre-emploi/data-scientist-reference-DEF_17-00072298")
+    assert is_job_path("/fr/carrieres/postesapourvoir/developpeur-full-stack-hf")
+    assert is_job_path("/fr/accueil/carrieres/08a38c64-50d1-4013-bd4f-cabff4fa8ddd.html")
+    assert not is_job_path("/nos-offres/filtres/mot-cles/data/page/2") and not is_job_path("/fr/carrieres/nous-rejoindre.html")
+    assert not is_job_path("/offre-de-emploi/tous-les-flux-rss.aspx")  # Talentsoft folder: only '/emploi-...' pages are offers
+    assert is_job_path("/offre-de-emploi/emploi-cdi-ingenieur-chercheur-h-f_42417.aspx")
+    html = ('<a href="/recrutement/offers/@@LINK@@">x</a><a href="/fr/jobs//ia-engineer-h-f-1262">AI engineer</a>'
+            '<a href="/en-FR/node/23383">Ingénieur DevOps Réseau Cloud (F/H)</a><a href="/en-FR/node/12">Our values</a>')
+    links = _job_links(BeautifulSoup(html, "html.parser"), "https://co.fr/fr/jobs", set())
+    assert links == ["https://co.fr/fr/jobs/ia-engineer-h-f-1262", "https://co.fr/en-FR/node/23383"]
+
+
+def test_card_title_behind_a_read_more_button_and_page_title():
+    from jobfinder.adapters import _page_title
+    from jobfinder.crawler import _card_title
+    html = '<div class="card"><h3>Data Engineer: Multi-stack</h3><p>Paris</p><a href="/carrieres/abc">LIRE LA SUITE</a></div>'
+    assert _card_title(BeautifulSoup(html, "html.parser"), "https://i.com/", "https://i.com/carrieres/abc") == "Data Engineer: Multi-stack"
+    assert _page_title(BeautifulSoup("<title>Full Stack Developer | Inetum</title>", "html.parser"), "https://www.inetum.com/x") \
+        == "Full Stack Developer"
+
+
+def test_page_data_offers_get_the_page_links_and_their_job_platform():
+    from jobfinder.adapters import jobs_from_json
+    from jobfinder.crawler import _real_links
+    data = [{"id": "90901", "title": "Ingénieur FPGA F/H", "url": "Ingenieur-FPGA-F-H", "location": "Valbonne",
+             "applyLink": {"url": "https://jobs.smartrecruiters.com/OCTOTechnology/744000158-ingenieur-fpga"}}]
+    jobs = jobs_from_json(data, "https://emploi.co.fr/offers")
+    assert jobs[0]["apply_url"].startswith("https://jobs.smartrecruiters.com/OCTOTechnology/")
+    jobs = _real_links(jobs, ["https://emploi.co.fr/offers/90901/Ingenieur-FPGA-F-H"])
+    assert jobs[0]["url"] == "https://emploi.co.fr/offers/90901/Ingenieur-FPGA-F-H"
+
+
+def test_page_text_is_fast_on_deep_pages():
+    import time
+    from jobfinder.dates import _content_text
+    html = "<html><body><main>" + "<div>" * 300 + "".join(f"<p>ligne {i}</p>" for i in range(1500)) + "</div>" * 300 + \
+           "<nav>menu</nav></main></body></html>"
+    soup, t = BeautifulSoup(html, "html.parser"), time.time()
+    text = _content_text(soup, "main", 30000)
+    assert "ligne 1499" in text and "menu" not in text and time.time() - t < 2
+
+
+def test_career_urls_get_one_uniform_form():
+    from jobfinder.urlclean import clean_source_url
+    c = lambda u: clean_source_url(u)[0]
+    # company sites: search words, contract types, page numbers, relevance sorts and tracking go; France stays
+    assert c("https://joining.bouygues.com/global/en/search-results?keywords=audio") == \
+        "https://joining.bouygues.com/global/en/search-results"
+    assert c("https://careers.se.com/jobs?lang=en-US&location=France&woe=12&page=2&sortBy=relevance&keywords=data%20science") \
+        == "https://careers.se.com/jobs?lang=en-US&location=France"
+    assert c("https://www.alten.fr/carriere/jobs/?sortby=date&job_search=ia&pagenum=3&per_page=25") == \
+        "https://www.alten.fr/carriere/jobs/?sortby=date"
+    assert c("https://recrute.carrefour.fr/offres?order=desc&sort=post_date_extern&contract_type=Stage") == \
+        "https://recrute.carrefour.fr/offres?order=desc&sort=post_date_extern"
+    assert c("https://careers.datadoghq.com/all-jobs/?igaag=&igacm=236&gad_source=1") == "https://careers.datadoghq.com/all-jobs/"
+    assert c("https://recrutement.sfr.com/offer/page/1") == "https://recrutement.sfr.com/offer/"
+    assert c("https://www.ibm.com/careers/search?field_keyword_05%5B0%5D=France").endswith("=France")
+    assert c("https://cgi.njoyn.com/corp/xweb/xweb.asp?CLID=21001&page=joblisting&CountryID=FR").endswith("page=joblisting&CountryID=FR")
+    # multi-company job boards: their search IS the search
+    assert "s=AI+Research+Scientist" in c("https://www.optioncarriere.com/emploi?s=AI+Research+Scientist&l=France")
+    assert "query=stage" in c("https://www.welcometothejungle.com/fr/jobs?query=stage+deep+learning&page=3")
+    assert "page=" not in c("https://www.welcometothejungle.com/fr/jobs?query=stage+deep+learning&page=3")
+    # filters that were left behind: list ids in page names, button values, 'all' values, cities, trailing spaces
+    assert c("https://www.inetum.com/fr/jobs.html?list-b4837029c4_page=1") == "https://www.inetum.com/fr/jobs.html"
+    assert c("https://www.viveris.fr/nous-rejoindre?eolia_search=Rechercher&keywords=") == "https://www.viveris.fr/nous-rejoindre"
+    assert c("https://www.wavestone.com/en/careers/our-offers?city=paris,lyon&sort=desc") == \
+        "https://www.wavestone.com/en/careers/our-offers?sort=desc"
+    assert c("https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+ml+&cod=all&d=all") == \
+        "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+ml"
+    # a board's contract filter goes when search words remain, and stays when it is all that narrows the list
+    assert c("https://jobs.makesense.org/en/s/jobs/all/all/cdi?contracts=cdd&sortBy=relevance&s=Data+scientist") == \
+        "https://jobs.makesense.org/en/s/jobs/all/all?s=Data+scientist"
+    assert "typesConvention=1" in c("https://www.apec.fr/candidat/recherche-emploi.html/emploi?lieux=75&typesConvention=1")
+    # one address for one list: a single offer gives its list, a moved page its new address
+    assert c("https://jobs.inria.fr/public/classic/fr/offres/2025-09455") == "https://jobs.inria.fr/public/classic/fr/offres"
+    assert c("https://emploi.cnrs.fr/Recherche.aspx?bassin=INDEF&type=STAG&texte=") == "https://emploi.cnrs.fr/Offres/Recherche.aspx"
+    # a numeric filter of unknown meaning stays: Siemens' '42386' is its France filter
+    assert "42386=" in c("https://jobs.siemens.com/en_US/externaljobs/SearchJobs/deep%20learning?42386=[812134]&listFilterMode=1")
+
+
+def test_job_board_is_not_read_as_an_employer_platform():
+    from jobfinder.crawler import detect_platform
+
+    class F:
+        def __init__(self, html):
+            self.html = html
+
+        def get(self, url, **kw):
+            return type("R", (), {"text": self.html})()
+
+    page = "<html><body>" + "x" * 100 + "jobs2web j2w rmk</body></html>"
+    assert detect_platform(F(page), "https://jobs.makesense.org/en/s/jobs/all/all?s=data") == \
+        ("generic", "https://jobs.makesense.org/en/s/jobs/all/all?s=data")
+    assert detect_platform(F(page), "https://careers.acme.fr/search")[0] == "successfactors"
+
+
+def test_avature_capped_feed_is_not_the_reader():
+    from jobfinder.adapters import detect_from_page
+    page = '<html><head><link rel="alternate" type="application/rss+xml" title="Job offers" href="/SearchJobs/feed/"></head></html>'
+    assert detect_from_page(None, "https://jobs.acme.com/en_US/ext/SearchJobs", page) is None
+    assert detect_from_page(None, "https://acme.fr/careers", page)[0] == "rss"
+
+
+def test_technical_titles_are_never_rejected():
+    from jobfinder.classify import analyze_title
+    prof = {**CFG()["_profile"], "offer_types": ["job", "internship", "phd_postdoc", "apprenticeship"]}
+    for t in ("Ingénieur FPGA F/H", "Stage - Vérification UVM d'IPs digitales", "Développeur CUDA / GPU",
+              "Stage – Observateur d'angle moteur haute résolution", "Stage - Beamforming / antennes", "Ingénieur PyTorch",
+              "Data Engineer Spark / Databricks", "Stage - Étude des matériaux piézoélectriques pour capteurs"):
+        assert analyze_title(t, "", prof).verdict != "reject", t
+    for t in ("Commercial grands comptes", "Comptable fournisseurs", "Assistant RH", "Chauffeur livreur"):
+        assert analyze_title(t, "", prof).verdict == "reject", t
+
+
+def test_website_deadline_stops_job_page_opening():
+    import time
+    from jobfinder.adapters import _Budget
+    st = ScanState()
+    b = _Budget(CFG(), st)
+    assert b.take()
+    st.deadline = time.time() - 1  # this website's time is up
+    assert not b.take() and st.details_capped
+
+
+def test_an_exhausted_daily_quota_stops_the_next_requests_at_once(monkeypatch):
+    import pytest
+    from pydantic import BaseModel
+    from jobfinder import llm
+
+    class Ans(BaseModel):
+        ok: bool = True
+
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(1)
+        e = llm.QuotaExhausted("Daily quota of this model used up")
+        e.wait = 58000
+        raise e
+    monkeypatch.setattr(llm, "chat", refuse)
+    monkeypatch.setattr(llm, "_EXHAUSTED", {})
+    cfg = {**CFG(), "model": {"provider": "gemini", "model": "gemini-2.5-flash"}, "max_ai_calls": 100}
+
+    class S:
+        get = staticmethod(lambda *a: None)
+    for _ in range(3):
+        with pytest.raises(llm.QuotaExhausted):
+            llm.call_json("x", Ans, cfg, S())
+    assert len(calls) == 1  # the provider is asked once, not once per website
+
+
+def test_output_token_limit_is_learned_and_respected(monkeypatch):
+    from jobfinder import llm
+    sent = []
+
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self.text, self._b, self.headers = code, body, body, {}
+
+        def json(self):
+            import json
+            return json.loads(self._b)
+
+    def post(url, headers=None, json=None, timeout=None):
+        sent.append(json["max_tokens"])
+        if json["max_tokens"] > 1000:
+            return Resp(429, '{"error":{"message":"Request too large for model on output tokens per minute (OTPM): '
+                             'Limit 1000, Requested 1500."}}')
+        return Resp(200, '{"choices":[{"message":{"content":"{}"}}],"usage":{}}')
+    monkeypatch.setattr(llm.requests, "post", post)
+    monkeypatch.setattr(llm, "_OUT_CAP", {})
+    llm._post("https://api.groq.com/x", {}, {"max_tokens": 1500}, cap_key=("groq", "m"))
+    assert sent == [1500, 900] and llm._OUT_CAP == {("groq", "m"): 900}
+
+
+def test_workday_is_not_trusted_as_strictly_sorted():
+    # Accenture: page 1 runs down to 30+ days, page 2 restarts at today: one old offer must not end the list
+    from jobfinder.adapters import crawl_workday
+    old = {"title": "Ingénieur IA", "externalPath": "/job/1", "postedOn": "Posted 30+ Days Ago"}
+    f = FakeFetcher({"/jobs#": {"total": 40, "jobPostings": [old] * 20, "facets": []}, "/job/1": {"jobPostingInfo": {}}})
+    a = dict(host="x.wd3.myworkdayjobs.com", tenant="x", site="S", facets={"locations": ["a" * 32]}, prefix="/S")
+    pg = next(iter(crawl_workday(f, a, CFG(), set(), ScanState())))
+    assert pg.ordered and not pg.sorted
+
+
+def test_foreign_location_with_a_street_address_is_outside_france():
+    from jobfinder.classify import classify_location as C
+    for loc in ("United States ; New York ; 130 West 42nd Street", "Belgium ; Liège", "Switzerland ; Grand-lancy ; Geneva"):
+        r = C(loc)
+        assert r["location_verified"] and not r["france_eligible"], loc
+    assert C("Paris ; London")["france_eligible"] and C("France ; Marseille ; 40c Av. de Hambourg")["france_eligible"]
+
+
+def test_products_and_symbol_titles_are_not_offers():
+    from jobfinder.adapters import jobs_from_json
+    from jobfinder.classify import is_boilerplate_title
+    games = [{"title": "Rayman Legends Retold", "url": "https://www.ubisoft.com/fr/rayman", "releaseDate": "2026-12-03", "price": 39.9}]
+    assert jobs_from_json(games, "https://www.ubisoft.com/fr-fr/company/careers/search") == []
+    assert is_boilerplate_title("<") and not is_boilerplate_title("QA Lead")
+
+
+def test_location_from_the_list_card():
+    from jobfinder.crawler import _card_location
+    html = '<div><a href="/offre-de-emploi/emploi-x_1.aspx">Technicien H/F</a><span>CDI</span><span>Gard (30)</span><span>Bagnols</span></div>'
+    assert _card_location(BeautifulSoup(html, "html.parser"), "https://c.fr/", "https://c.fr/offre-de-emploi/emploi-x_1.aspx",
+                          "Technicien H/F") == "Gard (30)"
+
+
+def test_smartrecruiters_public_list_stops_opening_after_the_first_old_offer():
+    from jobfinder.adapters import _smartrecruiters_pages
+    li = lambda i: f'<li class="opening-job"><a href="https://jobs.smartrecruiters.com/X/{i}-ing"><h4>Ingénieur IA {i}</h4></a></li>'
+    page = lambda d: ('<html><head><script type="application/ld+json">{"@type":"JobPosting","title":"Ingénieur IA",'
+                      f'"datePosted":"{d}","description":"Poste ingénieur IA"}}</script></head></html>')
+    f = FakeFetcher({"page=0": "<ul>" + li(3) + li(2) + li(1) + "</ul>", "/3-ing": page(TODAY), "/2-ing": page(OLD), "/1-ing": page(OLD)})
+    pg = next(iter(_smartrecruiters_pages(f, "X", CFG(), set(), ScanState())))
+    assert pg.sorted and len(pg.jobs) == 2 and not any("/1-ing" in c for c in f.calls)
+
+
+def test_ai_reads_the_most_promising_offers_first():
+    from datetime import datetime
+    from types import SimpleNamespace as NS
+    from jobfinder.analysis import _by_priority
+    mk = lambda name, verdict, status, day: NS(name=name, extra={"title_info": {"verdict": verdict}}, status=status,
+                                               pub_date=datetime(2026, 10, day) if day else None)
+    jobs = [mk("maybe new", "maybe", "candidate", 30), mk("pass unknown date", "pass", "review", None),
+            mk("pass old", "pass", "candidate", 2), mk("pass new", "pass", "candidate", 29)]
+    assert [j.name for j in _by_priority(jobs)] == ["pass new", "pass old", "pass unknown date", "maybe new"]

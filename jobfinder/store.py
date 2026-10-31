@@ -196,7 +196,10 @@ def set_setting(s, key, value):
 
 
 _ATS_DOMAINS = ("myworkdayjobs.com", "smartrecruiters.com", "breezy.hr", "teamtailor.com", "icims.com", "recruitee.com",
-                "lever.co", "greenhouse.io", "ashbyhq.com", "myworkdaysite.com")
+                "lever.co", "greenhouse.io", "ashbyhq.com", "myworkdaysite.com", "eightfold.ai", "talentview.io",
+                "welcomekit.co", "talent-soft.com")
+_ATS_PATH = {"careers.smartrecruiters.com": 0, "jobs.smartrecruiters.com": 0, "jobs.lever.co": 0, "jobs.ashbyhq.com": 0,
+             "apply.workable.com": 0, "careers.werecruit.io": 1}  # host -> position of the company in the path
 _HOST_PREFIX = {"www", "jobs", "job", "careers", "career", "carrieres", "carriere", "carrieresfrance", "recrutement", "emploi",
                 "emplois", "join", "apply", "talents", "talent", "work", "hiring"}
 
@@ -205,21 +208,31 @@ def company_from_url(url: str) -> str:
     """'recrutement.mitsubishielectric.fr' -> 'Mitsubishielectric'; 'expleo-jobs-fr-fr.icims.com' -> 'Expleo'."""
     host = (urlparse(url).hostname or "").lower()
     parts, seg = host.split("."), [x for x in urlparse(url).path.split("/") if x]
-    if host in ("careers.smartrecruiters.com", "jobs.smartrecruiters.com", "jobs.lever.co", "jobs.ashbyhq.com") and seg:
-        name = seg[0]
+    if host in _ATS_PATH and len(seg) > _ATS_PATH[host]:
+        name = seg[_ATS_PATH[host]]
     elif any(host.endswith(d) for d in _ATS_DOMAINS) and len(parts) > 2:
-        name = re.split(r"-(?:jobs|careers|career|recrutement|fr|en)\b", parts[0])[0]
+        words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external")]
+        name = max(words, key=len) if words else parts[0]  # 'careers-fr-soitec' -> 'soitec', 'expleo-jobs-fr-fr' -> 'expleo'
     else:
-        rest = [x for x in parts[:-1] if x not in _HOST_PREFIX] or parts[:1]
+        rest = [x for x in parts[:-1] if x not in _HOST_PREFIX and x not in ("gouv", "co", "com", "ac", "org")] or parts[:1]
         name = rest[-1] if len(rest[-1]) > 3 or len(rest) == 1 else rest[0]
-    return name.replace("-", " ").title()
+    name = name.replace("-", " ").replace("_", " ")
+    return name.upper() if len(name) <= 3 else name.title()
 
 
 def add_sources(s, urls: list[str]):
+    """Each URL is put in one uniform form first (urlclean): search words, page numbers and tracking codes of a past
+    search are removed, so every website is read whole and filtered the same way. Duplicates collapse."""
+    from .urlclean import clean_source_url
     added = 0
     for u in urls:
-        if syntactic_ok(u) and not s.query(Source).filter_by(url=normalize_url(u)).first():
-            s.add(Source(url=normalize_url(u), label=company_from_url(u), platform=""))
+        if not syntactic_ok(u):
+            continue
+        clean, removed = clean_source_url(u)
+        nu = normalize_url(clean)
+        if not s.query(Source).filter_by(url=nu).first():
+            s.add(Source(url=nu, label=company_from_url(nu), platform="",
+                         last_error=("URL simplified: " + ", ".join(removed)) if removed else ""))
             added += 1
     s.commit()
     return added

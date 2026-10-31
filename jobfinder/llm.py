@@ -29,6 +29,15 @@ class MalformedOutput(AIError):
     """The model answered, but not in the expected shape: only this one request failed."""
 
 
+class QuotaExhausted(AIError):
+    """A daily quota: every request to this model fails until it resets."""
+
+
+# (provider, model) -> time.time() when its exhausted quota frees up: no request is sent before (one website after
+# another would otherwise each wait for the same refusal)
+_EXHAUSTED: dict = {}
+
+
 class RequestTooLarge(AIError):
     """The prompt is over what the model / the free plan accepts in one request: waiting does not help, a shorter one does."""
 
@@ -51,17 +60,23 @@ def mask(key: str) -> str:
 
 
 def _wait_time(r, default):
-    """Seconds the provider asks to wait: Retry-After header or 'try again in 12.5s' in the message (max 65 s)."""
+    """Seconds the provider asks to wait: Retry-After header, 'try again in 12.5s' / 'retry in 16h14m2s' in the message."""
     v = r.headers.get("retry-after") or ""
-    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", r.text) if not v else None
+    # 'Please try again in 1m30.5s' (Groq), 'Please retry in 16h14m21.5s' (Gemini), '"retryDelay": "41s"'
+    m = re.search(r"(?:try again|retry) in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", r.text) if not v else None
+    d = re.search(r'"retryDelay"\s*:\s*"([\d.]+)s"', r.text) if not v and not m else None
     try:
-        s = float(v) if v else (int(m[1] or 0) * 60 + float(m[2])) if m else default
+        s = (float(v) if v else (int(m[1] or 0) * 3600 + int(m[2] or 0) * 60 + float(m[3])) if m
+             else float(d[1]) if d else default)
     except ValueError:
         s = default
     return max(s, 1.0)
 
 
-def _post(url, headers, payload, timeout=90, retries=5):
+_OUT_CAP: dict = {}  # (provider, model) -> answer length the provider accepts (learned from its 'output tokens' limit)
+
+
+def _post(url, headers, payload, timeout=90, retries=5, cap_key=None):
     delay, timeouts = 2, 0
     for i in range(retries + 1):
         wait = delay
@@ -72,6 +87,12 @@ def _post(url, headers, payload, timeout=90, retries=5):
             if i == retries or timeouts >= 2:  # a model that is too slow once is retried once, not five times
                 raise AIError(f"Provider unreachable ({type(e).__name__}). Is the service running / reachable?")
         else:
+            out = re.search(r"output tokens[^.]*?Limit (\d+)", r.text, re.I) if r.status_code in (413, 429) else None
+            if out and "max_tokens" in payload and payload["max_tokens"] > int(out[1]) * 0.9:
+                payload["max_tokens"] = max(200, int(int(out[1]) * 0.9))  # the provider's output-per-minute limit
+                if cap_key:
+                    _OUT_CAP[cap_key] = payload["max_tokens"]
+                continue
             if r.status_code in (413, 429) and re.search(r"too large|reduce the length|context length|maximum context", r.text, re.I):
                 raise RequestTooLarge(f"Request too large for this model: {r.text[:160]}")
             if r.status_code in (429, 500, 502, 503, 504):
@@ -80,10 +101,12 @@ def _post(url, headers, payload, timeout=90, retries=5):
                 if r.status_code == 429:  # rate limit: wait as long as the provider asks
                     wait = _wait_time(r, delay)
                     if wait > 120:  # a daily quota, not a per-minute limit: waiting here would freeze the analysis
-                        per_day = re.search(r"per day|daily|quota", r.text, re.I)
-                        raise AIError(f"{'Daily quota' if per_day else 'Rate limit'} of this model used up: it frees up "
-                                      f"in about {wait / 60:.0f} min. Choose another model or provider in Settings, "
-                                      "or try again later.")
+                        per_day = re.search(r"per day|perday|daily|quota", r.text, re.I)
+                        err = QuotaExhausted(f"{'Daily quota' if per_day else 'Rate limit'} of this model used up: it frees "
+                                             f"up in about {wait / 60:.0f} min. Choose another model or provider in Settings, "
+                                             "or try again later.")
+                        err.wait = wait
+                        raise err
             elif r.status_code in (401, 403):
                 raise AIError("Authentication failed - check the API key for this provider")
             elif r.status_code == 402:
@@ -107,8 +130,10 @@ def chat(provider, model, system, user, cfg, keys=None):
         d = _post(f"{base}/api/chat", {}, {"model": model, "messages": msgs, "stream": False, "format": "json"})
         return d["message"]["content"], d.get("prompt_eval_count", 0), d.get("eval_count", 0)
     if provider in ("openai", "openrouter", "groq"):
+        # an explicit answer length: without it Groq counts 2048 output tokens and refuses on its output-per-minute limit
         d = _post(f"{base}/chat/completions", {"Authorization": f"Bearer {key}"},
-                  {"model": model, "messages": msgs, "response_format": {"type": "json_object"}})
+                  {"model": model, "messages": msgs, "response_format": {"type": "json_object"},
+                   "max_tokens": _OUT_CAP.get((provider, model), 1500)}, cap_key=(provider, model))
         u = d.get("usage", {})
         return d["choices"][0]["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
     if provider == "gemini":
@@ -209,6 +234,10 @@ def _soften(schema, data):
 
 def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
     t = cfg["model"]  # one model for every task
+    until = _EXHAUSTED.get((t["provider"], t["model"]), 0)
+    if until > time.time():
+        raise QuotaExhausted(f"The quota of {t['provider']} / {t['model']} is used up for about {(until - time.time()) / 60:.0f} "
+                             "more min. Choose another model or provider in Settings, or try again later.")
     ck = hashlib.sha256(json.dumps([t["provider"], t["model"], system, user, schema.__name__]).encode()).hexdigest()
     row = s.get(AICache, ck)
     if row:
@@ -220,7 +249,11 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
             if USAGE["calls"] >= cfg["max_ai_calls"]:
                 raise BudgetExceeded(f"AI call budget reached ({cfg['max_ai_calls']})")
             USAGE["calls"] += 1
-        text, i, o = chat(t["provider"], t["model"], system, prompt, cfg, keys)
+        try:
+            text, i, o = chat(t["provider"], t["model"], system, prompt, cfg, keys)
+        except QuotaExhausted as e:
+            _EXHAUSTED[(t["provider"], t["model"])] = time.time() + getattr(e, "wait", 3600)
+            raise
         with _USAGE_LOCK:
             USAGE["in"] += i
             USAGE["out"] += o

@@ -79,8 +79,13 @@ browser navigation) are labelled "tested" in Settings:
 | Groq | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` | |
 | Gemini | `gemini-2.5-flash`, `gemini-3.1-flash-lite`, `gemini-3.5-flash` | slower responses |
 
-Gemma, speech, image and other non-chat models are not offered. Free hosted plans have per-minute and per-day token
-quotas: when a daily quota is exhausted, the analysis stops with a message stating when the quota resets.
+Gemma, speech, image and other non-chat models are not offered.
+
+Free hosted plans are limited. At the time of writing, the Groq free plan allows about 200,000 tokens per day per model
+(roughly one moderate search), and the Gemini free plan allows only 20 requests per day for `gemini-2.5-flash`, which is
+not enough for a search over many websites. For regular use over large website lists, use a paid API key or a local
+Ollama model. When a daily quota is exhausted, the application stops sending requests to that model until the quota
+resets and states when this will happen.
 
 ### API keys
 
@@ -160,12 +165,41 @@ Each website is processed by the most precise reader available, selected automat
 
 Additional detection rules:
 
+- offer links are recognised by their address (job folders in French and English, identifiers in a careers folder) and
+  by their text (a gender mark such as "H/F" or "m/w/d", or a contract type in a title-length text); template links
+  (`@@LINK@@`, `{{id}}`) and pagination links are ignored;
+- a page that yields no offer from its static HTML is rendered once with JavaScript (cookie banners are accepted, "load
+  more" buttons are used when they can be clicked), and the job data it downloads is read;
+- offers found in page data are matched to the page's own links, and when they have no publication date but point to a
+  job platform (for example SmartRecruiters), the offers are read on that platform;
+- titles hidden behind "Read more" buttons are taken from the card heading, and site names are removed from page
+  titles;
 - a careers home page linking to its job list is followed one step to identify the platform;
 - a careers page that loads a Greenhouse, Ashby or Lever board without naming it is matched to the board carrying the
   company's name, accepted only when the board's offers link back to the company's website or the page names the
   platform;
 - an expired offer URL is replaced by the list it belonged to;
 - menus, legal pages, list pages and spontaneous application pages are never taken for offers.
+
+### URL normalisation
+
+Career page URLs are often copied from a browser with the filters of a past search. Before a website is read, its URL is
+put in a uniform form (`jobfinder/urlclean.py`):
+
+| Element of the URL | Treatment |
+|---|---|
+| tracking, display and session parameters (`gad_source`, `width`, `hashed`, `createNewAlert`), empty filters, `all` values, search button values | removed |
+| page numbers (`page=3`, `pagenum=3`, `list-b4837029c4_page=1`, `/page/2`) | removed: reading starts on the first page |
+| relevance sorts | removed; date sorts are kept |
+| country and location filters (`location=France`, `countries=fr`, Workday location identifiers), numeric filters of unknown meaning | kept |
+| city lists on company career sites (`city=paris,lyon`) | removed: they hide the rest of France |
+| search words, contract types, domains, specialties on company career sites | removed: the title analysis and the offer types selected in the application apply the same criteria to every website |
+| search words and location on multi-company job boards (Hellowork, Welcome to the Jungle search, optioncarriere, stage.fr, JobTeaser, APEC) | kept: without them a job board lists the entire market |
+| contract types on multi-company job boards | removed when search words remain, kept when they are the only narrowing filter |
+| address of a single offer (`/offres/2025-09455`) or of a moved page (CNRS) | replaced by the address of the list |
+
+The original files are not modified. The websites table of step 1 shows what was removed from each URL, and duplicate
+URLs are merged.
 
 ### Website filters and early stop
 
@@ -183,10 +217,11 @@ The website's own filters are applied whenever they exist, so that fewer and mor
 
 Reading stops as soon as the selected range is covered:
 
-- when the website sorts its list by date (Workday, SuccessFactors, iCIMS, Jibe, Workable, Talentview, sitemap, or a site
+- when the website strictly sorts its list by date (SuccessFactors, iCIMS, Jibe, Workable, Talentview, sitemap, or a site
   where the application selected "newest first" or "posted within"), reading stops at the first offer older than the
   range; for a 24-hour range this is usually the first page;
-- lists assumed but not confirmed to be sorted stop after two pages without any offer in the range;
+- lists that are mostly sorted or assumed to be sorted stop after two pages without any offer in the range; this includes
+  Workday, where some sites pin a block of offers and restart the list after it;
 - lists that cannot be sorted (Phenom, Eightfold, Greenhouse, Lever, Ashby) are retrieved in a few large requests and
   filtered by date before any job page is opened.
 
@@ -216,6 +251,14 @@ Learning H/F", "Senior Data Scientist (m/w/d)") and research-subject titles (for
 la détection d'anomalies dans les séries temporelles"). It removes gender marks and reference codes, detects the
 language, role family, offer type and research topics, and returns one of three verdicts: pass, review by the
 language model, or reject. The topic vocabulary is bilingual: "computer vision" also matches "vision par ordinateur".
+
+Titles made of technical terms are recognised through an extended vocabulary covering the research fields (machine
+learning, deep learning, computer vision, audio and speech, signal processing, NLP, robotics, data science, MLOps) and
+broader technical fields (embedded systems and hardware such as FPGA, ASIC, VHDL or UVM; HPC and GPU; data engineering;
+software and cloud; cybersecurity; control and estimation). A title in a research field passes; a title in a broader
+technical field is reviewed by the language model. Only sales, administrative and support titles, explicitly excluded
+words and unwanted offer types are rejected on the title alone; an internship or thesis subject expressed in
+specialised terms is always reviewed by the language model.
 
 ### AI analysis and CV matching
 
@@ -270,7 +313,9 @@ environment variables and are never copied into the image. If network access is 
 behind a reverse proxy with HTTPS and authentication.
 
 Operational limits are defined in `jobfinder/config.py` (`LIMITS`): 4 websites read in parallel, a maximum duration of
-90 minutes per analysis, 300 job pages opened per website, and 150 offers analysed by the language model per run.
+90 minutes per analysis and 20 minutes per website (also enforced while job pages are being opened), 300 job pages
+opened per website, and 150 offers analysed by the
+language model per run.
 
 ## Project structure
 
@@ -315,6 +360,8 @@ The test suite runs offline. Platform readers are tested against recorded respon
   APEC, JobTeaser, Glassdoor, Hellowork search, Carrefour, Prairie, Master IASD, Welcome to the Jungle, Alten, Tuito
   and optioncarriere search URLs; the LISN offer page is restricted to internal access.
 - When robots.txt forbids a search URL but not the page itself, the page and its sitemap are read instead.
+- Network problems (name resolution, timeouts) are retried and reported as "unreachable", never as "blocked"; a run
+  made while the network is down should be started again.
 - Some career home pages give access to offers only through a search form; the URL of the result list should be
   supplied (for example `https://recrutement.michelin.fr/en/job-offer-result-list`).
 - A portal home page (for example francetravail.fr) is not a job list; the URL of a search result page should be

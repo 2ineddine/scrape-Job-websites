@@ -10,6 +10,7 @@ verdict: pass (clearly wanted) / maybe (the AI reads the description) / reject (
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from dataclasses import dataclass, field
 
 from .web import _wb, norm
@@ -21,8 +22,9 @@ def html_location(soup) -> str:
     add = lambda v: out.append(re.sub(r"\s+", " ", v).strip()) if v and v.strip() else None
     for t in soup.find_all(attrs={"itemprop": re.compile("^(streetAddress|addressLocality|addressRegion|addressCountry)$", re.I)}):
         add(t.get("content") or t.get_text(" ", strip=True))
-    for t in soup.select('[data-careersite-propertyid="location"], .jobGeoLocation, .job-location, .jobLocation, '
-                         '[class*="job-location"], [class*="jobLocation"]'):
+    loc_class = re.compile(r"job-?location|jobgeolocation", re.I)  # one pass ('[class*=...]' selectors are slow)
+    for t in soup.find_all(lambda tag: tag.get("data-careersite-propertyid") == "location"
+                           or any(loc_class.search(c) for c in tag.get("class") or ())):
         add(t.get_text(" ", strip=True)[:120])
     seen, res = set(), []
     for v in out:
@@ -44,7 +46,8 @@ _BOILER = re.compile(r"^(error|erreur|404|page not found|page introuvable|not fo
 
 def is_boilerplate_title(title) -> bool:
     """'Mentions légales', 'Error', 'Politique des cookies'...: a site page, not an offer."""
-    return bool(_BOILER.match(norm(title or "").strip(" -:|")))
+    t = norm(title or "").strip(" -:|")
+    return bool(_BOILER.match(t)) or not re.search(r"[a-z]{2}", t)  # '<': no words, no offer
 
 
 def location_from_text(text) -> str:
@@ -132,7 +135,7 @@ def classify_location(loc, country_hint=None, remote_hint=None, applicant_countr
     elif ch:
         r.update(country_code=ch.upper()[:3], location_verified=True,
                  location_evidence=f"Structured country field = {country_hint}")
-    elif kinds and all(k == "OTHER" for k in kinds):
+    elif "OTHER" in kinds:  # 'United States ; New York ; 130 West 42nd Street': the street is no place, the country is
         r.update(location_verified=True, location_evidence=f"Listing location '{original}' is outside France")
     return r
 
@@ -183,7 +186,9 @@ TOPICS = {
                          "apprentissage federe", "active learning", "transfer learning"],
     "deep learning": ["deep learning", "apprentissage profond", "neural network", "reseau de neurones", "reseaux de neurones",
                       "neuronal", "neuronaux", "transformer", "cnn", "gnn", "graph neural", "diffusion model",
-                      "modele de diffusion", "representation learning", "self supervised", "auto supervise"],
+                      "modele de diffusion", "representation learning", "self supervised", "auto supervise", "pytorch", "tensorflow",
+                      "jax", "keras", "gan", "vae", "autoencoder", "auto encodeur", "vision transformer", "generative model",
+                      "modele generatif", "nerf", "gaussian splatting"],
     "generative ai / llm": ["llm", "large language model", "grand modele de langage", "generative ai", "genai",
                             "ia generative", "foundation model", "modele de fondation", "rag", "agentic", "ai agent",
                             "agent ia", "agents ia", "prompt engineering"],
@@ -196,20 +201,28 @@ TOPICS = {
                         "slam", "optical flow", "remote sensing", "teledetection", "medical imaging", "imagerie medicale",
                         "ocr", "photogrammetrie", "photogrammetry", "stereo vision", "vision 3d", "3d vision",
                         "image reconstruction", "reconstruction d'image", "reconstruction d'images", "computational imaging",
-                        "imagerie computationnelle", "microscopy", "microscopie", "super resolution", "super-resolution"],
+                        "imagerie computationnelle", "microscopy", "microscopie", "super resolution", "super-resolution",
+                        "estimation de pose", "pose 6d", "debruitage", "denoising", "deblurring", "defloutage", "isp",
+                        "image raw", "flux video", "video", "tracking", "suivi d'objets", "suivi d'objet", "depth estimation",
+                        "estimation de profondeur", "hyperspectral", "multispectral", "reconnaissance d'images",
+                        "image recognition", "camera", "cameras", "vision embarquee", "embedded vision"],
     "audio & speech": ["speech", "parole", "audio", "acoustic", "acoustique", "speech recognition", "reconnaissance vocale",
                        "reconnaissance de la parole", "asr", "text to speech", "tts", "synthese vocale", "speaker",
                        "locuteur", "voice", "voix", "music", "musique", "sound", "spatial audio"],
     "signal processing": ["signal processing", "traitement du signal", "traitement de signal", "traitement des signaux",
                           "dsp", "radar", "sonar", "time series", "series temporelles", "serie temporelle",
                           "compressed sensing", "inverse problem", "probleme inverse", "problemes inverses",
-                          "sparse representation", "filtrage", "kalman", "array processing", "antenna processing"],
+                          "sparse representation", "filtrage", "kalman", "array processing", "antenna processing", "beamforming",
+                          "formation de voies", "antenne", "antennes", "antenna", "rf", "radiofrequence", "gnss", "gps",
+                          "sensor fusion", "fusion de capteurs", "fusion de donnees", "navigation inertielle", "inertial",
+                          "imu", "ultrasons", "ultrasound", "wavelet", "ondelettes", "sdr", "telecommunications", "5g", "6g"],
     "nlp": ["nlp", "natural language", "langage naturel", "traitement automatique des langues", "traitement automatique du langage",
             "tal", "text mining", "fouille de texte", "information extraction", "extraction d'information",
             "traduction automatique", "machine translation", "chatbot", "conversational ai", "ia conversationnelle"],
     "robotics": ["robotics", "robotique", "robot", "autonomous", "autonome", "autonomes", "drone", "drones", "uav",
                  "motion planning", "planification de trajectoire", "manipulation robotique", "cobot", "mechatronics",
-                 "mecatronique", "perception", "self driving", "vehicule autonome", "adas"],
+                 "mecatronique", "perception", "self driving", "vehicule autonome", "adas", "ros", "ros2", "humanoid", "humanoide",
+                 "legged", "manipulation", "navigation autonome", "autonomous navigation"],
     "data science": ["data science", "data scientist", "science des donnees", "data mining", "fouille de donnees",
                      "predictive", "predictif", "predictive maintenance", "maintenance predictive", "forecasting",
                      "recommendation system", "systeme de recommandation", "anomaly detection", "detection d'anomalies",
@@ -217,7 +230,31 @@ TOPICS = {
                      "operations research", "recherche operationnelle", "statistical modeling", "modelisation statistique"],
     "mlops / deployment": ["mlops", "ml ops", "model deployment", "deploiement de modeles", "edge ai", "embedded ai",
                            "ia embarquee", "model serving", "tinyml", "quantization"],
+    "embedded & hardware": ["fpga", "asic", "soc", "system on chip", "vhdl", "verilog", "systemverilog", "rtl", "uvm",
+                            "dft", "design for testability", "microelectronique", "microelectronics", "electronique",
+                            "electronics", "embarque", "embedded", "firmware", "microcontroleur", "microcontroller",
+                            "linux embarque", "embedded linux", "rtos", "hardware", "semiconducteur", "semiconductor",
+                            "circuits integres", "integrated circuit", "analogique", "analog", "mixed signal",
+                            "photonique", "photonics", "verification d'ips", "ip digitale", "ips digitales"],
+    "hpc & gpu": ["hpc", "high performance computing", "calcul haute performance", "gpu", "cuda", "parallel computing",
+                  "calcul parallele", "calcul scientifique", "scientific computing", "simulation numerique",
+                  "numerical simulation", "methodes numeriques", "numerical methods"],
+    "data engineering": ["data engineer", "data engineering", "ingenieur data", "spark", "databricks", "hadoop", "kafka",
+                         "airflow", "dbt", "etl", "big data", "snowflake", "data platform", "data pipeline", "datalake",
+                         "data lake"],
+    "software & cloud": ["kubernetes", "docker", "devops", "sre", "cloud", "aws", "azure", "gcp", "rust", "golang",
+                         "temps reel", "real time", "backend", "full stack", "fullstack", "microservices", "logiciel embarque",
+                         "embedded software"],
+    "cybersecurity": ["cybersecurite", "cybersecurity", "cyber securite", "securite informatique", "pentest",
+                      "cryptographie", "cryptography", "soc analyst", "analyste soc"],
+    "control & estimation": ["automatique", "control theory", "theorie du controle", "commande", "loi de commande",
+                             "controle moteur", "motor control", "observateur", "observer", "estimation d'etat",
+                             "state estimation", "mpc", "model predictive control", "identification de systemes",
+                             "system identification", "controle commande"],
 }
+# broad technical fields: never rejected, but read by the AI rather than passed on the title alone
+TECH_FIELDS = {"embedded & hardware", "hpc & gpu", "data engineering", "software & cloud", "cybersecurity",
+               "control & estimation"}
 _TOPIC_TERMS = [(t, _clean(x)) for t, xs in TOPICS.items() for x in xs]
 
 
@@ -229,12 +266,18 @@ def title_topics(text: str) -> list[str]:
 def expand_keywords(keywords) -> list[str]:
     """A profile keyword that belongs to a topic brings that topic's other spellings ('computer vision' also finds
     'vision par ordinateur'). Generic words (ai / ia) are not expanded."""
+    return list(_expand(tuple(keywords or ())))
+
+
+@lru_cache(maxsize=32)
+def _expand(keywords: tuple) -> tuple:  # the profile does not change during a search: computed once
+    topics = [[_clean(x) for x in xs] for xs in TOPICS.values()]
     out = [_clean(k) for k in keywords if _clean(k)]
     for k in list(out):
-        for topic, xs in TOPICS.items():
-            if len(k) > 3 and any(_clean(x) == k for x in xs):
-                out += [_clean(x) for x in xs if len(_clean(x)) > 3]
-    return list(dict.fromkeys(out))
+        for xs in topics:
+            if len(k) > 3 and k in xs:
+                out += [x for x in xs if len(x) > 3]
+    return tuple(dict.fromkeys(out))
 
 
 # ---- 4. roles and contracts
@@ -280,7 +323,12 @@ GENERIC_TECH = ("engineer", "ingenieur", "scientist", "scientifique", "chercheur
                 "recherche", "r&d", "data", "developer", "developpeur", "analyst", "architect", "model", "models",
                 "modele", "modeles", "deploy", "deploying", "deployment", "deploiement", "inference", "pipeline",
                 "algorithm", "algorithme", "mlops", "modelisation", "analytics", "python", "engineering", "ingenierie",
-                "enhancement", "transformer", "simulation", "numerique", "computational", "calcul")
+                "enhancement", "transformer", "simulation", "numerique", "computational", "calcul", "software",
+                "logiciel", "hardware", "embedded", "embarque", "systeme", "systemes", "system", "systems",
+                "electronique", "verification", "validation", "conception", "design", "developpement", "development",
+                "capteur", "capteurs", "sensor", "sensors", "physique", "physics", "mathematiques", "mathematics",
+                "statistique", "statistics", "optique", "optics", "mecanique", "mechanical", "estimation", "technique",
+                "technical", "prototype", "prototypage", "test", "tests", "integration")
 
 # ---- 5. research-topic titles: a subject stated as a problem rather than a job name
 _SUBJECT_LEAD = re.compile(r"^(sujet|subject|topic|projet de recherche|research project|project|projet|offre de these|"
@@ -405,6 +453,9 @@ def _topic_verdict(info, t, d, profile):
     hit = [k for k in expand_keywords(profile.get("keywords", [])) if _kw(k, t)]
     if hit and info.role_family != "management":
         return done("pass", f"title matches {hit[:3]}")
+    core = [x for x in info.topics if x not in TECH_FIELDS]
+    if info.topics and not core:  # FPGA, Spark, Kubernetes...: a technical offer outside the research topics
+        return done("maybe", f"technical field {', '.join(info.topics[:3])}: AI decides")
     if info.topics:
         if info.role_family in ("research", "engineering") or info.kind == "research_topic":
             return done("pass", f"{'research subject' if info.kind == 'research_topic' else 'title'} on {', '.join(info.topics[:3])}")
@@ -420,6 +471,8 @@ def _topic_verdict(info, t, d, profile):
         return done("maybe", f"department matches {dh[:2]}")
     if any(_kw(g, t) for g in GENERIC_TECH):
         return done("maybe", "technical title: judged from the description")
+    if info.training in ("internship", "phd_postdoc", "apprenticeship") and len(t.split()) >= 4:
+        return done("maybe", "subject-like internship / thesis title with specialised terms: judged from the description")
     return done("reject", "no research / technical term in the title")
 
 

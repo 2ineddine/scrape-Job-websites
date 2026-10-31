@@ -26,7 +26,7 @@ from .config import PRESET_DAYS, PROFILE_DEFAULT, utcnow
 from .dates import NO_DATE, _cfg_day, merge_dates, reconcile_date, refine_raw_date
 from .llm import AIError, RequestTooLarge, call_json
 from .store import SessionLocal
-from .web import UA, AccessError, check_url, normalize_url, syntactic_ok
+from .web import PARSER, UA, AccessError, check_url, normalize_url, syntactic_ok
 
 # Elements the browser must never click, whatever the AI says (applications, accounts, forms, alerts).
 DENY = re.compile(r"apply|postuler|candidater|sign ?in|log ?in|connexion|se connecter|register|create account|"
@@ -497,6 +497,7 @@ def crawl_ai(f, url, cfg, known, st):
     seen, steps, pages, details, stalls, dismissed, hops, refused = set(known), 0, 0, 0, 0, 0, 0, 0
     probes = 0
     filters_done = False  # the website's own filters are used once per website
+    unfiltered = None  # (url, jobs seen) before the filters: the way back if the filters hide every job
     carry = []  # jobs found in JSON the page downloaded, waiting for the next harvest
     with sync_playwright() as pw, SessionLocal() as s:
         browser = pw.chromium.launch()
@@ -539,6 +540,14 @@ def crawl_ai(f, url, cfg, known, st):
                     if _click(pg, frame, items, view.open_listing_element):
                         continue
                 heur_idx = _heuristic_jobs(items) if no_jobs and view.page_kind != "landing" else []
+                if unfiltered and no_jobs and not heur_idx:  # the filters hid the list (a panel of 150 checkboxes...)
+                    back, carry = unfiltered
+                    unfiltered = None
+                    f.note("the website's filters left no job on the page: back to the unfiltered list")
+                    _goto(pg, back, f, cfg)
+                    capture.take()
+                    continue
+                unfiltered = None
                 if no_jobs and not heur_idx and pages == 0:
                     return  # nothing recognisable on this page
 
@@ -547,11 +556,12 @@ def crawl_ai(f, url, cfg, known, st):
                         and view.page_kind in ("listing", "other")):
                     filters_done = True
                     backup, carry = carry, []  # jobs seen BEFORE filtering are dropped if the filters change the list
+                    unfiltered = (pg.url, backup)
                     if apply_site_filters(pg, cfg, s, f.note):
                         capture.take()
                         f.note("website filters applied: reading the filtered list")
                         continue
-                    carry = backup
+                    carry, unfiltered = backup, None
 
                 # ---- 1. collect every job candidate of this page (complete jobs, JSON jobs, links, cards)
                 entries, heur_urls, cards, cur = {}, set(), [], normalize_url(pg.url)
@@ -562,7 +572,7 @@ def crawl_ai(f, url, cfg, known, st):
                         entries[nu] = raw
                     return nu
 
-                for j in _jsonld_jobs(BeautifulSoup(pg.content(), "html.parser"), pg.url):
+                for j in _jsonld_jobs(BeautifulSoup(pg.content(), PARSER), pg.url):
                     add(j)
                 for j in carry:
                     add(j)

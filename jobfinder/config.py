@@ -25,7 +25,9 @@ CONFIG_DEFAULT = {
     "date_preset": "Last 30 days",
     "min_relevance": 60,
     "send_cv_remote_ok": False,
-    "model": {"provider": "ollama", "model": "llama3.1"},  # ONE model used for every AI task
+    "cv_consent_providers": [],  # with automatic switching: the hosted providers allowed to receive the CV
+    "auto_models": True,  # start with the most capable model, move down the ladder when a limit is reached (llm.LADDER)
+    "model": {"provider": "ollama", "model": "llama3.1"},  # the one model when automatic switching is off, else the last resort
     "providers": {
         "ollama": {"base_url": "http://localhost:11434"},
         "openai": {"base_url": "https://api.openai.com/v1"},
@@ -33,6 +35,8 @@ CONFIG_DEFAULT = {
         "groq": {"base_url": "https://api.groq.com/openai/v1"},
         "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta"},
         "anthropic": {"base_url": "https://api.anthropic.com/v1"},
+        "xai": {"base_url": "https://api.x.ai/v1"},
+        "cohere": {"base_url": "https://api.cohere.ai/compatibility/v1"},
     },
 }
 

@@ -28,6 +28,7 @@ inside a company's own career page). Anything else is read by the generic crawle
 from __future__ import annotations
 
 import json
+from html import unescape
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -70,6 +71,9 @@ class ScanState:
     redirect: tuple | None = None  # (platform, argument): the page's offers live on this job platform, with their dates
     held: list = field(default_factory=list)  # the page's own offers, kept in case that platform cannot be read
     more_pages: bool = False  # the list has more pages the crawler may not open (script links, robots.txt): use the sitemap
+    announced: int | None = None  # the number of results the website's own page announces ('154 results')
+    skipped: int = 0  # offers on the list that were not opened because their title is clearly not wanted
+    page_titles: list = field(default_factory=list)  # offer titles on the website's own page, when its reader was found there
 
 
 def _raw(title, url, **kw):
@@ -297,6 +301,7 @@ def _strings(o, d=0):
 def _as_job(o, base):
     if not isinstance(o, dict):
         return None
+    o = o["_source"] if isinstance(o.get("_source"), dict) else o  # Elasticsearch wraps every result (IBM)
     n = {}
     for k, v in o.items():
         n.setdefault(_k(k), v)
@@ -456,7 +461,10 @@ def _parse_detail(html, url, now=None, card=None):
         job = ld[0]
         job["url"] = job["apply_url"] = url
     else:
-        h1 = soup.find("h1")
+        # the site's logo is sometimes an <h1> linking home ('<h1><a href="/">Recrutement</a></h1>'): not the offer's title
+        home = lambda h: (a := h.find("a", href=True)) and urlparse(urljoin(url, a["href"])).path in ("", "/") \
+            and a.get_text(" ", strip=True) == h.get_text(" ", strip=True)
+        h1 = next((h for h in soup.find_all("h1") if h.get_text(" ", strip=True) and not home(h)), None)
         title = h1.get_text(" ", strip=True) if h1 else _page_title(soup, url)
         job = _raw(title, url, description=_content_text(soup, "main", 15000), conf=0.4, provenance="html-fallback")
     if not job["location"]:
@@ -777,6 +785,12 @@ def _workday_france(facets):
                 stack.append((v.get("facetParameter") or param, v))
             elif norm(v.get("descriptor") or "") == "france" and "country" in norm(param or ""):
                 return {param: [v["id"]]}
+    # no country list: the offices in France of its location list (Sonos)
+    for f in facets or []:
+        ids = [v["id"] for v in f.get("values") or [] if "id" in v and "location" in norm(f.get("facetParameter") or "")
+               and re.search(r"\bfrance\b|\bfr\b", norm(v.get("descriptor") or ""))]
+        if ids:
+            return {f["facetParameter"]: ids}
     return {}
 
 
@@ -846,7 +860,7 @@ def _rmk_list(url):
 def _rmk_france(f, url, cfg):
     """The site's own country filter (a 'optionsFacetsDD_country' list offering France), when it has one and the URL
     does not already choose a country."""
-    if not _wants_france(cfg) or "optionsFacetsDD_country" in url or "/go/" in urlparse(url).path:
+    if not _wants_france(cfg) or re.search(r"optionsFacetsDD_country|locationsearch", url) or "/go/" in urlparse(url).path:
         return url
     try:
         soup = BeautifulSoup(f.get(_rmk_list(url)(0)).text, PARSER)
@@ -857,12 +871,21 @@ def _rmk_france(f, url, cfg):
     sel = soup.find("select", attrs={"name": "optionsFacetsDD_country"}) or soup.find("select", id=re.compile("country", re.I))
     opt = next((o for o in (sel.find_all("option") if sel else []) if norm(o.get_text(" ", strip=True)).startswith("france")
                 or (o.get("value") or "").upper() == "FR"), None)
-    if not opt or not opt.get("value"):
-        return url
-    f.note("successfactors: the website's country filter 'France' is applied")
     p = urlparse(url)
-    q = [(k, v) for k, v in parse_qsl(p.query) if k != "optionsFacetsDD_country"] + [("optionsFacetsDD_country", opt["value"])]
-    return urlunparse(p._replace(path=p.path if "search" in p.path else "/search/", query=urlencode(q)))
+    # no country list: its location search, which every SuccessFactors career site has
+    pick = ("optionsFacetsDD_country", opt["value"]) if opt and opt.get("value") else ("locationsearch", "France")
+    q = [(k, v) for k, v in parse_qsl(p.query) if k != pick[0]] + [pick]
+    filtered = urlunparse(p._replace(path=p.path if "search" in p.path else "/search/", query=urlencode(q)))
+    try:
+        if pick[0] == "locationsearch" and not BeautifulSoup(f.get(_rmk_list(filtered)(0)).text, PARSER).select(
+                "tr.data-row, li.job-tile, div.job-tile"):
+            return url  # that search finds nothing: the whole list, the location of each offer is checked afterwards
+    except AccessError:
+        raise
+    except Exception:
+        return url
+    f.note(f"successfactors: the website's filter '{pick[0]}' France is applied")
+    return filtered
 
 
 def crawl_successfactors(f, url, cfg, known, st):
@@ -1150,6 +1173,49 @@ def crawl_talentview(f, company, cfg, known, st):
     st.truncated = True
 
 
+def _softy_page(html):
+    """Softy pages (Inertia.js) carry their whole content as JSON in <script data-page="app">."""
+    m = re.search(r"<script[^>]*data-page=[\"']app[\"'][^>]*>(.*?)</script>", html, re.S)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1)).get("props", {})
+    except ValueError:
+        return json.loads(unescape(m.group(1))).get("props", {})  # the JSON may come HTML-escaped
+
+
+def crawl_softy(f, origin, cfg, known, st):
+    """<company>.softy.pro (Inserm): 21 offers per page, the newest 'updated_at' first, which the site shows as
+    'Mise en ligne le' on each card. The offer page's data holds the description."""
+    budget = _Budget(cfg, st)
+    for n in range(1, cfg["max_pages"] + 1):
+        r = f.get(f"{origin}/offers?page={n}")
+        box = _softy_page(r.text).get("offers") or {}
+        jobs = []
+        for p in box.get("data") or []:
+            locs = p.get("locations") or []
+            place = ", ".join(dict.fromkeys(x for x in (locs[0].get("city"), locs[0].get("country")) if x)) if locs else ""
+            u = f"{origin}/offers/{p.get('softy_id') or p.get('id')}"
+            raw = _raw(p.get("title", ""), u, employer=p.get("subsidiary_name") or "", location=place,
+                       country_hint=locs[0].get("country") if locs else None,
+                       employment_type=(p.get("contract_type") or {}).get("name", ""), platform_id=str(p.get("id", "")),
+                       conf=0.8, provenance="softy-api", **_date(p.get("updated_at"), "softy 'mise en ligne' (updated_at)", 0.6))
+            if normalize_url(u) not in known and worth_opening(cfg, raw) and budget.take():
+                try:
+                    o = _softy_page(f.get(u).text).get("offer") or {}
+                    raw.update(description=html_to_text(" ".join(o.get(k) or "" for k in
+                                                                 ("description_html", "searched_profile_html")))[:15000])
+                except AccessError:
+                    raise
+                except Exception as e:
+                    f.note(f"softy detail failed {u}: {e}")
+            jobs.append(raw)
+        yield Page(f"page={n}", r.url, jobs, total=box.get("last_page"), sorted=True)
+        if not jobs or not box.get("next_page_url"):
+            return
+    st.truncated = True
+
+
 _WP_SKIP = {"post", "page", "attachment", "nav_menu_item", "wp_block", "wp_template", "wp_template_part", "wp_navigation",
             "wp_font_family", "wp_font_face", "wp_global_styles", "elementor_library", "product"}
 _WP_JOBTYPE = re.compile(r"job|offre|offer|emploi|vacanc|poste|position|career|carri|recrut|annonce|opening", re.I)
@@ -1250,6 +1316,8 @@ def detect_from_url(url):
         return "workable", seg[0]
     if host.endswith(".icims.com"):
         return "icims", url
+    if host.endswith(".softy.pro") and host.split(".")[0] not in _VENDOR_SUB | {"recrutement", "sc"}:
+        return "softy", _origin(url)
     return None
 
 
@@ -1272,7 +1340,7 @@ def detect_from_page(f, url, html):
     for a in soup.find_all(["a", "iframe", "script"], href=True) + soup.find_all(["iframe", "script"], src=True):
         found = detect_from_url(urljoin(url, a.get("href") or a.get("src")))
         if found and found[0] in ("greenhouse", "lever", "ashby", "workday", "breezy", "recruitee", "teamtailor",
-                                  "talentview", "workable", "eightfold"):
+                                  "talentview", "workable", "eightfold", "softy"):
             return found
     gh = list(dict.fromkeys(re.findall(r"(?:boards-api\.greenhouse\.io/v1/boards|(?:job-)?boards\.greenhouse\.io)/([\w-]+)", html)))
     gh = [t for t in gh if t not in ("embed", "v1")]
@@ -1391,4 +1459,4 @@ ADAPTERS = {"greenhouse": crawl_greenhouse, "lever": crawl_lever, "ashby": crawl
             "teamtailor": crawl_feed, "talentsoft": crawl_talentsoft, "rss": crawl_feed,
             "successfactors": crawl_successfactors, "icims": crawl_icims, "wordpress": crawl_wordpress,
             "phenom": crawl_phenom, "eightfold": crawl_eightfold, "jibe": crawl_jibe, "workable": crawl_workable,
-            "talentview": crawl_talentview}
+            "talentview": crawl_talentview, "softy": crawl_softy}

@@ -431,6 +431,8 @@ def analyze_title(title, dept="", profile=None, employment_type="") -> TitleInfo
     want = wanted_types(profile)
     if info.training and info.training not in want:
         return done("reject", f"{OFFER_TYPES[info.training].split(' (')[0].lower()} not wanted ({why})")
+    if info.training and len(t.split()) == 1:
+        return done("maybe", "the title only says the kind of offer ('Stagiaire'): the offer itself tells the subject")
     if not info.training and "job" not in want and info.contract in ("cdi", "cdd", "freelance", "interim"):
         return done("reject", f"{info.contract.upper()} job: you look for {', '.join(sorted(want))}")
     info = _topic_verdict(info, t, d, profile)

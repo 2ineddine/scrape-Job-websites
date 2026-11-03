@@ -355,14 +355,16 @@ def _cfg_day(v):
     return d.date() if d else None
 
 
-def _in_window(day, cfg, now):
-    """Calendar-day comparison (a date-only value has no time of day, so hours must not matter)."""
+def _window(cfg, now):
     today, preset = now.date(), cfg["date_preset"]
     if preset == "Custom date range":
-        lo = _cfg_day(cfg.get("date_from")) or datetime.min.date()
-        hi = _cfg_day(cfg.get("date_to")) or today + timedelta(days=1)
-    else:
-        lo, hi = today - timedelta(days=PRESET_DAYS.get(preset, 30)), today + timedelta(days=1)
+        return (_cfg_day(cfg.get("date_from")) or datetime.min.date(), _cfg_day(cfg.get("date_to")) or today + timedelta(days=1))
+    return today - timedelta(days=PRESET_DAYS.get(preset, 30)), today + timedelta(days=1)
+
+
+def _in_window(day, cfg, now):
+    """Calendar-day comparison (a date-only value has no time of day, so hours must not matter)."""
+    lo, hi = _window(cfg, now)
     return lo <= day <= hi
 
 
@@ -385,6 +387,10 @@ def date_decision(pub, conf, cfg, now=None, text=None):
                 ok = verdicts.pop()
                 return ok, ("both readings of '%s' (%s) are %s '%s'" %
                             (text, " / ".join(f"{r:%Y-%m-%d}" for r in reads), "inside" if ok else "outside", preset))
+        if text and _is_relative(text):  # 'il y a 1 an', '30+ days ago': vague, but a lower bound of the offer's age
+            newest = (now - (now - pub) * 0.85).date()  # 'a year ago' is shown from about 11 months
+            if newest < _window(cfg, now)[0]:
+                return False, f"'{text}': published before {newest:%Y-%m-%d}, outside '{preset}'"
         return None, "publication date unknown"
     if _in_window(pub.date(), cfg, now):
         return True, f"published {pub:%Y-%m-%d}, inside window"

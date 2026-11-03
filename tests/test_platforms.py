@@ -264,42 +264,59 @@ def test_page_text_is_fast_on_deep_pages():
     assert "ligne 1499" in text and "menu" not in text and time.time() - t < 2
 
 
-def test_career_urls_get_one_uniform_form():
+def test_career_urls_become_the_main_page():
     from jobfinder.urlclean import clean_source_url
     c = lambda u: clean_source_url(u)[0]
-    # company sites: search words, contract types, page numbers, relevance sorts and tracking go; France stays
+    # company sites: every filter goes, France and date included; the language and what the page needs stay
     assert c("https://joining.bouygues.com/global/en/search-results?keywords=audio") == \
         "https://joining.bouygues.com/global/en/search-results"
     assert c("https://careers.se.com/jobs?lang=en-US&location=France&woe=12&page=2&sortBy=relevance&keywords=data%20science") \
-        == "https://careers.se.com/jobs?lang=en-US&location=France"
-    assert c("https://www.alten.fr/carriere/jobs/?sortby=date&job_search=ia&pagenum=3&per_page=25") == \
-        "https://www.alten.fr/carriere/jobs/?sortby=date"
-    assert c("https://recrute.carrefour.fr/offres?order=desc&sort=post_date_extern&contract_type=Stage") == \
-        "https://recrute.carrefour.fr/offres?order=desc&sort=post_date_extern"
+        == "https://careers.se.com/jobs?lang=en-US"
+    assert c("https://www.alten.fr/carriere/jobs/?sortby=date&job_search=ia&pagenum=3&per_page=25") == "https://www.alten.fr/carriere/jobs/"
+    assert c("https://recrute.carrefour.fr/offres?order=desc&sort=post_date_extern&contract_type=Stage") == "https://recrute.carrefour.fr/offres"
     assert c("https://careers.datadoghq.com/all-jobs/?igaag=&igacm=236&gad_source=1") == "https://careers.datadoghq.com/all-jobs/"
     assert c("https://recrutement.sfr.com/offer/page/1") == "https://recrutement.sfr.com/offer/"
-    assert c("https://www.ibm.com/careers/search?field_keyword_05%5B0%5D=France").endswith("=France")
-    assert c("https://cgi.njoyn.com/corp/xweb/xweb.asp?CLID=21001&page=joblisting&CountryID=FR").endswith("page=joblisting&CountryID=FR")
+    assert c("https://www.ibm.com/careers/search?field_keyword_05%5B0%5D=France") == "https://www.ibm.com/careers/search"
+    assert c("https://cgi.njoyn.com/corp/xweb/xweb.asp?CLID=21001&page=joblisting&CountryID=FR&lang=2") == \
+        "https://cgi.njoyn.com/corp/xweb/xweb.asp?CLID=21001&page=joblisting&lang=2"
+    assert c("https://www.emploi.cea.fr/offre-de-emploi/liste-offres.aspx?page=3&LCID=1036").endswith("liste-offres.aspx?LCID=1036")
+    assert c("https://www.inetum.com/fr/jobs.html?list-b4837029c4_page=1") == "https://www.inetum.com/fr/jobs.html"
+    assert c("https://www.wavestone.com/en/careers/our-offers?city=paris,lyon&sort=desc") == "https://www.wavestone.com/en/careers/our-offers"
+    assert c("https://jobs.siemens.com/en_US/externaljobs/SearchJobs/deep%20learning?42386=[812134]&listFilterMode=1") == \
+        "https://jobs.siemens.com/en_US/externaljobs/SearchJobs"
+    # saved searches written in the path
+    assert c("https://jobs.atos.net/go/Jobs-in-France/3677001") == "https://jobs.atos.net/"
+    assert c("https://careers.lkqeurope.com/France/go/Welcome-to-LKQ-France/9357555") == "https://careers.lkqeurope.com/"
+    assert c("https://jobs.sanofi.com/en/search-jobs/France/2649/2/3017382/46/2/50/2") == "https://jobs.sanofi.com/en/search-jobs"
     # multi-company job boards: their search IS the search
     assert "s=AI+Research+Scientist" in c("https://www.optioncarriere.com/emploi?s=AI+Research+Scientist&l=France")
     assert "query=stage" in c("https://www.welcometothejungle.com/fr/jobs?query=stage+deep+learning&page=3")
     assert "page=" not in c("https://www.welcometothejungle.com/fr/jobs?query=stage+deep+learning&page=3")
-    # filters that were left behind: list ids in page names, button values, 'all' values, cities, trailing spaces
-    assert c("https://www.inetum.com/fr/jobs.html?list-b4837029c4_page=1") == "https://www.inetum.com/fr/jobs.html"
-    assert c("https://www.viveris.fr/nous-rejoindre?eolia_search=Rechercher&keywords=") == "https://www.viveris.fr/nous-rejoindre"
-    assert c("https://www.wavestone.com/en/careers/our-offers?city=paris,lyon&sort=desc") == \
-        "https://www.wavestone.com/en/careers/our-offers?sort=desc"
     assert c("https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+ml+&cod=all&d=all") == \
         "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+ml"
-    # a board's contract filter goes when search words remain, and stays when it is all that narrows the list
     assert c("https://jobs.makesense.org/en/s/jobs/all/all/cdi?contracts=cdd&sortBy=relevance&s=Data+scientist") == \
         "https://jobs.makesense.org/en/s/jobs/all/all?s=Data+scientist"
     assert "typesConvention=1" in c("https://www.apec.fr/candidat/recherche-emploi.html/emploi?lieux=75&typesConvention=1")
-    # one address for one list: a single offer gives its list, a moved page its new address
+    # one address for one list
     assert c("https://jobs.inria.fr/public/classic/fr/offres/2025-09455") == "https://jobs.inria.fr/public/classic/fr/offres"
     assert c("https://emploi.cnrs.fr/Recherche.aspx?bassin=INDEF&type=STAG&texte=") == "https://emploi.cnrs.fr/Offres/Recherche.aspx"
-    # a numeric filter of unknown meaning stays: Siemens' '42386' is its France filter
-    assert "42386=" in c("https://jobs.siemens.com/en_US/externaljobs/SearchJobs/deep%20learning?42386=[812134]&listFilterMode=1")
+
+
+def test_the_app_puts_back_france_and_the_date_itself():
+    from jobfinder.sitefilters import with_own_filters
+    cfg = {"site_filter_location": "France"}
+    assert with_own_filters("https://www.capgemini.com/careers/join-capgemini/job-search", cfg).endswith("?country_code=fr-fr,FRA")
+    assert with_own_filters("https://cgi.njoyn.com/corp/xweb/xweb.asp?CLID=21001&lang=2", cfg).endswith("&CountryID=FR")
+    assert with_own_filters("https://recrute.carrefour.fr/offres", {}).endswith("?order=desc&sort=post_date_extern")  # newest first always
+    assert with_own_filters("https://www.capgemini.com/x", {}) == "https://www.capgemini.com/x"  # France not asked
+    assert with_own_filters("https://other.fr/jobs", cfg) == "https://other.fr/jobs"
+
+
+def test_workday_france_offices_without_a_country_list():
+    from jobfinder.adapters import _workday_france
+    facets = [{"facetParameter": "locations", "values": [{"id": "a", "descriptor": "Paris, France"}, {"id": "b", "descriptor": "Boston, USA"}]}]
+    assert _workday_france(facets) == {"locations": ["a"]}
+    assert _workday_france([{"facetParameter": "locationCountry", "values": [{"id": "c", "descriptor": "France"}]}]) == {"locationCountry": ["c"]}
 
 
 def test_job_board_is_not_read_as_an_employer_platform():
@@ -449,3 +466,418 @@ def test_ai_reads_the_most_promising_offers_first():
     jobs = [mk("maybe new", "maybe", "candidate", 30), mk("pass unknown date", "pass", "review", None),
             mk("pass old", "pass", "candidate", 2), mk("pass new", "pass", "candidate", 29)]
     assert [j.name for j in _by_priority(jobs)] == ["pass new", "pass old", "pass unknown date", "maybe new"]
+
+
+def test_announced_total_reads_only_real_counters():
+    from jobfinder.crawler import announced_total
+    n = lambda h: announced_total(BeautifulSoup(h, "html.parser"))
+    assert n("<div>Filter</div><span>154\n results</span>") == 154
+    assert n("<p>1 - 6 of 1,254 jobs</p>") == 1254
+    assert n("<p>12 offres d'emploi</p>") == 12
+    assert n("<p>Plus de 5000 postes ouverts dans le monde</p>") is None
+    assert n("<a>120 jobs</a><p>Nos offres</p>") is None
+
+
+def test_wrong_reader_needs_other_offers_from_another_website():
+    from jobfinder.crawler import wrong_reader
+    page = ["offre a", "offre b", "offre c", "offre d", "offre e"]
+    other = [{"title": "Melbourne engineer", "url": "https://employer.successfactors.eu/job/1"}]
+    assert wrong_reader(page, other, "https://careers.acme.fr/list")
+    assert not wrong_reader(page[:4], other, "https://careers.acme.fr/list")  # too few titles to tell
+    assert not wrong_reader(page, [{"title": "Offre A", "url": "https://x.greenhouse.io/1"}], "https://careers.acme.fr/list")
+    # its own website: the reader applied the France filter, so the offers may differ from the page
+    assert not wrong_reader(page, [{"title": "Autre", "url": "https://jobs.acme.fr/1"}], "https://www.acme.fr/list")
+
+
+def test_read_outcome_tells_what_a_reading_gave():
+    from jobfinder.adapters import ScanState
+    from jobfinder.scan import read_outcome
+
+    class S:
+        def __init__(self, mem=None):
+            self.mem, self.added = mem, []
+
+        def get(self, _, __):
+            return self.mem
+
+        def add(self, x):
+            self.added.append(x)
+
+    u = "https://a.fr/jobs"
+    assert read_outcome(S(), u, "completed", 3, 10, ScanState())[0] == "offers_found"
+    assert read_outcome(S(), u, "completed", 0, 10, ScanState())[0] == "nothing_in_range"
+    assert read_outcome(S(), u, "completed", 0, 0, ScanState())[0] == "no_offers_detected"
+    assert read_outcome(S(), u, "blocked", 0, 0, ScanState()) == ("", "")
+    out, note = read_outcome(S(), u, "completed", 20, 20, ScanState(announced=154))
+    assert out == "partial" and "154" in note
+    # a list left early because of the dates is not compared with the total
+    assert read_outcome(S(), u, "completed", 20, 20, ScanState(announced=154, stopped_by_date=True))[0] == "offers_found"
+    mem = type("M", (), {"usual": 300})()
+    out, note = read_outcome(S(mem), u, "completed", 3, 3, ScanState())
+    assert out == "partial" and "300" in note and mem.usual == 300  # a bad reading does not become the new normal
+
+
+def test_undated_offer_is_hidden_once_first_seen_before_the_range():
+    from datetime import datetime, timedelta
+    from jobfinder.dates import date_decision
+    cfg = CFG(date_preset="Last 7 days")
+    now = datetime(2026, 11, 1)
+    assert date_decision(now - timedelta(days=20), 1.0, cfg, now)[0] is False
+    assert date_decision(now - timedelta(days=2), 1.0, cfg, now)[0] is True
+
+
+def test_suggest_page_finds_the_new_address():
+    from jobfinder.crawler import suggest_page
+
+    class F:
+        def get(self, url, **kw):
+            html = {"https://lab.fr/": '<a href="/contact">Contact</a><a href="/old">Emploi</a><a href="/rejoindre">Nous rejoindre</a>',
+                    "https://lab.fr/rejoindre": "<h1>Nous rejoindre</h1>" + "<p>texte de la page</p>" * 30}.get(url)
+            if html is None:
+                raise ConnectionError("HTTP 404")
+            return type("R", (), {"text": html})()
+
+        def robots_ok(self, url):
+            return True
+
+    assert suggest_page(F(), "https://lab.fr/old") == "https://lab.fr/rejoindre"
+
+
+def test_elasticsearch_results_are_read():
+    from jobfinder.adapters import jobs_from_json
+    data = {"hits": {"total": {"value": 1}, "hits": [{"_id": "ab", "_score": 0, "_source": {
+        "url": "https://careers.ibm.com/careers/JobDetail?jobId=134659", "title": "Développeur Cobol H/F"}}]}}
+    assert [j["title"] for j in jobs_from_json(data, "https://www.ibm.com/careers/search")] == ["Développeur Cobol H/F"]
+
+
+def test_offer_links_with_the_id_in_the_query_and_reference_as_first_link():
+    from jobfinder.crawler import _card_title, _job_links
+    html = """<table><tr><td><a href="xweb.asp?clid=1&Page=JobDetails&Jobid=J1026-2917">J1026-2917</a></td>
+              <td><a href="xweb.asp?clid=1&Page=JobDetails&Jobid=J1026-2917">Ingénieur vision par ordinateur</a></td></tr></table>
+              <a href="xweb.asp?clid=1&Page=Help">Aide</a>"""
+    base = "https://cgi.njoyn.com/corp/xweb/xweb.asp?clid=1"
+    soup = BeautifulSoup(html, "html.parser")
+    links = _job_links(soup, base, set())
+    assert len(links) == 1 and "Jobid=J1026-2917" in links[0]
+    assert _card_title(soup, base, links[0]) == "Ingénieur vision par ordinateur"
+
+
+def test_card_title_used_when_job_pages_share_the_website_heading():
+    html_list = """<a href="/fr/offres-emplois/ingenieur-a"><h3>Ingénieur prototypage</h3></a>
+                   <a href="/fr/offres-emplois/doctorant-b"><h3>Doctorant composition assistée par IA</h3></a>"""
+    body = "<h1>Découvrir le laboratoire</h1><main>" + "<p>Missions du poste, profil, compétences, candidature, contrat, stage.</p>" * 12 + "</main>"
+
+    class F(FakeFetcher):
+        def get(self, url, **kw):
+            return type("R", (), {"text": html_list if url.endswith("/jobs") else body, "url": url, "status_code": 200})()
+
+        def robots_ok(self, url):
+            return True
+
+        def note(self, m):
+            pass
+
+    from jobfinder.crawler import crawl_generic
+    cfg = {**CFG(), "_profile": {**CFG()["_profile"], "offer_types": ["job", "internship", "phd_postdoc", "apprenticeship"]}}
+    titles = {j["title"] for pg in crawl_generic(F({}), "https://lab.fr/jobs", cfg, set(), ScanState()) for j in pg.jobs}
+    assert "Ingénieur prototypage" in titles and "Découvrir le laboratoire" not in titles
+
+
+def test_list_page_found_from_a_careers_home_page():
+    from jobfinder.crawler import _list_page
+    soup = BeautifulSoup('<a href="/en/about">About</a><a href="https://r.michelin.fr/en/job-offer-result-list">Apply</a>', "html.parser")
+    assert _list_page(soup, "https://r.michelin.fr/en") == "https://r.michelin.fr/en/job-offer-result-list"
+    assert _list_page(BeautifulSoup('<a href="/en/about">About</a>', "html.parser"), "https://r.michelin.fr/en") == ""
+    soup = BeautifulSoup('<a href="/en/jobsearch/application">How to apply</a><a href="/en/job-offer-result-list">Jobs</a>', "html.parser")
+    assert _list_page(soup, "https://r.michelin.fr/en") == "https://r.michelin.fr/en/job-offer-result-list"
+
+
+def test_next_page_written_in_a_form_field():
+    from jobfinder.crawler import _next_page
+    soup = BeautifulSoup('<input type="hidden" name="pn" value="1"><a href="javascript:gotopage(2)">PROCHAIN</a>', "html.parser")
+    assert _next_page(soup, "https://c.com/x.asp?CLID=1", 1) == "https://c.com/x.asp?CLID=1&pn=2"
+    soup = BeautifulSoup('<input type="hidden" name="pn" value="2"><a href="javascript:gotopage(3)">PROCHAIN</a>', "html.parser")
+    assert _next_page(soup, "https://c.com/x.asp?CLID=1&pn=2", 2) == "https://c.com/x.asp?CLID=1&pn=3"
+
+
+def test_title_with_only_the_kind_of_offer_is_opened():
+    from jobfinder.classify import analyze_title
+    prof = {**CFG()["_profile"], "offer_types": ["job", "internship"]}
+    assert analyze_title("Stagiaire", "", prof).verdict == "maybe"
+    assert analyze_title("Stage comptabilité fournisseurs", "", prof).verdict == "reject"
+
+
+def test_openrouter_daily_limit_stops_at_once():
+    from unittest.mock import patch
+    import time as _t
+    import pytest
+    from jobfinder import llm
+
+    class R:
+        status_code, text = 429, '{"error":{"message":"Rate limit exceeded: free-models-per-day"}}'
+        headers = {"x-ratelimit-reset": str(int((_t.time() + 7200) * 1000))}
+
+    with patch.object(llm.requests, "post", return_value=R()) as post, pytest.raises(llm.QuotaExhausted) as e:
+        llm._post("https://openrouter.ai/x", {}, {})
+    assert post.call_count == 1 and "Daily quota" in str(e.value) and 7000 < e.value.wait < 7300
+
+
+def _ladder(monkeypatch, answers):
+    from jobfinder import llm
+    from pydantic import BaseModel
+
+    class A(BaseModel):
+        ok: bool
+
+    class S:
+        def get(self, *_):
+            return None
+
+        def merge(self, _):
+            pass
+
+        def commit(self):
+            pass
+
+    calls = []
+
+    def chat(prov, model, system, user, cfg, keys=None):
+        calls.append((prov, model, keys[prov]))
+        got = answers.get((prov, model, keys[prov]), '{"ok": true}')
+        if isinstance(got, Exception):
+            raise got
+        return got, 1, 1
+
+    monkeypatch.setattr(llm, "chat", chat)
+    monkeypatch.setattr(llm, "_EXHAUSTED", {})
+    llm.reset_usage()
+    keys = {"gemini": "g1", "gemini#2": "g2", "groq": "q", "openrouter": "o"}
+    cfg = {"auto_models": True, "max_ai_calls": 100, "model": {"provider": "ollama", "model": "llama3.1"}}
+    return llm, A, S(), cfg, keys, calls
+
+
+def test_ladder_order_starts_with_the_best_and_skips_missing_keys():
+    from jobfinder import llm
+    cfg = {"auto_models": True, "model": {"provider": "ollama", "model": "llama3.1"}}
+    chain = llm.model_chain(cfg, {"gemini": "g1", "gemini#2": "g2", "groq": "q"})
+    assert chain[:3] == [("gemini", "gemini-3.5-flash", "gemini"), ("gemini", "gemini-3.5-flash", "gemini#2"),
+                         ("groq", "openai/gpt-oss-120b", "groq")]
+    assert not any(p == "openrouter" for p, _, _ in chain) and chain[-1][0] == "ollama"
+    assert llm.model_chain({"auto_models": False, "model": {"provider": "groq", "model": "x"}}, {}) == [("groq", "x", "groq")]
+
+
+def test_limit_moves_to_the_second_key_then_another_provider(monkeypatch):
+    from jobfinder import llm as L
+    q = L.QuotaExhausted("Daily quota")
+    q.wait = 7200
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): q, ("gemini", "gemini-3.5-flash", "g2"): q})
+    assert llm.call_json("u", A, cfg, s, keys).ok
+    assert calls == [("gemini", "gemini-3.5-flash", "g1"), ("gemini", "gemini-3.5-flash", "g2"), ("groq", "openai/gpt-oss-120b", "q")]
+    assert llm.USAGE["model"] == "groq / openai/gpt-oss-120b"
+    calls.clear()
+    assert llm.call_json("u2", A, cfg, s, keys).ok  # the used-up models are not asked again...
+    assert calls == [("groq", "openai/gpt-oss-120b", "q")]
+    llm._EXHAUSTED.clear()  # ...until their limit has passed: the best model is back
+    calls.clear()
+    llm.call_json("u3", A, cfg, s, keys)
+    assert calls[0][1] == "gemini-3.5-flash"
+
+
+def test_gone_model_and_bad_answer_move_on(monkeypatch):
+    from jobfinder import llm as L
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): L.AIError("HTTP 404: no longer available"),
+                                                        ("gemini", "gemini-3.5-flash", "g2"): "not json"})
+    assert llm.call_json("u", A, cfg, s, keys).ok
+    assert calls[-1][0] == "groq" and llm._EXHAUSTED[("gemini", "gemini-3.5-flash", "gemini")] > __import__("time").time() + 3000
+
+
+def test_all_models_at_their_limit_gives_one_clear_message(monkeypatch):
+    from jobfinder import llm as L
+    q = L.QuotaExhausted("Daily quota")
+    q.wait = 7200
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {})
+    monkeypatch.setattr(llm, "chat", lambda *a, **k: (_ for _ in ()).throw(q))
+    import pytest
+    with pytest.raises(L.QuotaExhausted, match="AI models have reached"):
+        llm.call_json("u", A, {**cfg, "model": {"provider": "groq", "model": "openai/gpt-oss-20b"}}, s, keys)
+
+
+def test_cv_consent_covers_every_provider_of_the_ladder():
+    import pytest
+    from jobfinder import llm
+    keys = {"gemini": "g", "groq": "q"}
+    cfg = {"auto_models": True, "_keys": keys, "cv_consent_providers": ["gemini"], "send_cv_remote_ok": True,
+           "model": {"provider": "ollama", "model": "llama3.1"}}
+    with pytest.raises(llm.AIError, match="groq"):  # the older single-provider consent does not count
+        llm.require_cv_consent(cfg)
+    llm.require_cv_consent({**cfg, "cv_consent_providers": ["gemini", "groq"]})
+
+
+def test_xai_comes_last_and_an_account_without_credits_is_said_clearly(monkeypatch):
+    import pytest
+    from jobfinder import llm
+    cfg = {"auto_models": True, "model": {"provider": "groq", "model": "openai/gpt-oss-20b"}}
+    assert llm.model_chain(cfg, {"gemini": "g", "groq": "q", "xai": "x"})[-1] == ("xai", "grok-4.3", "xai")
+
+    class R:
+        status_code, text, headers = 403, "Your team has used all available credits or reached its monthly spending limit", {}
+
+    monkeypatch.setattr(llm.requests, "post", lambda *a, **k: R())
+    with pytest.raises(llm.AIError, match="no credits"):
+        llm._post("https://api.x.ai/v1/chat/completions", {}, {})
+
+
+def test_second_groq_key_and_monthly_limit(monkeypatch):
+    from jobfinder import llm as L
+    chain = L.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"groq": "a", "groq#2": "b"})
+    assert chain[:2] == [("groq", "openai/gpt-oss-120b", "groq"), ("groq", "openai/gpt-oss-120b", "groq#2")]
+    gone = L.AIError("Provider error 429: limited to 1000 API calls / month")
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): gone})
+    assert llm.call_json("u", A, cfg, s, keys).ok
+    assert llm._EXHAUSTED[("gemini", "gemini-3.5-flash", "gemini")] > __import__("time").time() + 3000
+
+
+def test_next_page_called_from_a_click_and_sitemap_job_paths():
+    from jobfinder.crawler import _next_page, sitemap_jobs
+    soup = BeautifulSoup("""<input type="hidden" name="Page" value="1"><a onclick="toPage('SearchForm', 2)">Page suivante</a>""", "html.parser")
+    assert _next_page(soup, "https://emploi.cnrs.fr/Offres/Recherche.aspx", 1) == "https://emploi.cnrs.fr/Offres/Recherche.aspx?Page=2"
+
+    class F:
+        def sitemaps(self, url):
+            return ["https://emploi.sncf.com/sitemap-jobs.xml"]
+
+        def get(self, url, **k):
+            return type("R", (), {"text": "<url><loc>https://emploi.sncf.com/nos-offres/706050</loc></url>"})()
+
+        def robots_ok(self, url):
+            return True
+
+    assert sitemap_jobs(F(), "https://emploi.sncf.com/nos-offres") == [("https://emploi.sncf.com/nos-offres/706050", "")]
+
+
+def test_logo_heading_vague_age_and_error_page_redirect(monkeypatch):
+    from datetime import datetime
+    from jobfinder.adapters import _parse_detail
+    from jobfinder.dates import date_decision, parse_date
+    from jobfinder.web import AccessError, Fetcher
+    # PSL: the first <h1> is the site's logo linking home, the offer's title comes after it
+    page = ('<html><head><title>Chaire IA | PSL</title></head><body><h1><a href="/">Recrutement</a></h1>'
+            '<main><h1>Chaire de professeur junior IA (F/H)</h1><p>publié le 02/11/2026</p></main></body></html>')
+    assert _parse_detail(page, "https://recrutement.psl.eu/odyssee-1")["title"] == "Chaire de professeur junior IA (F/H)"
+    from jobfinder.crawler import _card_title
+    card = BeautifulSoup('<a href="/uzlf8yhb7f"><div class="title_etablissement">MINES Paris - PSL</div>'
+                         '<div class="title">Assistant.e de direction (F/H)</div><div class="created">02.11.2026</div></a>', "html.parser")
+    assert _card_title(card, "https://recrutement.psl.eu/nos-offres", "https://recrutement.psl.eu/uzlf8yhb7f") == \
+        "Assistant.e de direction (F/H)"
+    # 'il y a 1 an' is vague (confidence 0.45) but surely outside the last 30 days; '2 semaines' stays decided normally
+    now = datetime(2026, 11, 2)
+    d, c = parse_date("publiée il y a 1 an", now)
+    assert date_decision(d, c, {"date_preset": "Last 30 days"}, now, "publiée il y a 1 an")[0] is False
+    d, c = parse_date("30+ days ago", now)
+    assert date_decision(d, c, {"date_preset": "Last 30 days"}, now, "30+ days ago")[0] is None
+    assert date_decision(d, c, {"date_preset": "Last 7 days"}, now, "30+ days ago")[0] is False
+    # LISN: every page redirects to '/403.html' with status 200: blocked, not 'no offers'
+
+    class R:
+        def __init__(self, code, loc=None):
+            self.status_code, self.headers, self.text, self.encoding = code, {"Location": loc} if loc else {}, "<p>x</p>", "utf-8"
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    f = Fetcher({**run_config(CONFIG_DEFAULT), "retries": 0, "timeout": 5}, lambda m: None)
+    monkeypatch.setattr(f, "robots_ok", lambda u: True)
+    monkeypatch.setattr(f, "_wait", lambda h: None)
+    monkeypatch.setattr("jobfinder.web.check_url", lambda u: (True, ""))
+    monkeypatch.setattr(f.s, "request", lambda m, u, **k: R(302, "https://rp.lisn.fr/403.html") if "403" not in u else R(200))
+    try:
+        f.get("https://www.lisn.fr/job-offers")
+        assert False, "the refusal was not seen"
+    except AccessError as e:
+        assert "access_restricted" in str(e)
+
+
+def test_a_model_the_provider_removed_is_skipped_until_next_week(monkeypatch):
+    from jobfinder import llm as L
+    L_error = L.AIError('HTTP 404: {"message": "This model models/gemini-2.5-flash is no longer available to new users"}')
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): L_error})
+    assert llm.call_json("u", A, cfg, s, keys).ok
+    chain = llm.model_chain(cfg, keys)
+    assert ("gemini", "gemini-3.5-flash", "gemini") not in chain and ("gemini", "gemini-3.5-flash", "gemini#2") in chain
+
+
+def test_a_scan_in_another_process_is_never_wiped(monkeypatch, tmp_path):
+    import subprocess
+    import sys
+    from jobfinder import store
+    monkeypatch.setattr(store, "SCAN_LOCK", tmp_path / "scan.lock")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        (tmp_path / "scan.lock").write_text(str(other.pid))
+        assert store.scan_running_elsewhere() and store.wipe_session_data() is False
+        try:
+            store.load_new_sources(None, ["https://a.fr/jobs"])
+            assert False, "websites were replaced during a scan"
+        except RuntimeError:
+            pass
+    finally:
+        other.kill()
+        other.wait()
+    assert not store.scan_running_elsewhere()  # the process has stopped: its lock no longer counts
+    store.lock_scan()
+    assert not store.scan_running_elsewhere()  # this process's own scan
+    store.unlock_scan()
+    assert not (tmp_path / "scan.lock").exists()
+
+
+def test_health_report_compares_each_website_with_its_previous_scan():
+    from datetime import datetime
+    from jobfinder.scan import health_note
+    from jobfinder.store import SiteMemory
+
+    class S:
+        def __init__(self):
+            self.rows = {}
+
+        def flush(self):
+            pass
+
+        def get(self, _, url):
+            return self.rows.get(url)
+
+        def add(self, row):
+            self.rows[row.url] = row
+    s, src = S(), type("Src", (), {})()
+    src.url, src.status, src.listed = "https://co.fr/jobs", "completed", 120
+    assert health_note(s, src, "Last 7 days") == ""  # first scan: the reference
+    s.rows[src.url].last_scan = datetime(2026, 11, 1)
+    src.status, src.listed = "blocked", 0
+    assert health_note(s, src, "Last 7 days") == "read on 2026-11-01 (120 offers on its lists), now blocked"
+    src.status, src.listed = "completed", 30
+    assert health_note(s, src, "Last 7 days").endswith("read again now")
+    s.rows[src.url].last_listed = 120
+    assert "the website may have changed" in health_note(s, src, "Last 7 days")
+    s.rows[src.url].last_listed, src.listed = 120, 30
+    assert health_note(s, src, "Last 30 days") == ""  # another date range: list sizes are not comparable
+    assert isinstance(s.rows[src.url], SiteMemory)
+
+
+def test_softy_platform_offers_with_place_date_and_description():
+    import json
+    from html import escape
+    from jobfinder.adapters import crawl_softy
+
+    def page(props, esc=False):
+        data = json.dumps({"props": props})
+        return f'<div id="app"></div><script data-page="app" type="application/json">{escape(data) if esc else data}</script>'
+    item = lambda i, title, day: {"id": i, "softy_id": 900 + i, "title": title, "updated_at": f"{day} 10:00:00",
+                                  "contract_type": {"name": "CDD"}, "subsidiary_name": "Occitanie",
+                                  "locations": [{"city": "Montpellier", "country": "France"}]}
+    lst = page({"offers": {"data": [item(1, "Ingénieur d'études en machine learning - H/F", TODAY),
+                                    item(2, "Post-doctorant en vision par ordinateur - H/F", OLD)],
+                           "last_page": 1, "next_page_url": None}})
+    det = page({"offer": {"description_html": "<p>Apprentissage profond pour l'imagerie médicale.</p>"}}, esc=True)
+    f = FakeFetcher({"/offers?page=1": lst, "/offers/901": det, "/offers/902": det})
+    jobs = [j for pg in crawl_softy(f, "https://inserm.softy.pro", CFG(), set(), ScanState()) for j in pg.jobs]
+    assert [j["title"][:10] for j in jobs] == ["Ingénieur ", "Post-docto"]
+    assert jobs[0]["location"] == "Montpellier, France" and jobs[0]["employment_type"] == "CDD"
+    assert jobs[0]["url"] == "https://inserm.softy.pro/offers/901" and "imagerie" in jobs[0]["description"]
+    assert jobs[0]["date"].strftime("%Y-%m-%d") == TODAY and jobs[0]["date_conf"] == 0.6
+    assert detect_from_url("https://inserm.softy.pro/offre/191137?idt=190") == ("softy", "https://inserm.softy.pro")

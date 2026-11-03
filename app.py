@@ -20,7 +20,8 @@ from jobfinder.classify import OFFER_TYPES
 from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config
 from jobfinder.scan import Progress, run_scan
 from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, get_setting,
-                             init_db, load_keys, load_new_sources, save_key, set_setting, wipe_session_data)
+                             init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
+                             wipe_session_data)
 from jobfinder.web import extract_urls
 
 ASSETS = Path(__file__).parent / "assets"
@@ -114,16 +115,24 @@ def step_websites(running, n):
                     st.toast(f"{f.name} is over 2 MB: skipped", icon=":material/warning:")
             urls = list(dict.fromkeys(u for f in files if f.size <= 2_000_000
                                       for u in extract_urls(f.getvalue().decode("utf-8", errors="replace"))))
-            with SessionLocal() as s:
-                load_new_sources(s, urls)
+            try:
+                with SessionLocal() as s:
+                    load_new_sources(s, urls)
+            except RuntimeError as e:
+                st.error(str(e))
+                return
             prog.reset()
             st.session_state["sites_sig"] = _sig(files)
             st.rerun()
         with st.expander("…or paste URLs"):
             pasted = st.text_area("One URL per line", height=90, label_visibility="collapsed")
             if st.button("Use these URLs", disabled=running or not extract_urls(pasted)):
-                with SessionLocal() as s:
-                    load_new_sources(s, extract_urls(pasted))
+                try:
+                    with SessionLocal() as s:
+                        load_new_sources(s, extract_urls(pasted))
+                except RuntimeError as e:
+                    st.error(str(e))
+                    return
                 prog.reset()
                 st.rerun()
         if n["sites"]:
@@ -132,12 +141,22 @@ def step_websites(running, n):
             st.caption(f"**{len(srcs)} websites** ready. Loading another file replaces them. Search words, page numbers and "
                        "tracking codes from a past search are removed from company URLs, so every website is read whole "
                        "and filtered the same way; country filters and job-board searches are kept.")
+            worse = [x for x in srcs if x.health and not x.health.endswith("read again now")]
+            if worse:  # the health report: websites that worked at the previous scan and do not any more
+                st.warning(f"**{len(worse)} website(s) changed since the previous scan**: "
+                           + "; ".join(f"{x.label}: {x.health}" for x in worse[:5]) + (" …" if len(worse) > 5 else ""),
+                           icon=":material/monitor_heart:")
             with st.expander("Websites and how each one was read"):
                 st.dataframe(pd.DataFrame([dict(website=x.label, host=urlparse(x.url).hostname, read_by=x.platform or "—",
-                                                status=x.status, offers=x.jobs_found, note=x.last_error, url=x.url)
+                                                status=READ_OUTCOME.get(x.outcome, x.status), offers=x.jobs_found,
+                                                on_lists=x.listed, since_last_scan=x.health, note=x.last_error, url=x.url)
                                            for x in srcs]),
                              width="stretch", hide_index=True, height=min(38 + 35 * len(srcs), 420),
                              column_config={"url": st.column_config.LinkColumn("url", display_text="open")})
+
+
+READ_OUTCOME = {"offers_found": "offers found", "nothing_in_range": "read: nothing in the date range",
+                "no_offers_detected": "no offers detected", "partial": "possibly incomplete"}
 
 
 def step_cv(running, n):
@@ -162,7 +181,13 @@ def step_cv(running, n):
                 if b.button("Remove", key=f"rm{cv.id}", disabled=running):
                     cvm.delete_cv(s, cv.id)
                     st.rerun()
-        if c["model"]["provider"] in llm.PAID:
+        hosted = sorted({x[0] for x in llm.model_chain(c, KEYS) if x[0] in llm.PAID}) if c["auto_models"] else []
+        if hosted:  # the models switch automatically: the consent names every provider that could receive the CV
+            ok = st.checkbox(f"Allow sending my CV text to these hosted providers: {', '.join(hosted)}",
+                             set(hosted) <= set(c["cv_consent_providers"]),
+                             help="Free plans may keep or use what they receive: check each provider's terms.")
+            c["cv_consent_providers"] = hosted if ok else []
+        elif c["model"]["provider"] in llm.PAID:
             c["send_cv_remote_ok"] = st.checkbox(f"Allow sending my CV text to {c['model']['provider']} (hosted model)",
                                                  c["send_cv_remote_ok"])
         with st.expander("Your details (only for cover letters)"):
@@ -185,6 +210,8 @@ def _monitor():
                 text=f"{d['task'].capitalize()} — websites {d['sources_done']} / {d['sources_total']}")
     if d["ai_total"]:
         st.progress(min(d["ai_done"] / d["ai_total"], 1.0), text=f"AI reading offers {d['ai_done']} / {d['ai_total']}")
+        if llm.USAGE["model"]:
+            st.caption(f"Model in use: {llm.USAGE['model']}")
     m = st.columns(4)
     m[0].metric("Offers in the date range", d["jobs"])
     m[1].metric("Too old (hidden)", d["date_x"])
@@ -192,6 +219,9 @@ def _monitor():
     m[3].metric("Relevant", d["relevant"])
     if d["ai_msg"]:
         st.warning(d["ai_msg"])
+    if d["type_x"] and not d["running"]:
+        st.warning(f"{d['type_x']} offers were set aside only because of their type (internship, PhD, apprenticeship...). "
+                   "If you want them too, select these types in 'I am looking for' and analyse again.")
     if not d["running"] and d["finished"]:
         st.page_link(RESULTS, label="See the results", icon=":material/arrow_forward:")
     with st.expander("Activity log"):
@@ -207,7 +237,9 @@ def step_analysis(running, n):
         pre = c["date_preset"] if c["date_preset"] in PRESETS else "Last 30 days"
         c["date_preset"] = st.segmented_control("Published within", PRESETS, default=pre, key="preset") or pre
         m = c["model"]
-        st.caption(f"AI model **{m['provider']} / {m['model']}** — change it in Settings. "
+        first = llm.model_chain(c, KEYS)[0]
+        st.caption((f"AI models: starts with **{first[0]} / {first[1]}** and switches when a limit is reached — see Settings. "
+                    if c["auto_models"] else f"AI model **{m['provider']} / {m['model']}** — change it in Settings. ")
                    + ("" if n["cvs"] else "No CV yet: offers are ranked, but not compared with a CV."))
         x, y, _ = st.columns([1, 1, 3])
         if x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:", width="stretch"):
@@ -225,7 +257,11 @@ def step_analysis(running, n):
 
 def page_search():
     shell("Job Finder", "1 · websites   2 · CV   3 · analysis")
-    running, n = prog.snap()[0]["running"], counts()
+    elsewhere = scan_running_elsewhere()
+    if elsewhere:  # a scan started outside this app (script, other window): its data is kept and nothing can change
+        st.warning("A scan is running in another process: its websites and offers are kept. Loading websites and "
+                   "starting a scan are locked until it ends — reload this page then.", icon=":material/lock:")
+    running, n = prog.snap()[0]["running"] or elsewhere, counts()
     step_websites(running, n)
     step_cv(running, n)
     step_analysis(running, n)
@@ -240,7 +276,7 @@ def _rows():
             r = j.relevance_json or {}
             kind = r.get("contract_kind") if r.get("contract_kind") not in (None, "unknown") else (ti.get("training") or ti.get("contract") or "")
             out.append(dict(uid=j.uid, title=j.title, company=j.employer, location=j.location_original or "",
-                            published=j.pub_date.date() if j.pub_date else None, type=kind,
+                            published=j.pub_date.date() if j.pub_date else None, first_seen=(j.extra or {}).get("first_seen"), type=kind,
                             topics=", ".join(r.get("research_topics") or ti.get("topics", [])),
                             relevance=j.relevance_score, match=j.match_score, status=j.status))
     return pd.DataFrame(out)
@@ -359,11 +395,16 @@ def _cv_and_letter(s, j):
 
 # =================================================================== page 3: settings (AI model + search profile)
 def settings_ai():
+    c["auto_models"] = st.toggle("Switch models automatically", c["auto_models"],
+                                 help="Starts with the most capable model. When a limit is reached, the next one takes over.")
+    if c["auto_models"]:
+        order = [f"{i}. {p} / {m}" + (" (second key)" if "#" in k else "") for i, (p, m, k) in enumerate(llm.model_chain(c, KEYS), 1)]
+        st.caption("Order of use: " + " → ".join(order))
     provs = list(c["providers"])
     models = st.session_state.setdefault("models", {})
     a, b = st.columns([1, 2], vertical_alignment="bottom")
     prov = a.selectbox("Provider", provs, index=provs.index(CFG["model"]["provider"]) if CFG["model"]["provider"] in provs else 0,
-                       format_func=lambda x: "ollama (local, free)" if x == "ollama" else x)
+                       format_func=lambda x: {"ollama": "ollama (local, free)", "openrouter": "Open Router", "xai": "xAI (Grok)", "cohere": "Cohere"}.get(x, x))
     if prov != "ollama":
         have = prov in KEYS or os.environ.get(ENV_KEYS[prov])
         key = b.text_input(f"API key for {prov}", type="password", placeholder="key saved" if have else "paste your key")

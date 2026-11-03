@@ -158,6 +158,7 @@ Each website is processed by the most precise reader available, selected automat
 | Greenhouse, Lever, Ashby, Recruitee, Breezy | official job-board APIs | first publication date |
 | Teamtailor, Talentsoft, RSS feeds | the site's job feed, then its list pages | `pubDate` |
 | Talentview (Parrot) | public campaign list | last activation date |
+| Softy (Inserm) | page data of the offer list, newest first | "mise en ligne" date (the offer's last update) |
 | WordPress job post types | REST API, sorted by date | publication date |
 | Other websites | JSON-LD, embedded page data, job links, sitemap | labelled date on the offer |
 | Laboratory pages | AI page reader; titles and dates must appear on the page | date written next to the offer |
@@ -190,16 +191,75 @@ put in a uniform form (`jobfinder/urlclean.py`):
 |---|---|
 | tracking, display and session parameters (`gad_source`, `width`, `hashed`, `createNewAlert`), empty filters, `all` values, search button values | removed |
 | page numbers (`page=3`, `pagenum=3`, `list-b4837029c4_page=1`, `/page/2`) | removed: reading starts on the first page |
-| relevance sorts | removed; date sorts are kept |
-| country and location filters (`location=France`, `countries=fr`, Workday location identifiers), numeric filters of unknown meaning | kept |
-| city lists on company career sites (`city=paris,lyon`) | removed: they hide the rest of France |
-| search words, contract types, domains, specialties on company career sites | removed: the title analysis and the offer types selected in the application apply the same criteria to every website |
+| every filter on company career sites: search words, contract types, cities, country, date sorts, saved searches in the path (`/go/Jobs-in-France/3677001`) | removed: the application applies France and the date itself |
+| the site's language and the identifiers a page needs (`lang`, `locale`, `LCID`, `CLID`, `page=joblisting`) | kept |
 | search words and location on multi-company job boards (Hellowork, Welcome to the Jungle search, optioncarriere, stage.fr, JobTeaser, APEC) | kept: without them a job board lists the entire market |
 | contract types on multi-company job boards | removed when search words remain, kept when they are the only narrowing filter |
 | address of a single offer (`/offres/2025-09455`) or of a moved page (CNRS) | replaced by the address of the list |
 
-The original files are not modified. The websites table of step 1 shows what was removed from each URL, and duplicate
-URLs are merged.
+When a website is read, France and the date are applied in this order:
+
+1. the platform reader (Workday, SuccessFactors, Phenom, Eightfold, Jibe and others);
+2. `OWN_FILTERS` in `jobfinder/sitefilters.py`, for websites whose filter cannot be found on the page;
+3. the website's own search form or "sort by date" link;
+4. the AI browser, when a website still gives mostly offers outside France and an AI model is available.
+
+The websites table of step 1 shows what was removed from each URL, and duplicate URLs are merged.
+
+### Reading checks
+
+"Nothing failed" does not mean "everything was read", so each reading is checked. The websites table of step 1 shows
+the result:
+
+| Status | Meaning |
+|---|---|
+| offers found | offers inside the date range were read |
+| read: nothing in the date range | the lists were read, and all their offers are older than the range |
+| no offers detected | the website answered, but no offer was recognised: it usually needs an AI reader |
+| possibly incomplete | fewer than half of the offers the website announces were read, or far fewer than usual |
+
+- A website that was down or refused once gets one more try at the end of the scan. `robots.txt` refusals are not retried.
+- When a website announces many more offers than its page gives, its sitemap is read as well.
+- When a page is gone (404, 410, 5xx), its home page is searched for a career page, and the possible new address is shown in
+  the note. The address is not replaced automatically.
+- A reader recognised from a word in the page code is dropped if it returns other offers than the page shows, from another
+  website.
+- Two small tables survive between sessions: the usual number of offers per website, and the day each offer was first seen.
+  An offer without a date that was already online before the chosen range is hidden, as it cannot be newer.
+- Health report: at the end of each scan, every website is compared with its previous scan. A website that was read and is
+  now blocked or failing, or whose lists hold less than 40 % of the offers they held for the same date range, is listed in a
+  warning above the websites table and in its "since last scan" column.
+- A scan holds a lock (`data/scan.lock`). While a scan runs in another process, opening the application does not delete
+  its websites and offers, and loading websites or starting a scan is locked until it ends.
+
+### Automatic model switching
+
+The application starts with the most capable model. When a limit is reached, the next model takes over, with the same provider
+or another one, and the better model returns as soon as its limit has passed. Providers without a key are skipped.
+
+| Order | Model |
+|---|---|
+| 1 | Gemini `gemini-3.5-flash` |
+| 2 | Groq `openai/gpt-oss-120b` |
+| 3 | Gemini `gemini-2.5-flash` |
+| 4 | Open Router `nvidia/nemotron-3.5-super-vl:free` |
+| 5 | Cohere `command-a-03-2025` |
+| 6 | Cohere `command-r-plus-08-2024` |
+| 7 | Groq `qwen/qwen3.8-27b` |
+| 8 | Gemini `gemini-3.1-flash-lite` |
+| 9 | Open Router `dots-studio/dots-3-note-preview:free` |
+| 10 | Cohere `command-r-08-2024` |
+| 11 | Groq `openai/gpt-oss-20b` |
+| 12 | xAI `grok-4.3` (billed per use, so it comes after every free quota) |
+| last | the model selected in Settings |
+
+A second key can be added as `GEMINI_API_KEY_2` or `GROQ_API_KEY_2` in `api_keys.txt`; each model of that provider is then tried
+with both keys. Cohere comes after the models whose limit returns every day, because its trial limit is monthly. The
+order is a judgement, not a benchmark, and is set by `LADDER` in `jobfinder/llm.py`. Before CV matching, the consent box names
+every hosted provider that could receive the CV. Switching can be turned off in Settings to use a single model.
+
+A model the provider no longer offers on a key (HTTP 404 "no longer available", for example `gemini-2.5-flash` on a new
+Google account), or an account without credits, is skipped for 7 days, even after a restart (setting `ai_gone`).
 
 ### Website filters and early stop
 

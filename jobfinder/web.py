@@ -228,7 +228,9 @@ class Fetcher:
                     raise AccessError("too many redirects")
                 # an anti-bot page is small; a normal page that merely loads a captcha script for its forms is not one
                 challenge = r.status_code == 200 and len(r.text) < 30000 and _ANTIBOT.search(r.text[:30000])
-                if r.status_code in (401, 403) or challenge:
+                # a redirect to an error page ('/403.html', '/access-denied') is a refusal sent with status 200
+                refused = cur != url and re.search(r"/(40[13]|forbidden|access[-_]?denied)(\.html?)?$", urlparse(cur).path, re.I)
+                if r.status_code in (401, 403) or challenge or refused:
                     raise AccessError(f"access_restricted: HTTP {r.status_code} / anti-bot page - inspect manually")
                 if r.status_code in (429, 500, 502, 503, 504) and attempt < self.cfg["retries"]:
                     time.sleep(min(2 ** attempt * 2, 20))

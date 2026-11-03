@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from urllib.parse import urlparse
 
@@ -27,6 +28,25 @@ class Source(Base):
     pages_visited = Column(Integer, default=0)
     jobs_found = Column(Integer, default=0)
     last_error = Column(Text, default="")
+    listed = Column(Integer, default=0)  # offers on the website's lists, inside the date range or not
+    outcome = Column(String, default="")  # offers_found | nothing_in_range | no_offers_detected | partial
+    health = Column(String, default="")  # what changed since the previous scan ('read on 2026-11-01, now blocked')
+
+
+class SiteMemory(Base):  # kept between sessions: what is normal for a website
+    __tablename__ = "site_memory"
+    url = Column(String, primary_key=True)
+    usual = Column(Integer, default=0)  # usual number of offers on its lists
+    last_status = Column(String, default="")  # the previous scan, compared with the next one (health report)
+    last_listed = Column(Integer, default=0)
+    last_scan = Column(DateTime)
+    last_preset = Column(String, default="")  # list sizes are compared only for the same date range
+
+
+class SeenOffer(Base):  # kept between sessions: an offer cannot be younger than the day it was first seen
+    __tablename__ = "seen_offers"
+    uid = Column(String, primary_key=True)
+    first_seen = Column(DateTime, default=utcnow)
 
 
 class Job(Base):
@@ -123,11 +143,22 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 def init_db():
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:  # a database made by an older version gets the new columns
+        have = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(sources)")}
+        for name, kind in (("listed", "INTEGER DEFAULT 0"), ("outcome", "VARCHAR DEFAULT ''"), ("health", "VARCHAR DEFAULT ''")):
+            if name not in have:
+                conn.exec_driver_sql(f"ALTER TABLE sources ADD COLUMN {name} {kind}")
+        have = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(site_memory)")}
+        for name, kind in (("last_status", "VARCHAR DEFAULT ''"), ("last_listed", "INTEGER DEFAULT 0"), ("last_scan", "DATETIME"),
+                           ("last_preset", "VARCHAR DEFAULT ''")):
+            if name not in have:
+                conn.exec_driver_sql(f"ALTER TABLE site_memory ADD COLUMN {name} {kind}")
 
 
 # --------------------------------------------------------------------------- API key file (local, chmod 600)
 ENV_KEYS = {"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
-            "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY"}
+            "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "gemini#2": "GEMINI_API_KEY_2", "groq#2": "GROQ_API_KEY_2",
+            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY"}  # '#2': a second key, its own quota
 
 
 def load_keys() -> dict:
@@ -238,8 +269,38 @@ def add_sources(s, urls: list[str]):
     return added
 
 
-def wipe_session_data():
-    """Delete websites, jobs, letter records and AI cache (settings, API keys, CVs and profile are kept)."""
+SCAN_LOCK = DATA_DIR / "scan.lock"  # holds the id of the process that is scanning
+
+
+def lock_scan():
+    SCAN_LOCK.write_text(str(os.getpid()))
+
+
+def unlock_scan():
+    if scan_owner() == os.getpid():
+        SCAN_LOCK.unlink(missing_ok=True)
+
+
+def scan_owner():
+    """The process id of a scan still running, or None (a lock left by a stopped process does not count)."""
+    try:
+        pid = int(SCAN_LOCK.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def scan_running_elsewhere() -> bool:
+    return scan_owner() not in (None, os.getpid())
+
+
+def wipe_session_data() -> bool:
+    """Delete websites, jobs, letter records and AI cache (settings, API keys, CVs and profile are kept).
+    Refused while another process scans: opening the app must not erase a scan running in the background."""
+    if scan_running_elsewhere():
+        LOG.warning("a scan is running in another process (%s): its websites and offers are kept", scan_owner())
+        return False
     try:
         with SessionLocal() as s:
             for m in (Job, Source, CoverLetter, AICache):
@@ -247,10 +308,12 @@ def wipe_session_data():
             s.commit()
     except Exception as e:  # pragma: no cover
         LOG.warning("wipe failed: %s", e)
+    return True
 
 
 def load_new_sources(s, urls: list[str]) -> int:
     """A new file REPLACES the previous websites and every job found before."""
-    wipe_session_data()
+    if not wipe_session_data():
+        raise RuntimeError("a scan is running in another window or process: load new websites when it has finished")
     return add_sources(s, urls)
 

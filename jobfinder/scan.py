@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 from collections import Counter, deque
@@ -11,9 +12,9 @@ from datetime import datetime
 from .adapters import ScanState, distrust_shared_dates, make_gate
 from .classify import analyze_title, classify_location, clean_title, location_from_text
 from .config import LOG, run_config, utcnow
-from .crawler import crawl_source
+from .crawler import crawl_source, suggest_page
 from .dates import date_decision, refine_job_date, refine_raw_date
-from .store import Job, SessionLocal, Source
+from .store import Job, SeenOffer, SessionLocal, SiteMemory, Source, lock_scan, unlock_scan
 from .web import AccessError, Fetcher, normalize_url
 
 
@@ -31,6 +32,10 @@ def upsert_job(s, src, raw, hidden=False) -> bool:
     desc = "" if hidden else raw["description"]
     chash = hashlib.sha1(f"{raw['title']}|{raw['location']}|{raw['description'][:3000]}".encode()).hexdigest()
     job = s.query(Job).filter_by(uid=uid).first()
+    seen = s.get(SeenOffer, uid)
+    if not seen and not hidden:
+        seen = SeenOffer(uid=uid, first_seen=utcnow())
+        s.add(seen)
     if job:
         job.last_seen = utcnow()
         if hidden:
@@ -59,7 +64,8 @@ def upsert_job(s, src, raw, hidden=False) -> bool:
               status="out_of_range" if hidden else "new",
               reason=(f"date: {raw['date']:%Y-%m-%d}" if raw["date"] else "date") if hidden else "",
               extra={**{k: raw.get(k) for k in ("remote_hint", "applicant_countries", "country_hint", "department")},
-                     "original_title": original_title}))
+                     "original_title": original_title,
+                     "first_seen": seen.first_seen.strftime("%Y-%m-%d") if seen else None}))
     return not hidden
 
 
@@ -80,6 +86,11 @@ def apply_filters(s, cfg, profile, now=None):
         d, why = date_decision(job.pub_date, job.date_conf, cfg, now, job.pub_date_text)
         if d is False:  # DATE FIRST: outside the range -> hidden, never analysed, never shown (relevant or not)
             hide_out_of_range(s, job, why)
+            st["date_x"] += 1
+            continue
+        seen = (ex.get("first_seen") or "") if d is None else ""
+        if seen and date_decision(datetime.strptime(seen, "%Y-%m-%d"), 1.0, cfg, now)[0] is False:
+            hide_out_of_range(s, job, f"no date, but already online on {seen}")  # published that day at the latest
             st["date_x"] += 1
             continue
         if d is None and cfg["unknown_date_policy"] == "exclude":
@@ -108,6 +119,7 @@ def apply_filters(s, cfg, profile, now=None):
         if verdict == "reject":
             job.status, job.reason = "excluded", "title: " + twhy
             st["title_x"] += 1
+            st["type_x"] += "not wanted" in twhy
             continue
         job.status = "review" if flags else "candidate"
         job.review_flags, job.reason = ",".join(flags), f"title: {twhy}; date: {why}"
@@ -130,7 +142,7 @@ class Progress:
 
     def reset(self):
         self.d = dict(running=False, source="", page=0, total=None, pages=0, pages_failed=0, jobs=0, dups=0,
-                      date_x=0, loc_x=0, title_x=0, review=0, candidate=0, sources_done=0, sources_total=0,
+                      date_x=0, loc_x=0, title_x=0, type_x=0, review=0, candidate=0, sources_done=0, sources_total=0,
                       task="idle", started=None, finished=None, ai_done=0, ai_total=0, relevant=0, matched=0, ai_msg="")
         self.log = deque(maxlen=300)
 
@@ -150,6 +162,54 @@ class Progress:
             return dict(self.d), list(self.log)
 
 
+def read_outcome(s, url, status, found, listed, st):
+    """What a finished reading really gave, and a note when it looks incomplete. 'completed' only says that nothing failed:
+    a website read to the end may have shown no offer at all."""
+    if status != "completed":
+        return "", ""
+    whole = not st.stopped_by_date  # a list left early because of the dates is not comparable with a total
+    outcome = "offers_found" if found else "nothing_in_range" if listed else "no_offers_detected"
+    note = ""
+    if whole and st.announced and listed < st.announced * 0.5:
+        outcome, note = "partial", f"the website announces {st.announced} offers, {listed} were read"
+    mem = s.get(SiteMemory, url)
+    if whole:
+        if mem and mem.usual >= 20 and listed < mem.usual * 0.2 and not note:
+            outcome, note = "partial", f"{listed} offers read, usually about {mem.usual}: the website may have changed"
+        elif listed:  # one bad reading must not become the new normal
+            if mem:
+                mem.usual = max(listed, round(mem.usual * 0.7 + listed * 0.3))
+            else:
+                s.add(SiteMemory(url=url, usual=listed))
+    return outcome, note
+
+
+def health_note(s, src, preset):
+    """This scan of a website against the previous one: a website that worked and now fails, or whose lists suddenly hold
+    far fewer offers (same date range), has probably changed (new address, new layout, a block). Runs once per scan, after
+    the second tries; this scan becomes the reference for the next one."""
+    s.flush()
+    mem = s.get(SiteMemory, src.url)
+    if mem is None:
+        mem = SiteMemory(url=src.url, usual=0)
+        s.add(mem)
+    status, listed, before, note = src.status, src.listed or 0, mem.last_status or "", ""
+    when = f"{mem.last_scan:%Y-%m-%d}" if mem.last_scan else "before"
+    if before == "completed" and status in ("blocked", "failed"):
+        note = f"read on {when} ({mem.last_listed} offers on its lists), now {status}"
+    elif before in ("blocked", "failed") and status == "completed":
+        note = f"{before} on {when}, read again now"
+    elif before == "completed" and status == "completed" and mem.last_preset == preset and mem.last_listed >= 20 \
+            and listed < mem.last_listed * 0.4:
+        note = f"{listed} offers on its lists, {mem.last_listed} on {when}: the website may have changed"
+    if status != "partially_completed":
+        mem.last_status, mem.last_scan, mem.last_listed, mem.last_preset = status, utcnow(), listed, preset
+    return note
+
+
+_RETRY = re.compile(r"source_unreachable|HTTP 5\d\d|HTTP 403", re.I)
+
+
 def scan_source(sid, cfg, fetcher, prog, t0):
     with SessionLocal() as s:
         src = s.get(Source, sid)
@@ -163,7 +223,7 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                     known.add(url_)
             else:
                 known.add(url_)
-        pages, found, status, err, stale = 0, 0, "completed", "", 0
+        pages, found, status, err, stale, listed = 0, 0, "completed", "", 0, 0
         stale_max = int(cfg.get("stale_pages", 2))
         prog.say(f"START {label}")
         t_site = time.time()
@@ -179,6 +239,7 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                     LOG.warning("%s | pagination failed: %s", label, pg.error)
                 n_in, n_unk, n_out, last = pg.seen, 0, pg.out, None  # last: verdict of the page's last dated offer
                 prog.inc("date_x", pg.out)
+                listed += len(pg.jobs) + pg.out + pg.seen
                 for raw in distrust_shared_dates(pg.jobs):
                     if not raw.get("title"):
                         continue
@@ -230,8 +291,12 @@ def scan_source(sid, cfg, fetcher, prog, t0):
             err = f"{cfg['max_details_per_source']} job pages opened (limit): the other offers keep their list data"
         s.rollback()
         src = s.get(Source, sid)
+        listed += st.skipped
         src.status, src.last_scan, src.pages_visited, src.jobs_found = status, utcnow(), pages, found
-        src.last_error, src.platform = err, st.platform
+        src.last_error, src.platform, src.listed = err, st.platform, listed
+        src.outcome, note = read_outcome(s, src.url, status, found, listed, st)
+        if note:
+            src.last_error = f"{err}; {note}" if err else note
         s.commit()
         prog.say(f"END {label}: {status} {err}")
 
@@ -242,6 +307,7 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     cfg["_gate"] = make_gate(cfg)  # date_decision for the chosen range: True inside | False outside | None unknown
     prog.reset()
     prog.cancel.clear()
+    lock_scan()
     prog.set(running=True, started=datetime.now(), sources_total=len(source_ids), task="crawling")
     t0 = time.time()
 
@@ -254,9 +320,36 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
             prog.say(f"website {sid} crashed: {e}")
         prog.inc("sources_done")
 
+    def again(sid):  # a website that was down, or refused once, gets one more calm try after the others
+        if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
+            return
+        calm = {**cfg, "timeout": cfg["timeout"] * 2, "retries": 0}
+        scan_source(sid, calm, Fetcher(calm, prog.say), prog, t0)
+
+    def explain_dead(sid):  # the page is gone: the website's home page may link its new address
+        with SessionLocal() as s:
+            src = s.get(Source, sid)
+            page = suggest_page(Fetcher(cfg, prog.say), src.url)
+            if page:
+                src.last_error = f"{src.last_error}; possible new address: {page}"
+                s.commit()
+
     try:
         with ThreadPoolExecutor(max_workers=int(cfg["parallel_sites"])) as ex:
             list(ex.map(one, source_ids))
+            with SessionLocal() as s:
+                todo = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status.in_(["failed", "blocked"]))
+                        if _RETRY.search(x.last_error or "")]
+            prog.say(f"second try for {len(todo)} websites")
+            list(ex.map(again, todo))
+            with SessionLocal() as s:
+                dead = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status == "failed")
+                        if re.search(r"HTTP (404|410|5\d\d)", x.last_error or "")]
+            list(ex.map(explain_dead, dead))
+        with SessionLocal() as s:
+            for src in s.query(Source).filter(Source.id.in_(source_ids)):
+                src.health = health_note(s, src, cfg["date_preset"])
+            s.commit()
         prog.set(task="filtering")
         with SessionLocal() as s:
             reset_filters(s)
@@ -266,4 +359,5 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     except Exception as e:  # never crash silently
         prog.say(f"FATAL {e}")
     finally:
+        unlock_scan()
         prog.set(running=False, finished=datetime.now(), task="done")

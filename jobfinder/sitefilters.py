@@ -22,6 +22,31 @@ _WORDS = [(re.compile(r"aujourd|today|24\s*h|dernier jour|last day|past day", re
           (re.compile(r"semaine|week", re.I), 7), (re.compile(r"\bmois\b|month", re.I), 30)]
 
 
+# Filters these websites keep in their URL, in a form that cannot be found on the page (script menus, internal numbers).
+# Host -> (France filter, newest first). Other websites: the platform readers, the page's own form, then the AI browser.
+OWN_FILTERS = {"capgemini.com": ("country_code=fr-fr,FRA", ""), "njoyn.com": ("CountryID=FR", ""),
+               "jobs.nokia.com": ("selectedLocationsFacet=300000000471655", ""),
+               "jobs.siemens.com": ("42386=[812134]&42386_format=17546&listFilterMode=1", ""),
+               "careers.stellantis.com": ("primary_country=FR", ""),
+               "sonos.wd1.myworkdayjobs.com": ("locations=f4abac2e193c01537b8ebb847c1b7a83&locations=58852068b6ad012ab42a01159d1d3976", ""), "ubisoft.com": ("countries=fr", ""),
+               "sia-partners.com": ("country=fr", ""), "ibm.com": ("field_keyword_05[0]=France", ""),
+               "equans.com": ("jobs_offer[refinementList][country_en][0]=France", ""),
+               "edf.fr": ("search[location]=_TS_CO_Country_France", ""), "alten.fr": ("", "sortby=date"),
+               "recrute.carrefour.fr": ("", "order=desc&sort=post_date_extern"), "wavestone.com": ("", "sort=desc")}
+
+
+def with_own_filters(url, cfg):
+    """The URL with this website's France and date filters, when it is one of OWN_FILTERS."""
+    host = (urlparse(url).hostname or "").lower()
+    france, newest = next((v for k, v in OWN_FILTERS.items() if host == k or host.endswith("." + k)), ("", ""))
+    wants_france = norm(cfg.get("site_filter_location") or "") in ("france", "fr")
+    extra = "&".join(x for x in (france if wants_france else "", newest) if x)
+    if not extra:
+        return url
+    p = urlparse(url)
+    return urlunparse(p._replace(query="&".join(x for x in (p.query, extra) if x)))
+
+
 def window_days(cfg):
     p = cfg.get("date_preset", "Last 30 days")
     return None if p == "All dates" else PRESET_DAYS.get(p, 30)

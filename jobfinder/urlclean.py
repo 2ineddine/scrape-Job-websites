@@ -1,13 +1,13 @@
-"""urlclean.py - one uniform form for the career page URLs found in the user's files.
+"""urlclean.py - the main page of each career website, whatever filters the URL was copied with.
 
 Career URLs are copied from a browser with the filters of a past search inside them: a search word ('keywords=audio'),
 a contract type ('contract_type=Stage'), a page number ('page=3'), a relevance sort, tracking codes. Kept as they are,
 they hide most offers: the app would only see page 3 of the 'audio' offers. So, before a website is read:
 
   removed always     tracking, display and session parameters, empty filters, page numbers, relevance sorts, fragments
-  removed on company search words, contract types, domains / specialties / diplomas: the app's own title analysis
-  career sites       and the 'I am looking for' choice do this for every website in the same way
-  kept               country / location filters (France), date sorts, the site's language, technical identifiers
+  removed on company every filter, France and date included: the app applies them itself when it reads the website
+  career sites       (sitefilters.with_own_filters, the platform readers, the AI browser)
+  kept               the site's language and the identifiers the page cannot open without
   kept on job        search words and location: without them a multi-company job board lists the whole job market.
   boards             Contract types go when search words remain, and stay when they are the only narrowing filter
 """
@@ -28,7 +28,6 @@ _DISPLAY = re.compile(r"^(mobile|width|height|bga|needsredirect|jan1offset|jun1o
                       r"\w*_autocomplete|view|display|layout|ss|stretch|stretchunit|woe)$", re.I)
 _PAGE = re.compile(r"^(page|pagenum|pagenumber|pg|p|pr|startrow|start|offset|from|[\w-]+[_-]page)$", re.I)
 _NO_FILTER = re.compile(r"all|any|tous|toutes|indef|rechercher|search|submit|valider|ok", re.I)  # 'd=all', 'x_search=Rechercher'
-_CITY = re.compile(r"^(city|cities|ville|villes)$", re.I)  # a few cities hide the rest of France
 _SORT = re.compile(r"^(sort|sortby|sort_by|order|orderby|order_by|sortorder|sortdirection|sortcolumn)$", re.I)
 _DATE_VALUE = re.compile(r"date|recent|newest|latest|publi|posted|desc", re.I)
 _SEARCH = re.compile(r"^(q|query|keywords?|kw|k|s|search|search\[?(?:text|query|keywords?)\]?|texte|text|title|job_search|"
@@ -40,9 +39,13 @@ _LOCATION = re.compile(r"countr|pays|location|lieu|region|city|ville|bassin|geo|
                        re.I)
 _FRANCE = re.compile(r"france|fr|fra|fr-fr(?:,fra)?", re.I)
 _PATH_PAGE = re.compile(r"/page/\d+/?$", re.I)
+_TECHNICAL = re.compile(r"^(lang|language|locale|hl|lcid|clid|page)$", re.I)  # needed to open the page, not a filter
+_PATH_CATEGORY = re.compile(r"^(?:/[^/]+)?/go/[^/]+/\d+/?$", re.I)  # SuccessFactors: '/go/Jobs-in-France/3677001', a saved search
+_PATH_SEARCH = re.compile(r"(/search-jobs)/.+$", re.I)  # '/en/search-jobs/France/2649/2/3017382/46/2/50/2'
 _PATH_CONTRACT = re.compile(r"/(cdi|cdd|stage|alternance|internship)/?$", re.I)  # makesense: '/s/jobs/all/all/cdi'
 _PATH_OFFER = re.compile(r"(/offres)/\d{4}-\d{4,}/?$", re.I)  # Inria: one offer's page, not the list that holds it
-_MOVED = {("emploi.cnrs.fr", "/Recherche.aspx"): "/Offres/Recherche.aspx"}  # the old address now shows an error page
+_MOVED = {("emploi.cnrs.fr", "/Recherche.aspx"): "/Offres/Recherche.aspx",  # the old address now shows an error page
+          ("www.careers.philips.com", "/student/global/en/c/internship-apprenticeship-jobs"): "/global/en/search-results"}
 
 
 def is_job_board(url) -> bool:
@@ -66,8 +69,14 @@ def clean_source_url(url: str) -> tuple[str, list[str]]:
         if _PAGE.match(name) and re.fullmatch(r"\d+", v):  # 'page=3' (not CGI's 'page=joblisting')
             removed.append(f"page number ({k}={v})")
             continue
+        if not board:
+            if _TECHNICAL.match(name):
+                keep.append((k, v))
+            else:
+                removed.append(f"filter ({name}={unquote(v)[:30]})")
+            continue
         if _FRANCE.fullmatch(unquote(v).strip()):
-            keep.append((k, v))  # 'field_keyword_05[0]=France': a country filter, whatever its name
+            keep.append((k, v))  # a country filter, whatever its name
             continue
         if _SORT.match(name):
             if _DATE_VALUE.search(v):
@@ -75,17 +84,11 @@ def clean_source_url(url: str) -> tuple[str, list[str]]:
             else:
                 removed.append(f"sort ({v})")
             continue
-        if not board and _CITY.match(name):
-            removed.append(f"cities ({unquote(v)[:30]})")
-            continue
         if _LOCATION.search(name) and not _SEARCH.match(name):
             keep.append((k, v))  # country / location: the search is about France
             continue
-        if (not board or searched) and _TYPE.search(k):  # a board's search words keep its list small without them
+        if searched and _TYPE.search(k):  # a board's search words keep its list small without them
             removed.append(f"type / domain ({unquote(v)[:30]})")
-            continue
-        if not board and (_SEARCH.match(name) or _SEARCH.match(name.split("[")[0])):
-            removed.append(f"search words ({unquote(v)[:30]})")
             continue
         keep.append((k, v))
     path = p.path
@@ -95,6 +98,9 @@ def clean_source_url(url: str) -> tuple[str, list[str]]:
     if not board and re.search(r"/searchjobs/[^/]+$", path, re.I):  # Siemens: '/SearchJobs/deep%20learning'
         path = re.sub(r"(/searchjobs)/[^/]+$", r"\1", path, flags=re.I)
         removed.append("search words (path)")
+    if not board and (_PATH_CATEGORY.match(path) or _PATH_SEARCH.search(path)):
+        path = "/" if _PATH_CATEGORY.match(path) else _PATH_SEARCH.sub(r"\1", path)
+        removed.append("saved search (path)")
     if searched and _PATH_CONTRACT.search(path):
         path = _PATH_CONTRACT.sub("", path)
         removed.append("contract type (path)")

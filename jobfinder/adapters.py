@@ -94,7 +94,7 @@ def _get_date(r):
 
 
 _TRUSTED_SOURCES = re.compile(r"api|feed|workday|smartrecruiters|successfactors list|icims|wordpress|breezy|recruitee|lever|"
-                              r"greenhouse|ashby|JSON-LD|job description")
+                              r"greenhouse|ashby|JSON-LD|job description|pdf (?:creation date|upload month)")
 
 
 def distrust_shared_dates(jobs):

@@ -881,3 +881,154 @@ def test_softy_platform_offers_with_place_date_and_description():
     assert jobs[0]["url"] == "https://inserm.softy.pro/offers/901" and "imagerie" in jobs[0]["description"]
     assert jobs[0]["date"].strftime("%Y-%m-%d") == TODAY and jobs[0]["date_conf"] == 0.6
     assert detect_from_url("https://inserm.softy.pro/offre/191137?idt=190") == ("softy", "https://inserm.softy.pro")
+
+
+def test_offers_published_as_pdf_files():
+    import pymupdf
+    from jobfinder.crawler import crawl_pdfs
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 72), "Laboratoire d'Imagerie Biomédicale\n15 rue de l'École de Médecine, 75006 Paris\n"
+                               "Segmentation d'images IRM par apprentissage profond\nType de stage : Master 2, 6 mois, Paris.\n"
+                               + "Le stagiaire développera des réseaux de neurones pour la segmentation. " * 6)
+    doc.set_metadata({"creationDate": f"D:{TODAY.replace('-', '')}101500"})
+    pdf = doc.tobytes()
+    lst = ('<main>'
+           '<div class="offre"><h3><a href="/segmentation-irm/">Segmentation IRM par deep learning</a></h3>'
+           '<a href="/wp-content/uploads/2026/10/Annonce_Stage_IRM.pdf">Télécharger le sujet de stage</a></div>'
+           f'<div class="offre"><p><a href="/files/{TODAY[:4]}/{TODAY[5:7]}/Sujet_stage_IA.pdf">Sujet de stage</a></p></div>'
+           '<div class="offre"><h3>Ancien sujet de stage en imagerie médicale</h3>'
+           '<a href="/closed/2025/01/Annonce_Stage_old.pdf">Télécharger le sujet de stage</a></div></main>')
+    post = ('<html><head><link rel="alternate" type="application/json" href="https://lab.fr/wp-json/wp/v2/posts/12"></head>'
+            '<body><h1><a href="/">LIB</a></h1><main>Segmentation IRM : ' + "missions, profil, candidature. " * 30 + '</main></body></html>')
+    R = type("R", (), {})
+
+    class F(SiteFetcher):
+        def get(self, url, **kw):
+            self.calls.append(url)
+            r = R()
+            r.url, r.status_code = url, 200
+            r.text = {"https://lab.fr/stages": lst, "https://lab.fr/segmentation-irm": post}.get(url.rstrip("/"), "")
+            r.content = pdf if url.endswith("Sujet_stage_IA.pdf") else b""
+            r.json = lambda: {"date": f"{TODAY}T17:10:16"}
+            return r
+    f = F({})
+    jobs = [j for pg in crawl_pdfs(f, "https://lab.fr/stages", CFG(), set(), ScanState()) for j in pg.jobs]
+    by = {j["url"].rsplit("/", 1)[-1]: j for j in jobs}
+    page = by["segmentation-irm"]  # the card's own offer page, dated by its WordPress data
+    assert page["url"] == "https://lab.fr/segmentation-irm" and page["date"].strftime("%Y-%m-%d") == TODAY
+    assert page["date_source"] == "wordpress api post date"
+    read = next(j for j in jobs if j["provenance"] == "pdf")  # no card page: the PDF itself, its title skips the letterhead
+    assert read["title"].startswith("Segmentation d'images IRM") and "Paris" in read["location"]
+    assert read["date_source"] == "pdf creation date" and "neurones" in read["description"]
+    old = by["Annonce_Stage_old.pdf"]  # robots.txt closes the PDF: the card's title, and its upload month proves it is too old
+    assert old["provenance"] == "list-only" and old["date"].strftime("%Y-%m-%d") == "2025-01-31" and old["date_conf"] == 0.8
+    assert not any("/closed/" in u for u in f.calls)
+
+
+def test_next_page_sent_as_a_form_like_a_browser():
+    from jobfinder.crawler import _form_post
+    soup = BeautifulSoup("""<form id="SearchForm" method="post" action="../../Offres/Recherche.aspx">
+        <input type="text" name="q" value=""><input type="checkbox" name="ContractType" value="CDD">
+        <input type="checkbox" name="Kept" value="1" checked><input type="hidden" name="Page" value="0">
+        <input type="hidden" name="__VIEWSTATE" value="abc"><input type="submit" name="go" value="OK"></form>
+        <a onclick="toPage('SearchForm', 2)">2</a>""", "html.parser")
+    url = "https://emploi.cnrs.fr/Offres/Recherche.aspx"
+    action, data = _form_post(soup, url, f"{url}?Page=2")
+    assert action == url and data == [("q", ""), ("Kept", "1"), ("Page", "2"), ("__VIEWSTATE", "abc")]
+    assert _form_post(BeautifulSoup('<form method="get"><input type="hidden" name="page" value="1"></form>', "html.parser"),
+                      "https://a.fr/jobs", "https://a.fr/jobs?page=2") is None  # a GET form: the address itself works
+
+
+def test_sitemap_without_lastmod_stops_after_a_long_run_of_old_offers():
+    sm = "".join(f"<url><loc>https://co.fr/jobs/data-scientist-machine-learning-{i}</loc></url>" for i in range(120))
+    page = lambda i: (f'<html><head><script type="application/ld+json">{{"@type": "JobPosting", "title": "Data Scientist {i}",'
+                      f'"datePosted": "{TODAY if i < 5 else OLD}", "description": "missions profil candidature"}}</script></head></html>')
+    f = SiteFetcher({"sitemap.xml": sm, "/jobs/data-scientist-machine-learning-": lambda u: page(int(u.rsplit("-", 1)[1]))})
+    st = ScanState()
+    jobs = [j for pg in crawl_sitemap(f, "https://co.fr/jobs", CFG(), set(), st) for j in pg.jobs]
+    assert len(jobs) == 55 and st.stopped_by_date  # 5 recent offers, then 50 old ones in a row: the other 65 are not opened
+
+
+def test_only_lab_page_readings_survive_a_wipe(monkeypatch):
+    from datetime import timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.config import utcnow
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    monkeypatch.setattr(store, "SessionLocal", sessionmaker(bind=engine))
+    with store.SessionLocal() as s:
+        s.add_all([store.AICache(key="lab", value="{}", kind="PageOffers"),
+                   store.AICache(key="old-lab", value="{}", kind="PageOffers", created=utcnow() - timedelta(days=31)),
+                   store.AICache(key="cv-match", value="{}", kind="Relevance"), store.AICache(key="before", value="{}")])
+        s.commit()
+    assert store.wipe_session_data()
+    with store.SessionLocal() as s:
+        assert [r.key for r in s.query(store.AICache)] == ["lab"]  # CV-related answers and old readings are deleted
+
+
+def test_page_locations_lose_buttons_and_street():
+    from jobfinder.classify import classify_location, tidy_place
+    assert tidy_place("PSL 60 rue Mazarine 75006 Paris Télécharger en") == "75006 Paris"
+    assert tidy_place("4 place Jussieu 75005 Paris Cedex 05") == "75005 Paris"
+    assert tidy_place("Paris - Voir sur la carte") == "Paris" and tidy_place("Boulogne-Billancourt, France") == "Boulogne-Billancourt, France"
+    assert classify_location(tidy_place("12 avenue de la Paix 91190 Gif-sur-Yvette"))["france_eligible"]
+
+
+def test_the_offer_type_written_in_the_title_beats_the_ai(monkeypatch):
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import analysis, store
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    wrong = analysis.JobAnalysis(contract_kind="job", role_type="data", is_relevant=True, relevance_score=90,
+                                 analysis_confidence=0.9, france_eligible=True)  # a small model reading 'Stage' as a job
+    monkeypatch.setattr(analysis, "call_json", lambda *a, **k: wrong.model_copy())
+    prof = {**PROFILE_DEFAULT, "offer_types": ["internship"]}
+    with sessionmaker(bind=engine)() as s:
+        job = store.Job(uid="1", title="Stage - Data Scientist (H/F)", url="https://a.fr/1", description="Stage de 6 mois. " * 20,
+                        pub_date=datetime.utcnow(), date_conf=0.9, location_verified=True, france_eligible=True, extra={})
+        s.add(job)
+        s.commit()
+        res = analysis.analyze_job(s, job, prof, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}))
+        assert res.contract_kind == "internship" and job.status != "excluded"
+
+
+def test_an_ai_slip_never_drops_an_offer_whose_title_matches(monkeypatch):
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import analysis, store
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    slip = analysis.JobAnalysis(contract_kind="internship", role_type="other", is_relevant=False, relevance_score=20,
+                                analysis_confidence=0.6, france_eligible=True)
+    monkeypatch.setattr(analysis, "call_json", lambda *a, **k: slip.model_copy())
+    cfg = run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"})
+    prof = {**PROFILE_DEFAULT, "offer_types": ["internship", "job"]}
+    with sessionmaker(bind=engine)() as s:
+        mk = lambda i, t: store.Job(uid=str(i), title=t, url=f"https://a.fr/{i}", description="Missions et profil. " * 20,
+                                    pub_date=datetime.utcnow(), date_conf=0.9, location_verified=True, france_eligible=True, extra={})
+        match, other = mk(1, "Stage - Data Scientist machine learning (H/F)"), mk(2, "Stage - Assistant(e) événementiel (H/F)")
+        s.add_all([match, other])
+        s.commit()
+        analysis.analyze_job(s, match, prof, cfg)
+        analysis.analyze_job(s, other, prof, cfg)
+        assert match.status == "review" and "title_matches_your_profile" in match.review_flags
+        assert other.status == "excluded"  # no match in the title: the AI's 'no' stands
+
+
+def test_store_finance_hr_roles_are_rejected_but_technical_ones_stay():
+    from jobfinder.classify import analyze_title
+    from jobfinder.config import PROFILE_DEFAULT
+    prof = {**PROFILE_DEFAULT, "offer_types": ["job", "internship", "phd_postdoc", "apprenticeship"]}
+    for t in ("Hôte de caisse CQP en alternance", "Analyste Financier - en stage", "Contrôle de Gestion Corporate – en stage",
+              "Acheteur Transport – en stage", "Assistant ressources humaines en alternance"):
+        assert analyze_title(t, "", prof).verdict == "reject", t
+    for t in ("Stage - Data Scientist (H/F)", "Ingénieur achats data et IA", "Stage - Analyste data RH",
+              "Alternance - Ingénieur Machine Learning"):
+        assert analyze_title(t, "", prof).verdict != "reject", t

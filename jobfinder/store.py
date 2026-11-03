@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 import os
 import re
 from urllib.parse import urlparse
@@ -125,6 +126,7 @@ class AICache(Base):
     key = Column(String, primary_key=True)
     value = Column(Text)
     created = Column(DateTime, default=utcnow)
+    kind = Column(String, default="")  # the answer's schema: 'PageOffers' (a lab page read by the AI) is kept between sessions
 
 
 engine = create_engine(f"sqlite:///{DATA_DIR / 'jobs.db'}", connect_args={"check_same_thread": False})
@@ -148,6 +150,8 @@ def init_db():
         for name, kind in (("listed", "INTEGER DEFAULT 0"), ("outcome", "VARCHAR DEFAULT ''"), ("health", "VARCHAR DEFAULT ''")):
             if name not in have:
                 conn.exec_driver_sql(f"ALTER TABLE sources ADD COLUMN {name} {kind}")
+        if "kind" not in {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(ai_cache)")}:
+            conn.exec_driver_sql("ALTER TABLE ai_cache ADD COLUMN kind VARCHAR DEFAULT ''")
         have = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(site_memory)")}
         for name, kind in (("last_status", "VARCHAR DEFAULT ''"), ("last_listed", "INTEGER DEFAULT 0"), ("last_scan", "DATETIME"),
                            ("last_preset", "VARCHAR DEFAULT ''")):
@@ -269,6 +273,7 @@ def add_sources(s, urls: list[str]):
     return added
 
 
+KEPT_AI_ANSWERS = ("PageOffers",)
 SCAN_LOCK = DATA_DIR / "scan.lock"  # holds the id of the process that is scanning
 
 
@@ -303,8 +308,12 @@ def wipe_session_data() -> bool:
         return False
     try:
         with SessionLocal() as s:
-            for m in (Job, Source, CoverLetter, AICache):
+            for m in (Job, Source, CoverLetter):
                 s.query(m).delete()
+            # the AI's reading of a public lab page is kept 30 days: an unchanged page is not sent to the AI again.
+            # Every other answer (offer analysis, CV matching, letters) is deleted.
+            s.query(AICache).filter((AICache.kind.notin_(KEPT_AI_ANSWERS)) | (AICache.kind.is_(None))
+                                    | (AICache.created < utcnow() - timedelta(days=30))).delete(synchronize_session=False)
             s.commit()
     except Exception as e:  # pragma: no cover
         LOG.warning("wipe failed: %s", e)

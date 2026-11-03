@@ -143,7 +143,8 @@ Each website is processed by the most precise reader available, selected automat
 2. the generic crawler (structured data, embedded page data, job links and listing dates, pagination, sitemap, one
    JavaScript rendering);
 3. the AI page reader, for pages that describe offers as text, tables or PDF files;
-4. the AI browser, which operates a headless browser for sites that require interaction.
+4. the PDF reader, without AI, for offers published as PDF files when the AI page reader is not available or found nothing;
+5. the AI browser, which operates a headless browser for sites that require interaction.
 
 | Platform | Data source | Publication date |
 |---|---|---|
@@ -159,6 +160,7 @@ Each website is processed by the most precise reader available, selected automat
 | Teamtailor, Talentsoft, RSS feeds | the site's job feed, then its list pages | `pubDate` |
 | Talentview (Parrot) | public campaign list | last activation date |
 | Softy (Inserm) | page data of the offer list, newest first | "mise en ligne" date (the offer's last update) |
+| Offers published as PDF files | the offer's own page when its card links one, else the PDF (when `robots.txt` allows it), else the card's title | WordPress post date, date written in the PDF, PDF creation date; the month in the PDF's address only proves an offer too old |
 | WordPress job post types | REST API, sorted by date | publication date |
 | Other websites | JSON-LD, embedded page data, job links, sitemap | labelled date on the offer |
 | Laboratory pages | AI page reader; titles and dates must appear on the page | date written next to the offer |
@@ -219,7 +221,9 @@ the result:
 | possibly incomplete | fewer than half of the offers the website announces were read, or far fewer than usual |
 
 - A website that was down or refused once gets one more try at the end of the scan. `robots.txt` refusals are not retried.
-- When a website announces many more offers than its page gives, its sitemap is read as well.
+- When a website announces many more offers than its page gives, its sitemap is read as well. A sitemap without dates is
+  read in its own order and left after 50 offers in a row older than the range (3DS lists its newest offers first).
+- A list whose next page is a form sent with POST (CNRS: `toPage('SearchForm', 2)`) is paged the way a browser does it.
 - When a page is gone (404, 410, 5xx), its home page is searched for a career page, and the possible new address is shown in
   the note. The address is not replaced automatically.
 - A reader recognised from a word in the page code is dropped if it returns other offers than the page shows, from another
@@ -257,6 +261,9 @@ A second key can be added as `GEMINI_API_KEY_2` or `GROQ_API_KEY_2` in `api_keys
 with both keys. Cohere comes after the models whose limit returns every day, because its trial limit is monthly. The
 order is a judgement, not a benchmark, and is set by `LADDER` in `jobfinder/llm.py`. Before CV matching, the consent box names
 every hosted provider that could receive the CV. Switching can be turned off in Settings to use a single model.
+
+The AI's reading of a public lab page is kept for 30 days, so an unchanged page is not sent to the AI again; every other AI
+answer (offer analysis, CV matching, letters) is deleted with the session data.
 
 A model the provider no longer offers on a key (HTTP 404 "no longer available", for example `gemini-2.5-flash` on a new
 Google account), or an account without credits, is skipped for 7 days, even after a restart (setting `ai_gone`).
@@ -318,13 +325,20 @@ broader technical fields (embedded systems and hardware such as FPGA, ASIC, VHDL
 software and cloud; cybersecurity; control and estimation). A title in a research field passes; a title in a broader
 technical field is reviewed by the language model. Only sales, administrative and support titles, explicitly excluded
 words and unwanted offer types are rejected on the title alone; an internship or thesis subject expressed in
-specialised terms is always reviewed by the language model.
+specialised terms is always reviewed by the language model. Rejected roles include store, cashier, finance and management
+control, purchasing, HR, legal, reception and customer-service roles, by full role name ("contrôleur de gestion",
+"hôte de caisse"), so that technical titles in those fields ("Stage - Analyste data RH") are still reviewed.
 
 ### AI analysis and CV matching
 
 For each offer in the range, the language model receives the offer text, the numbered candidate dates and the search
 profile. It returns the offer type, location evidence, publication date choice and a relevance score with a short
-justification. An unusable answer affects only that offer; the analysis continues. Relevant offers are then compared
+justification. An unusable answer affects only that offer; the analysis continues. Two rules protect offers
+from a model's mistakes:
+
+- the offer type stated in the title (Stage, Alternance, Thèse, Post-doc, CDI, CDD) replaces the model's answer;
+- an offer whose title matches the profile by itself is never excluded on the model's judgment alone: when the model
+  calls it irrelevant or non-technical, it goes to "To check" with that reason. Relevant offers are then compared
 with each CV (skills, experience, research topics, education, languages), and evidence quoted from a CV is verified
 against the CV text.
 

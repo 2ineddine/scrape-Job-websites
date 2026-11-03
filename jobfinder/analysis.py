@@ -132,6 +132,11 @@ def analyze_job(s, job: Job, profile, cfg, keys=None):
     ti = analyze_title(job.title, ex.get("department"), profile, job.employment_type)
     cands = date_candidates(text)
     res = call_json(build_prompt(job, profile, text, cands, ti), JobAnalysis, cfg, s, keys)
+    # the offer type the TITLE states ('Stage - Data Scientist', 'Post-doc', 'CDI') beats the AI's: small models read
+    # 'Stage' as a regular job, and an internship-only profile would then lose the offer
+    stated = ti.training or ("job" if ti.contract in ("cdi", "cdd", "freelance", "interim") else "")
+    if stated and res.contract_kind != stated:
+        res.contract_kind = stated
     proven = lambda ev: bool(ev) and len(_ws(ev)) >= 4 and _ws(ev) in _ws(text)
     flags = []
     # ---- publication date: deterministic text evidence first, then the AI's choice among the dates of the text
@@ -168,13 +173,19 @@ def analyze_job(s, job: Job, profile, cfg, keys=None):
         return _exclude(s, job, res, "location: not in France - " + res.location_evidence)
     else:
         flags.append("location_unverified")
-    # ---- role and relevance
+    # ---- role and relevance. A title that matches the profile by itself ('Stage - Data Scientist') is never dropped on the
+    # AI's word alone: free models slip now and then (the same offer judged right twice, wrong once), so it goes to 'To check'
+    title_match = ti.verdict == "pass"
     if res.role_type in ("sales_business", "admin_support"):
-        return _exclude(s, job, res, f"role: {res.role_type} - {res.reasoning_summary}")
+        if not title_match:
+            return _exclude(s, job, res, f"role: {res.role_type} - {res.reasoning_summary}")
+        flags.append("AI_says_non_technical_role_but_the_title_matches_your_profile")
     if res.contract_kind not in ("unknown", *wanted_types(profile)):
         return _exclude(s, job, res, f"contract: {OFFER_TYPES[res.contract_kind]} not wanted - {res.reasoning_summary}")
     if not res.is_relevant or res.relevance_score < cfg["min_relevance"]:
-        return _exclude(s, job, res, f"AI relevance {res.relevance_score:.0f}: {res.reasoning_summary}")
+        if not title_match:
+            return _exclude(s, job, res, f"AI relevance {res.relevance_score:.0f}: {res.reasoning_summary}")
+        flags.append("AI_says_not_relevant_but_the_title_matches_your_profile")
     if res.needs_review:
         flags.append("relevance_needs_review")
     job.relevance_score, job.relevance_json = res.relevance_score, res.model_dump()

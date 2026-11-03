@@ -16,10 +16,24 @@ from dataclasses import dataclass, field
 from .web import _wb, norm
 
 
+_UI_WORDS = re.compile(r"\s+(?:t[ée]l[ée]charger|download|postuler|apply|partager|share|imprimer|print|voir|see|plus d|"
+                       r"en savoir|itin[ée]raire|map|carte)\b.*$", re.I)
+_STREET = re.compile(r"\b\d{1,4}\s*(?:bis|ter)?,?\s+(?:rue|avenue|av\.|boulevard|bd|place|quai|all[ée]e|chemin|route|impasse|cours|"
+                     r"square|esplanade|parvis)\b", re.I)
+_POSTCODE_CITY = re.compile(r"\b(\d{5})\s+([A-ZÀ-Ý][\wÀ-ÿ'’-]*(?:[ -](?:sur|sous|en|le|la|les|de|du|d'|[A-ZÀ-Ý][\wÀ-ÿ'’-]*))*)")
+
+
+def tidy_place(v) -> str:
+    """'PSL 60 rue Mazarine 75006 Paris Télécharger en' -> '75006 Paris': no buttons, no street, the postcode and city."""
+    v = _UI_WORDS.sub("", re.sub(r"\s+", " ", v or "")).strip(" ,;-")
+    m = _POSTCODE_CITY.search(v) if _STREET.search(v) else None
+    return re.sub(r"\s+cedex\b.*$", "", f"{m[1]} {m[2]}", flags=re.I) if m else v
+
+
 def html_location(soup) -> str:
     """Location from microdata, ATS markup (data-careersite-propertyid, jobGeoLocation...) when JSON-LD is absent."""
     out = []
-    add = lambda v: out.append(re.sub(r"\s+", " ", v).strip()) if v and v.strip() else None
+    add = lambda v: out.append(tidy_place(v)) if v and v.strip() and tidy_place(v) else None
     for t in soup.find_all(attrs={"itemprop": re.compile("^(streetAddress|addressLocality|addressRegion|addressCountry)$", re.I)}):
         add(t.get("content") or t.get_text(" ", strip=True))
     loc_class = re.compile(r"job-?location|jobgeolocation", re.I)  # one pass ('[class*=...]' selectors are slow)
@@ -318,7 +332,21 @@ _NON_RESEARCH = ("sales", "pre sales", "presales", "account manager", "account e
                  "business developer", "ingenieur d'affaires", "ingenieur commercial", "technico commercial", "recruiter",
                  "recruteur", "talent acquisition", "charge de recrutement", "accountant", "comptable", "assistant administratif",
                  "assistante administrative", "assistant de direction", "assistante de direction", "office manager",
-                 "community manager", "chauffeur", "driver", "vendeur", "vendeuse", "magasinier", "sales advisor")
+                 "community manager", "chauffeur", "driver", "vendeur", "vendeuse", "magasinier", "sales advisor",
+                 # store, finance, purchasing, HR, legal, reception and customer-service roles: full role names only, so that
+                 # 'Data Scientist Marketing' or 'Ingénieur achats data' stay ('Hôte de caisse CQP en alternance' does not)
+                 "hote de caisse", "hotesse de caisse", "caissier", "caissiere", "employe libre service", "employee libre service",
+                 "employe de rayon", "employee de rayon", "employe commercial", "employee commerciale", "chef de rayon",
+                 "manager de rayon", "equipier", "equipiere", "assistant vente", "assistante vente", "conseiller de vente",
+                 "conseillere de vente", "conseiller clientele", "conseillere clientele", "charge de clientele",
+                 "chargee de clientele", "teleconseiller", "teleconseillere", "hote d'accueil", "hotesse d'accueil",
+                 "agent d'accueil", "preparateur de commandes", "preparatrice de commandes", "boucher", "boulanger",
+                 "poissonnier", "analyste financier", "analyste financiere", "controle de gestion", "controleur de gestion",
+                 "controleuse de gestion", "acheteur", "acheteuse", "assistant ressources humaines",
+                 "assistante ressources humaines", "charge de ressources humaines", "chargee de ressources humaines",
+                 "gestionnaire de paie", "gestionnaire paie", "juriste", "assistant juridique", "assistante juridique",
+                 "charge de contrats", "chargee de contrats", "gestionnaire administratif", "gestionnaire administrative",
+                 "charge de communication", "chargee de communication", "chef de projet marketing", "commercial terrain")
 GENERIC_TECH = ("engineer", "ingenieur", "scientist", "scientifique", "chercheur", "researcher", "research",
                 "recherche", "r&d", "data", "developer", "developpeur", "analyst", "architect", "model", "models",
                 "modele", "modeles", "deploy", "deploying", "deployment", "deploiement", "inference", "pipeline",

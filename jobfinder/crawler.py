@@ -11,14 +11,14 @@ import re
 import threading
 import time
 from collections import Counter
-from datetime import timedelta
-from urllib.parse import urljoin, urlparse, urlunparse
+from datetime import datetime, timedelta
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from .adapters import (ADAPTERS, NOT_JOB, Page, _Budget, _open_detail, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
-                       detect_one_hop, embedded_jobs, guess_board, jobs_from_json, worth_opening)
-from .classify import classify_location, is_boilerplate_title
+from .adapters import (ADAPTERS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
+                       detect_one_hop, embedded_jobs, guess_board, jobs_from_json, raw_verdict, worth_opening)
+from .classify import classify_location, is_boilerplate_title, location_from_text
 from .sitefilters import filtered_url, with_own_filters
 from .dates import _UPDATE_WORDS, _dayfirst, parse_date, text_publication_date
 from .config import utcnow
@@ -95,6 +95,28 @@ def _next_page(soup, base, n):
             kept = re.sub(rf"([?&]){re.escape(field['name'])}=\d+", "", base)
             return f"{kept}{sep}{field['name']}={n + 1}"
     return None
+
+
+def _form_post(soup, base, nxt):
+    """The next page of an ASP.NET-style list is a form sent with POST (CNRS: onclick="toPage('SearchForm', 2)" sets the
+    hidden field 'Page'): -> (form address, its fields with the next page number), like a browser sends it; else None."""
+    m = re.search(r"[?&](\w+)=(\d+)$", nxt or "")
+    field = soup.find("input", attrs={"type": "hidden", "name": m[1]}) if m else None
+    form = field.find_parent("form") if field else None
+    if not form or (form.get("method") or "get").lower() != "post":
+        return None
+    data = []
+    for i in form.find_all(["input", "select", "textarea"]):
+        name, kind = i.get("name"), (i.get("type") or "").lower()
+        if not name or kind in ("submit", "button", "image", "file") or (kind in ("checkbox", "radio") and not i.has_attr("checked")):
+            continue
+        if i.name == "select":
+            opt = i.find("option", selected=True) or i.find("option")
+            value = opt.get("value", opt.get_text(strip=True)) if opt else ""
+        else:
+            value = i.get_text() if i.name == "textarea" else i.get("value", "")
+        data.append((name, m[2] if name == m[1] else value))
+    return urljoin(base, form.get("action") or base), data
 
 
 _BROWSERS = threading.Semaphore(2)  # many browsers at once on a small machine miss the data a page downloads late (IBM: 1 offer of 29)
@@ -321,6 +343,7 @@ def _real_links(jobs, links):
 
 def crawl_generic(f, url, cfg, known, st):
     seen_pages, seen_links, page_url, n, details, guessed_next, rendered = set(), set(known), url, 0, 0, False, False
+    posts = {}  # next pages sent as a form (POST), by their address
     budget, filtered, retry, hopped = _Budget(cfg, st), False, False, False
     by_date = bool(_DATE_SORT.search(url))  # the URL already asks the website for its newest offers first
     while page_url:
@@ -336,7 +359,7 @@ def crawl_generic(f, url, cfg, known, st):
         try:
             dead, err = False, None
             try:
-                r = f.get(page_url)
+                r = f.request("POST", posts[key][0], data=posts[key][1]) if key in posts else f.get(page_url)
                 soup = BeautifulSoup(r.text, PARSER)
                 dead = n == 1 and _error_page(soup)
             except ConnectionError as e:
@@ -463,6 +486,9 @@ def crawl_generic(f, url, cfg, known, st):
                 st.more_pages = True  # 'javascript:pagination(2)' or a page robots.txt closes: the sitemap lists the rest
                 f.note(f"the next list page cannot be opened ({nxt[:60]}): the website's sitemap is read instead")
                 return
+            form = _form_post(soup, page_url, nxt) if nxt else None
+            if form:
+                posts[normalize_url(nxt)] = form
             page_url = nxt
         except AccessError:
             raise
@@ -513,13 +539,16 @@ def _slug_title(u):
     return re.sub(r"-(?:jid-)?\d+$", "", best).replace("-", " ").strip()
 
 
+_SITEMAP_OLD_RUN = 50
+
+
 def crawl_sitemap(f, url, cfg, known, st):
     """The jobs a list does not let the crawler page through, from the sitemap: newest 'lastmod' first. An offer cannot be
     published after its last modification, so a lastmod older than the range proves the offer too old (never opened)."""
     gate, details, seen, batch = cfg.get("_gate"), 0, set(known), []
     entries = sorted(sitemap_jobs(f, url), key=lambda e: e[1], reverse=True)
     f.note(f"sitemap: {len(entries)} job pages listed")
-    out = 0
+    out, old_run = 0, 0  # old_run: offers opened in a row whose own date is older than the range
     for u, lastmod in entries:
         if u in seen:
             continue
@@ -540,10 +569,17 @@ def crawl_sitemap(f, url, cfg, known, st):
             job = _parse_detail(f.get(u).text, u)
             job["provenance"] += "+sitemap"
             batch.append(job)
+            verdict = raw_verdict(cfg, dict(job)) if job.get("date") else None
+            old_run = old_run + 1 if verdict is False else 0 if verdict is True else old_run
         except AccessError:
             raise
         except Exception as e:
             f.note(f"detail failed {u}: {e}")
+        if not lastmod and old_run >= _SITEMAP_OLD_RUN and cfg.get("date_preset") != "All dates":
+            # no lastmod to sort by, but the sitemap's own order is clearly newest first (3DS): the rest is older
+            st.stopped_by_date = True
+            f.note(f"sitemap: {old_run} offers in a row older than the range -> finished")
+            break
         if len(batch) >= 25:
             yield Page("sitemap", url, batch, out=out, ordered=False)
             batch, out = [], 0
@@ -655,6 +691,174 @@ _UNSUPPORTED = {"linkedin.com": "LinkedIn shows jobs only to signed-in members: 
                 "indeed.": "Indeed blocks automated reading: add the company's own career page instead"}
 
 
+# ---------------------------------------------------------------------------- offers published as PDF files
+_PDF_OFFER = re.compile(r"annonce|offre|offer|stage|intern|th[eè]se|phd|post-?doc|poste|position|job|sujet|subject|"
+                        r"proposal|proposition|recrut|vacanc|fiche|m2", re.I)
+_PDF_SKIP_LINE = re.compile(r"https?://|www\.|@|\+?\d[\d .-]{7,}|\b\d{5}\b|^\W*(?:laboratoire|laboratory|universit|sorbonne|"
+                            r"campus|institut|cnrs|inserm|inria|umr|rue|avenue|bd|boulevard|page \d|sous la (?:co-?)?tutelle|"
+                            r"en partenariat|in partnership|with the support)|^[^:]{2,30}:\s", re.I)  # letterhead, 'Service : ...' 
+_PDF_LABEL = re.compile(r"^\s*(?:titre|title|sujet|subject|intitul[ée]|offre de stage|internship)\s*(?:du stage|of the internship)?"
+                        r"\s*[:\-]\s*(.{10,200})$", re.I | re.M)
+
+
+_GENERIC_WORDS = set("""internship internships intern stage stages stagiaire phd thesis these theses proposal proposals position
+positions post doc docs postdoc postdocs doctoral doctorat doctorant doctorante postdoctoral postdoctorat sujet sujets pourvoir
+offre offres offer offers job jobs emploi emplois recrutement recruitment cdd cdi ans mois year years month months open
+available disponible disponibles announcement annonce annonces description fiche poste postes vacancy vacancies opportunity
+opportunities master research recherche call candidature candidatures application applications""".split())
+
+
+def _generic_title(text) -> bool:
+    """'Internship', 'PhD Thesis proposal', 'Post-doctorat (CDD 2 ans)', 'Sujet de thèse à pourvoir': a section heading or a
+    kind of offer, not the offer's own title (fewer than two words that are not offer words)."""
+    return len([w for w in re.findall(r"[a-z]{3,}", norm(text or "")) if w not in _GENERIC_WORDS]) < 2
+
+
+def _pdf_read(data):
+    """-> (text with its lines, creation date or None) of a PDF offer (at most 10 MB, 20 pages)."""
+    if not data.startswith(b"%PDF") or len(data) > 10 * 1024 * 1024:
+        return "", None
+    import pymupdf as fitz
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        text = "\n".join(p.get_text() for p in list(doc)[:20])
+        m = re.match(r"D:(\d{8})", (doc.metadata or {}).get("creationDate") or "")
+        return text, (datetime.strptime(m[1], "%Y%m%d") if m else None)
+    except Exception:
+        return "", None
+
+
+def _pdf_place(text) -> str:
+    """'Lieu : Paris', else the letterhead's address ('15 rue de l'École de Médecine, 75006 Paris') -> 'Paris, France'."""
+    found = location_from_text(text)
+    if found:
+        return found
+    m = re.search(r"\b(?:F-)?\d{5}\s+([A-ZÀ-Ý][\wÀ-ÿ'’ -]{1,30}?)(?=\s*(?:,|\n|(?i:cedex)|$))", text[:3000], re.M)
+    return f"{m[1].strip()}, France" if m else ""
+
+
+def _pdf_title(text) -> str:
+    """'Titre : ...' when the PDF names it, else its first line that is not the lab's letterhead (name, address, phone)."""
+    m = _PDF_LABEL.search(text)
+    if m:
+        return m[1].strip()
+    lines = [x.strip() for x in text.splitlines()[:60]]
+    for i, ln in enumerate(lines):
+        if len(ln) >= 15 and not _PDF_SKIP_LINE.search(ln) and not _generic_title(ln) and re.search(r"[a-zà-ÿ]{3}", ln, re.I):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if nxt and nxt[:1].islower() and len(ln) + len(nxt) < 200:  # a title written on two lines
+                ln = f"{ln} {nxt}"
+            return ln[:200]
+    return ""
+
+
+def _upload_end(u):
+    """'/uploads/2026/10/x.pdf' -> 2026-10-31: the file was online by the end of that month at the latest."""
+    up = re.search(r"/(20\d\d)/(0[1-9]|1[0-2])/", urlparse(u).path)
+    return (datetime(int(up[1]) + int(up[2]) // 12, int(up[2]) % 12 + 1, 1) - timedelta(days=1)) if up else None
+
+
+def _pdf_boxes(soup, url):
+    """[(pdf address, heading of its card, the card's own offer page or '')] for every PDF that looks like an offer."""
+    root = soup.find("main") or soup.find(attrs={"role": "main"}) or soup.body or soup
+    out, seen = [], set()
+    for a in root.find_all("a", href=True):
+        u = urljoin(url, a["href"])
+        name = unquote(urlparse(u).path.rsplit("/", 1)[-1])
+        if (not urlparse(u).path.lower().endswith(".pdf") or a.find_parent(["nav", "footer", "header"]) or normalize_url(u) in seen
+                or not _PDF_OFFER.search(f"{a.get_text(' ', strip=True)} {name}")):
+            continue
+        seen.add(normalize_url(u))
+        box, head = a, None
+        for _ in range(4):  # the smallest block around the link that has a heading: the offer's card
+            box = box.parent
+            if box is None or box.name in ("body", "main"):
+                break
+            head = box.find(["h2", "h3", "h4", "h5"])
+            if head:
+                break
+        title = head.get_text(" ", strip=True) if head else ""
+        page = ""
+        if head:
+            links = [urljoin(url, x["href"]) for x in ([head] if head.name == "a" else []) + head.find_all("a", href=True) + box.find_all("a", href=True)]
+            page = next((x for x in links if not urlparse(x).path.lower().endswith(".pdf") and urlparse(x).hostname == urlparse(url).hostname
+                         and normalize_url(x) != normalize_url(url)), "")
+        out.append((u, title if 10 <= len(title) <= 250 and not _generic_title(title) else "", normalize_url(page) if page else ""))
+    shared = Counter(t for _, t, _ in out if t)  # one heading above several PDFs is the section's ('Internships 2027')
+    return [(u, "" if shared[t] > 1 else t, page if shared[t] <= 1 else "") for u, t, page in out]
+
+
+def _wp_post_date(f, html):
+    """A WordPress post links its own data ('<link rel="alternate" type="application/json" href=".../wp-json/wp/v2/posts/4387">'),
+    which holds the day it was published even when the page shows no date."""
+    ln = BeautifulSoup(html, PARSER).find("link", rel="alternate", type="application/json", href=re.compile(r"/wp-json/wp/v2/"))
+    if not ln or not f.robots_ok(ln["href"]):
+        return None
+    try:
+        return f.get(ln["href"]).json().get("date")
+    except AccessError:
+        raise
+    except Exception:
+        return None
+
+
+def crawl_pdfs(f, url, cfg, known, st):
+    """Offers published as PDF files ('Télécharger le sujet de stage' -> /uploads/2026/10/Annonce_Stage_LIB.pdf). For each
+    one: the offer's own page when its card links one, else the PDF itself, else (robots.txt closes both) the card's title.
+    Date: one written in the offer, else the day the PDF was made, never later than the month of the address
+    ('/uploads/2026/10/'); that month alone only proves that an offer is too old."""
+    boxes = [b for b in _pdf_boxes(BeautifulSoup(f.get(url).text, PARSER), url) if b[0] not in known and b[2] not in known]
+    if not boxes:
+        return
+    f.note(f"{len(boxes)} offers published as PDF files: reading them")
+    budget, gate, jobs = _Budget(cfg, st), cfg.get("_gate"), []
+    for pdf, head, page in boxes:
+        up_end, job = _upload_end(pdf), None
+        if page and f.robots_ok(page) and budget.take():
+            try:
+                html = f.get(page).text
+                job = _parse_detail(html, page)
+                if head and (job["provenance"] == "html-fallback" or not job["title"]):
+                    job["title"] = head  # the card's heading, not the website's ('LIB - Laboratoire...')
+                if not job.get("date"):
+                    wp = _wp_post_date(f, html)
+                    d, c = parse_date(wp) if wp else (None, 0.0)
+                    if d:
+                        job.update(date=d, date_conf=min(c, 0.85), date_text=wp, date_source="wordpress api post date")
+            except AccessError:
+                raise
+            except Exception as e:
+                f.note(f"offer page not read {page[:80]}: {e}")
+        if job is None and f.robots_ok(pdf) and budget.take():
+            try:
+                text, made = _pdf_read(f.get(pdf).content)
+            except AccessError:
+                raise
+            except Exception as e:
+                f.note(f"pdf not read {pdf[:80]}: {e}")
+                text, made = "", None
+            flat = re.sub(r"\s+", " ", text).strip()
+            if len(flat) >= 200:  # else a scanned image: no text to read
+                d, c, t, _ = text_publication_date(flat, dayfirst=True)
+                src = "date written in the PDF"
+                if d is None and made and (up_end is None or made <= up_end + timedelta(days=1)):
+                    d, c, t, src = made, 0.6, f"{made:%Y-%m-%d}", "pdf creation date"
+                job = _raw(head or _pdf_title(text) or unquote(pdf.rsplit("/", 1)[-1]).rsplit(".", 1)[0].replace("_", " "), pdf,
+                           description=flat[:15000], location=_pdf_place(text), date=d, date_conf=c or 0.0,
+                           date_source=src if d else "", date_text=t or "", conf=0.5, provenance="pdf")
+        if job is None and head:  # robots.txt closes the PDF and there is no offer page: the card is all there is
+            job = _raw(head, page or pdf, description=head, conf=0.4, provenance="list-only")
+        if job is None:
+            continue
+        if not job.get("date") and up_end:  # the month in the PDF's address: proof only when it is already too old
+            c = 0.8 if gate and gate(up_end, 0.8, "") is False else 0.45
+            job.update(date=up_end, date_conf=c, date_text=f"uploaded {up_end:%Y-%m}",
+                       date_source="pdf upload month (latest possible day)")
+        job["apply_url"] = job.get("apply_url") or pdf
+        jobs.append(job)
+    yield Page(f"{url}#pdf", url, jobs, ordered=False)
+
+
 def crawl_source(f, url, cfg, known, st):
     host = (urlparse(url).hostname or "").lower()
     for k, why in _UNSUPPORTED.items():
@@ -759,6 +963,15 @@ def crawl_source(f, url, cfg, known, st):
             raise
         except Exception as e:
             f.note(f"AI page reader: {str(e)[:120]}")
+    if found == 0 and mode != "ai":  # offers published as PDF files ('Télécharger le sujet de stage'). After the AI page
+        # reader, which reads the same PDFs with their context; without AI keys (or when it found nothing), this reads them
+        for pg in crawl_pdfs(f, url, cfg, known, st):
+            found += len(pg.jobs)
+            if pg.jobs:
+                st.platform = f"{st.platform}+pdf"
+            yield pg
+        if found:
+            return
     if found == 0 and mode in ("auto", "ai") and not known and cfg.get("_keys") is not None:
         if mode == "auto":
             f.note("no job found by reading the page: switching to the AI browser")

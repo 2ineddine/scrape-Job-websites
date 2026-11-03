@@ -322,7 +322,7 @@ def _ask(step, user, schema, cfg, s, keys, system):
                 obj = schema.model_validate(data)
             except ValidationError:
                 obj = schema.model_validate(_soften(schema, data))  # an invalid choice / a null: the field's default
-            s.merge(AICache(key=ck, value=obj.model_dump_json()))
+            s.merge(AICache(key=ck, value=obj.model_dump_json(), kind=schema.__name__))
             s.commit()
             return obj
         except (ValueError, ValidationError) as e:

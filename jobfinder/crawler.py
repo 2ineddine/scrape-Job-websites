@@ -12,18 +12,18 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
-from urllib.parse import unquote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from .adapters import (ADAPTERS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
-                       detect_one_hop, embedded_jobs, guess_board, jobs_from_json, raw_verdict, worth_opening)
+from .adapters import (ADAPTERS, FT_HOSTS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
+                       detect_one_hop, embedded_jobs, find_board, guess_board, jobs_from_json, raw_verdict, worth_opening)
 from .classify import classify_location, is_boilerplate_title, location_from_text
 from .sitefilters import filtered_url, with_own_filters
 from .dates import _UPDATE_WORDS, _dayfirst, parse_date, text_publication_date
 from .config import utcnow
-from .urlclean import is_job_board
-from .web import PARSER, UA, AccessError, check_url, norm, normalize_url, syntactic_ok
+from .urlclean import JOB_BOARDS, is_job_board
+from .web import PARSER, UA, AccessError, RobotsRefused, browser_guard, check_url, norm, normalize_url, syntactic_ok
 
 _ATS_HOSTS = ("greenhouse", "lever.co", "ashby", "smartrecruiters", "myworkdayjobs", "breezy.hr", "recruitee", "teamtailor",
               "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters")
@@ -145,8 +145,7 @@ def render_js(f, url, cfg):
         with _BROWSERS, sync_playwright() as pw:
             b = pw.chromium.launch()
             ctx = b.new_context(user_agent=UA, locale="fr-FR")
-            ctx.route("**/*", lambda route: route.continue_() if syntactic_ok(route.request.url) or
-                      route.request.url.startswith(("data:", "blob:")) else route.abort())
+            ctx.route("**/*", browser_guard(f))  # SSRF, and robots.txt for the page's own data requests
             pg = ctx.new_page()
             pg.on("response", grab)
             pg.goto(url, timeout=cfg["timeout"] * 1000, wait_until="domcontentloaded")
@@ -298,6 +297,28 @@ def looks_like_offer(text) -> bool:
     return len(t) >= 500 and len(set(_OFFER_WORDS.findall(t))) >= 3
 
 
+_OFFER_NUMBER = re.compile(r"\d{4,}")
+
+
+def _drop_odd_links(jobs):
+    """Page data that mixes other content with its offers (Ubisoft's search also returns 'Anti-Cheat Software',
+    '/careers/anti-cheat-software'): when the offers' addresses carry an offer number in one folder
+    ('/careers/search/744000160215749-video-editor'), an entry outside that folder with no number, no place and no
+    contract is not an offer."""
+    def folder(u):
+        return urlparse(u or "").path.rstrip("/").rsplit("/", 1)[0]
+
+    def numbered(u):
+        return bool(_OFFER_NUMBER.search(urlparse(u or "").path.rstrip("/").rsplit("/", 1)[-1]))
+    folders = Counter(folder(j["url"]) for j in jobs if numbered(j["url"]))
+    if len(jobs) < 5 or not folders:
+        return jobs
+    main, n = folders.most_common(1)[0]
+    if n < 5 or n < 0.5 * len(jobs):  # the numbered folder must hold the offers ('working-at-ubisoft' pages around them)
+        return jobs
+    return [j for j in jobs if folder(j["url"]) == main or numbered(j["url"]) or j.get("location") or j.get("employment_type")]
+
+
 def _drop_listing_pages(jobs, listing_soup):
     """Links that looked like jobs but opened a list / category page: the same heading on several 'jobs', or the
     heading of the listing page itself ('Our jobs', 'Nos offres'). Structured jobs (JSON-LD, page data) are kept."""
@@ -322,6 +343,29 @@ def _parent_list(url):
 
 
 _DATE_SORT = re.compile(r"[?&](?:sort|sortby|sort_by|order|orderby|tri)=(?:[^&]*date|[^&]*recent|[^&]*newest|[^&]*publi)", re.I)
+
+
+def _ids_to_links(jobs):
+    """Offers that came with an id but no address ('?jbid=2283'), next to offers whose address holds their id
+    ('/carriere/2437' for id 2437): the same pattern gives the missing addresses ('/carriere/2283')."""
+    real = [j for j in jobs if "jbid=" not in j["url"] and str(j.get("platform_id") or "")]
+    pattern = None
+    for j in real:
+        pid = str(j["platform_id"])
+        seg = urlparse(j["url"]).path.split("/")
+        if len(pid) >= 2 and pid in seg:
+            p = urlparse(j["url"])._replace(path="/".join("{id}" if x == pid else x for x in seg), query="", fragment="")
+            cand = urlunparse(p)
+            if pattern is None:
+                pattern, votes = cand, 1
+            elif cand == pattern:
+                votes += 1
+    if pattern is None or votes < 2:
+        return jobs  # one example is not a pattern
+    for j in jobs:
+        if "jbid=" in j["url"] and str(j.get("platform_id") or ""):
+            j["url"] = j["apply_url"] = pattern.replace("{id}", str(j["platform_id"]))
+    return jobs
 
 
 def _real_links(jobs, links):
@@ -408,6 +452,7 @@ def crawl_generic(f, url, cfg, known, st):
                         f.note(f"page rendered with JavaScript: {len(jobs)} jobs, {len(links)} job links")
             if jobs and links:
                 jobs = _real_links(jobs, links)
+            jobs = _ids_to_links(jobs) if jobs else jobs
             if n == 1 and jobs and not is_job_board(url):  # offers published on a job platform: read there, with their exact dates
                 plats = [p for p in (detect_from_url(j.get("apply_url") or "") for j in jobs[:50]) if p and p[0] in ADAPTERS]
                 plat = plats[0] if plats else None
@@ -454,13 +499,15 @@ def crawl_generic(f, url, cfg, known, st):
                         if job["provenance"] == "html-fallback" and len(_job_links(BeautifulSoup(dhtml, PARSER), lk, set(), False)) >= 8:
                             continue  # the link opened another list ('Account Executive jobs', '170 jobs found'), not a job
                         jobs.append(job)
+                    except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                        f.note(f"detail failed {lk}: {e}")
                     except AccessError:
                         raise
                     except Exception as e:
                         f.note(f"detail failed {lk}: {e}")
             jobs = [_open_detail(f, cfg, j, budget) if j["provenance"] == "network-json" and len(j["description"]) < 300
                     and normalize_url(j["url"]) not in known and "jbid=" not in j["url"] else j for j in jobs]
-            jobs = _drop_listing_pages(jobs, soup)
+            jobs = _drop_odd_links(_drop_listing_pages(jobs, soup))
             if n == 1 and not jobs and not page_out and not hopped and not new_links:
                 hopped, listing = True, _list_page(soup, page_url)
                 if listing:
@@ -571,6 +618,8 @@ def crawl_sitemap(f, url, cfg, known, st):
             batch.append(job)
             verdict = raw_verdict(cfg, dict(job)) if job.get("date") else None
             old_run = old_run + 1 if verdict is False else 0 if verdict is True else old_run
+        except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+            f.note(f"detail failed {u}: {e}")
         except AccessError:
             raise
         except Exception as e:
@@ -688,7 +737,72 @@ def suggest_page(f, url):
 
 
 _UNSUPPORTED = {"linkedin.com": "LinkedIn shows jobs only to signed-in members: add the company's own career page instead",
-                "indeed.": "Indeed blocks automated reading: add the company's own career page instead"}
+                "indeed.": "Indeed blocks automated reading: add the company's own career page instead",
+                "apec.fr": "Apec protects its whole website with an anti-bot service and has no public API for its offers: "
+                           "add the companies' own career pages instead"}
+
+
+_HW_WORDS = {"stage", "stages", "stagiaire", "alternance", "apprentissage", "cdi", "cdd", "interim", "freelance",
+             "independant", "emploi", "emplois", "job", "jobs", "offre", "offres", "h", "f"}
+
+
+_SHARED_HOSTS = ("jobs.stationf.co", "werecruit.io")  # one career site per company, on the host's own name
+
+
+def _board_host(url) -> bool:
+    """The address is on a job board or a platform that hosts many companies' career sites (any page of it): its name is
+    the platform's, not the company's, so no job board is guessed from it ('welcometothejungle' -> Welcome to the Jungle's
+    own test board, 'welcomekit' for 'devialet.welcomekit.co', 'stationf' for every STATION F startup)."""
+    host = (urlparse(url).hostname or "").lower()
+    return any(b in host for b in JOB_BOARDS + _ATS_HOSTS + _SHARED_HOSTS)
+
+
+_WTTJ_WHY = ("Welcome to the Jungle loads its offers with a script, and its servers refuse automated browsers (HTTP 403): add "
+             "the company's own career site instead (for a STATION F startup, its page 'https://jobs.stationf.co/companies/...')")
+
+
+def wttj_alternative(f, url):
+    """A Welcome to the Jungle company page ('/fr/companies/devialet/jobs') -> the company's own career site on the same
+    platform ('https://devialet.welcomekit.co/'), whose pages list the same offers in plain HTML. None when the company
+    has none (the platform answers 'No career website for ...')."""
+    m = re.search(r"/companies/([\w-]+)", urlparse(url).path)
+    if not m:
+        return None
+    cand = f"https://{m[1].lower()}.welcomekit.co/"
+    if not f.robots_ok(cand):
+        return None
+    try:
+        r = f.get(cand)
+    except AccessError:
+        raise
+    except Exception:
+        return None
+    page = "html" in (r.headers.get("content-type") or "text/html") and "no career website" not in r.text[:300].lower()
+    return cand if page else None
+
+
+def open_alternative(f, url):
+    """A job board whose SEARCH page robots.txt closes, but which shows the same offers on open pages. Hellowork closes
+    '/fr-fr/emploi/recherche.html?k=stage+deep+learning' (and every address with '?') and opens its keyword pages:
+    '/fr-fr/emploi/mot-cle_deep-learning.html' lists the newest offers of that keyword in all of France (the app filters the
+    place, the contract and the date). -> the open page, or None."""
+    p = urlparse(url)
+    if not (p.hostname or "").endswith("hellowork.com") or "/emploi/recherche" not in p.path:
+        return None
+    words = re.findall(r"[a-z0-9]+", norm(dict(parse_qsl(p.query)).get("k", "")))
+    core = [w for w in words if w not in _HW_WORDS]  # 'stage deep learning' -> 'deep learning' (a page exists per keyword)
+    for ws in dict.fromkeys(tuple(x) for x in (words, core) if x):
+        cand = f"https://www.hellowork.com/fr-fr/emploi/mot-cle_{'-'.join(ws)}.html"
+        if not f.robots_ok(cand):
+            continue
+        try:
+            f.get(cand)
+            return cand
+        except AccessError:
+            raise
+        except Exception:
+            continue  # no page for these words (HTTP 404)
+    return None
 
 
 # ---------------------------------------------------------------------------- offers published as PDF files
@@ -825,6 +939,8 @@ def crawl_pdfs(f, url, cfg, known, st):
                     d, c = parse_date(wp) if wp else (None, 0.0)
                     if d:
                         job.update(date=d, date_conf=min(c, 0.85), date_text=wp, date_source="wordpress api post date")
+            except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                f.note(f"offer page not read {page[:80]}: {e}")
             except AccessError:
                 raise
             except Exception as e:
@@ -832,6 +948,9 @@ def crawl_pdfs(f, url, cfg, known, st):
         if job is None and f.robots_ok(pdf) and budget.take():
             try:
                 text, made = _pdf_read(f.get(pdf).content)
+            except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                f.note(f"pdf not read {pdf[:80]}: {e}")
+                text, made = "", None
             except AccessError:
                 raise
             except Exception as e:
@@ -859,11 +978,27 @@ def crawl_pdfs(f, url, cfg, known, st):
     yield Page(f"{url}#pdf", url, jobs, ordered=False)
 
 
+# job platforms that host the career site itself: a refusal of their API is a refusal of the site
+_PLATFORM_HOSTS = re.compile(r"(?:^|\.)(?:myworkdayjobs\.com|myworkdaysite\.com|smartrecruiters\.com|workable\.com|"
+                             r"recruitee\.com|teamtailor\.com|greenhouse\.io|lever\.co|ashbyhq\.com|eightfold\.ai|"
+                             r"talent-soft\.com|breezy\.hr)$")
+
+
 def crawl_source(f, url, cfg, known, st):
     host = (urlparse(url).hostname or "").lower()
+    if host.endswith("welcometothejungle.com"):
+        alt = wttj_alternative(f, url)
+        if not alt:
+            raise AccessError(f"access_restricted: {_WTTJ_WHY}")
+        f.note(f"Welcome to the Jungle page: reading the company's own career site on the same platform ({alt})")
+        url, host = alt, urlparse(alt).hostname
     for k, why in _UNSUPPORTED.items():
         if k in host:
             raise AccessError(f"access_restricted: {why}")
+    if FT_HOSTS.search(host):  # France Travail: its official API only (with your access), never its pages
+        st.platform = "francetravail (official API)"
+        yield from ADAPTERS["francetravail"](f, url, cfg, known, st)
+        return
     own = with_own_filters(url, cfg)
     if own != url:
         f.note(f"this website's own filters are applied: {own[len(url):][:80]}")
@@ -873,10 +1008,33 @@ def crawl_source(f, url, cfg, known, st):
         f.note(f"robots.txt closes this search URL but not the page itself: reading {bare} (and its sitemap)")
         url = bare
         st.more_pages = True
+    if hasattr(f, "robots_ok") and not f.robots_ok(url):
+        alt = open_alternative(f, url)
+        if alt:
+            f.note(f"robots.txt closes this search page: reading the website's open page for the same words instead ({alt})")
+            url = alt
+        elif "hellowork.com" in host:
+            raise RobotsRefused("access_restricted: robots.txt closes Hellowork's search pages. Add its open pages instead: a "
+                                "keyword page ('https://www.hellowork.com/fr-fr/emploi/mot-cle_deep-learning.html') or a "
+                                "company page ('https://www.hellowork.com/fr-fr/entreprises/...html')")
     mode = cfg.get("nav_mode", "auto")
-    name, arg = ("generic", url) if mode == "ai" else detect_platform(f, url, st)
+    try:
+        name, arg = ("generic", url) if mode == "ai" else detect_platform(f, url, st)
+    except AccessError as blocked:
+        alt = None if _board_host(url) else find_board(f, url)
+        if not alt:
+            raise  # blocked, and no open job platform carries this company's offers
+        f.note(f"this website blocks automated reading: its offers are read on its {alt[0]} board ('{alt[2]}')")
+        st.platform = f"{alt[0]} (site blocked: offers read on its {alt[0]} board)"
+        n = 0
+        for pg in ADAPTERS[alt[0]](f, alt[1], cfg, known, st):
+            n += len(pg.jobs) + pg.out
+            yield pg
+        if not n:
+            raise blocked  # the board gave nothing either: the website stays 'blocked', with its real reason
+        return
     st.platform = name
-    found, read, places = 0, set(), Counter()
+    found, read, places, dates = 0, set(), Counter(), []
     if name in ADAPTERS:
         f.note(f"platform: {name}")
         try:
@@ -887,14 +1045,24 @@ def crawl_source(f, url, cfg, known, st):
                     break
                 found += len(pg.jobs)
                 read.update(normalize_url(j["url"]) for j in pg.jobs)
+                dates += [j["date"] for j in pg.jobs if j.get("date")]
                 yield pg
         except Exception as e:  # refused (robots.txt) or failed: the company page itself may still be readable
             if found:
                 raise
+            if isinstance(e, AccessError) and not isinstance(e, RobotsRefused) and _PLATFORM_HOSTS.search(host):
+                # the address IS the platform ('sanofi.wd3.myworkdayjobs.com'): its pages are served by the same servers that
+                # just refused, so the generic reader and the AI browser would only meet the same refusal (shown as a
+                # 'captcha wall') and spend AI calls. The platform's own reason is reported.
+                raise
             f.note(f"{name} reader failed ({str(e)[:120]}): trying the generic crawler")
             st.platform = f"{name}->generic"
-        if found and name == "rss" and st.announced and found < st.announced * 0.8:  # a feed holds only the newest offers
-            f.note(f"the feed holds {found} of the {st.announced} offers announced: reading the list too")
+        gate = cfg.get("_gate")
+        # a feed holds only the newest offers: when even its oldest one is inside the range, older ones may be on the page
+        full = name == "rss" and found >= 10 and len(dates) == found and gate and gate(min(dates), 0.9, "") is not False
+        if found and name == "rss" and ((st.announced and found < st.announced * 0.8) or full):
+            f.note(f"the feed holds {found} offers" + (f" of the {st.announced} announced" if st.announced else
+                                                        ", the oldest still inside the range") + ": reading the list too")
             st.platform, known = "rss+generic", set(known) | read
         elif found:
             return
@@ -918,9 +1086,10 @@ def crawl_source(f, url, cfg, known, st):
                 raise
             except Exception as e:
                 f.note(f"{name} not readable ({str(e)[:100]}): the page's own offers are kept")
-            if not found:
-                found = len(st.held)
-                yield Page(url, url, st.held, ordered=False)
+            if not found:  # the platform gave nothing: the page's own offers, cleaned like any page's
+                held = _drop_odd_links(_drop_listing_pages(st.held, None))
+                found = len(held)
+                yield Page(url, url, held, ordered=False)
         if st.announced and found < st.announced * 0.5 and not st.stopped_by_date and not st.more_pages:
             f.note(f"the website announces {st.announced} offers, {found} found on its page: trying its sitemap")
             st.more_pages = True
@@ -929,7 +1098,7 @@ def crawl_source(f, url, cfg, known, st):
                 found += len(pg.jobs)
                 yield pg
         if found == 0:  # a page that loads its jobs from a job board without naming the board
-            board = guess_board(f, url)
+            board = None if _board_host(url) else guess_board(f, url) or (lambda b: b[:2] if b else None)(find_board(f, url))
             if board:
                 f.note(f"job board found from the company name: {board[0]} '{board[1]}'")
                 st.platform = f"{board[0]} (guessed board)"
@@ -952,12 +1121,28 @@ def crawl_source(f, url, cfg, known, st):
     if found == 0 and mode == "auto" and cfg.get("_keys") is not None:  # offers written on the page itself (lab pages)
         from .pagereader import read_page
         try:
-            for pg in read_page(f, url, cfg, known, st):
-                found += len(pg.jobs)
-                yield pg
-            if found:
-                st.platform = "ai-page-reader"
+            ai = [j for pg in read_page(f, url, cfg, known, st) for j in pg.jobs]
+            if ai:
+                # the offers' cards with PDFs, read without AI, carry what the model cannot see: the WordPress / PDF date, and
+                # the offers it left out. Same offer (same address): the model's title, the card reader's date.
+                cards = {normalize_url(j["url"]): j for pg in crawl_pdfs(f, url, cfg, known, st) for j in pg.jobs}
+                same = lambda t: re.sub(r"[^a-z0-9]", "", norm(t or ""))[:40]
+                for j in ai:
+                    c = cards.pop(normalize_url(j["url"]), None)
+                    if c is None:  # the model linked the PDF, the card reader the offer's page: same offer by its title
+                        k = next((u for u, x in cards.items() if same(x["title"]) and same(x["title"]) == same(j["title"])), None)
+                        c = cards.pop(k) if k else None
+                        if c and not f.robots_ok(j["url"]):
+                            j["url"] = j["apply_url"] = c["url"]  # the page that opens, not the PDF robots.txt closes
+                    if c and c.get("date") and not j.get("date"):
+                        j.update({k: c[k] for k in ("date", "date_conf", "date_source", "date_text")})
+                    if c and len(c.get("description") or "") > len(j.get("description") or ""):
+                        j["description"] = c["description"]
+                ai += list(cards.values())
+                found = len(ai)
+                st.platform = "ai-page-reader" + ("+pdf" if cards else "")
                 f.note(f"AI page reader: {found} offers written on the page")
+                yield Page("ai-page", url, ai, ordered=False)
                 return
         except AccessError:
             raise

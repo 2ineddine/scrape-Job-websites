@@ -28,22 +28,24 @@ inside a company's own career page). Anything else is read by the generic crawle
 from __future__ import annotations
 
 import json
-from html import unescape
+import os
 import re
+from html import unescape
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
 from .classify import analyze_title, classify_location, html_location, location_from_text
-from .config import PROFILE_DEFAULT, utcnow
-from .dates import (NO_DATE, _content_text, _dayfirst, date_decision, html_date, merge_dates, parse_date, reconcile_date,
+from .config import PRESET_DAYS, PROFILE_DEFAULT, utcnow
+from .dates import (NO_DATE, _cfg_day, _content_text, _dayfirst, date_decision, html_date, merge_dates, parse_date, reconcile_date,
                     refine_raw_date)
-from .web import PARSER, AccessError, html_to_text, norm, normalize_url, syntactic_ok
+from .store import load_keys
+from .web import PARSER, AccessError, RobotsRefused, html_to_text, norm, normalize_url, syntactic_ok
 
 
 # --------------------------------------------------------------------------- the common shapes
@@ -93,7 +95,7 @@ def _get_date(r):
     return (r["date"], r["date_conf"], r["date_source"], r["date_text"]) if r.get("date") else NO_DATE
 
 
-_TRUSTED_SOURCES = re.compile(r"api|feed|workday|smartrecruiters|successfactors list|icims|wordpress|breezy|recruitee|lever|"
+_TRUSTED_SOURCES = re.compile(r"api|feed|workday|smartrecruiters|successfactors list|icims|talentsoft|wordpress|breezy|recruitee|lever|"
                               r"greenhouse|ashby|JSON-LD|job description|pdf (?:creation date|upload month)")
 
 
@@ -125,6 +127,15 @@ def raw_verdict(cfg, raw):
     return gate(raw["date"], raw["date_conf"], raw["date_text"])
 
 
+_CODE_TITLE = re.compile(r"\s*(?:[A-Z]{1,8}[-_/. ]?)?\d[\d\-_/. ]*[A-Z]?\s*")
+
+
+def code_title(t) -> bool:
+    """'DTIS-2027-23', 'REQ-12345', '2026-460', '': a reference number, not a title (ONERA's feed titles its offers so).
+    Only the offer's page tells what the offer is."""
+    return bool(_CODE_TITLE.fullmatch(t or "")) or len(re.sub(r"\W", "", t or "")) < 3
+
+
 def worth_opening(cfg, raw) -> bool:
     """DATE FIRST, then title: the job page is opened only when the job may be inside the range and its title is not
     clearly irrelevant. Saves hundreds of requests on large company boards."""
@@ -134,8 +145,8 @@ def worth_opening(cfg, raw) -> bool:
         loc = classify_location(raw.get("location"), raw.get("country_hint"), raw.get("remote_hint"))
         if loc["location_verified"] and not loc["france_eligible"]:
             return False  # 'Chennai', 'Frickenhausen, DE': excluded later anyway
-    if len(re.sub(r"\W", "", raw.get("title") or "")) < 3:
-        return True  # unreadable title: only the job page can tell
+    if code_title(raw.get("title")):
+        return True  # unreadable title or a reference number: only the job page can tell
     return analyze_title(raw["title"], raw.get("department", ""), cfg.get("_profile") or PROFILE_DEFAULT,
                          raw.get("employment_type", "")).verdict != "reject"
 
@@ -162,6 +173,47 @@ def _wants_france(cfg) -> bool:
 
 
 # --------------------------------------------------------------------------- JSON-LD and JSON found in pages
+def _repair_json(s):
+    """JSON written by hand-made templates (Welcome to the Jungle's JSON-LD). Inside a string: a quote left unescaped
+    ('"description": "a proactive "doer": autonomous"') ends it only where JSON allows it to - a key before ':', a value
+    before ',', '}' or ']' - any other quote is escaped; a backslash that starts no valid escape (a pasted Windows path,
+    '\\_', '\\]') is doubled. Only used when the document does not parse as it is."""
+    out, stack, in_str, key, prev, i = [], [], False, False, "", 0
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == "\\":
+                if s[i + 1:i + 2] and s[i + 1] in '"\\/bfnrtu':
+                    out.append(s[i:i + 2])
+                    i += 2
+                else:
+                    out.append("\\\\")
+                    i += 1
+                continue
+            if ch == '"':
+                nxt = s[i + 1:].lstrip()[:1]
+                if (nxt == ":") if key else (nxt in (",", "}", "]", "")):
+                    in_str, prev = False, '"'
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str, key = True, bool(stack) and stack[-1] == "{" and prev in ("{", ",")
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+        if not ch.isspace():
+            prev = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _jsonld_jobs(soup, base):
     out = []
 
@@ -177,10 +229,17 @@ def _jsonld_jobs(soup, base):
                 out.append(o)
 
     for sc in soup.find_all("script", type="application/ld+json"):
+        txt = sc.string or sc.get_text() or ""
         try:
-            walk(json.loads(sc.string or sc.get_text() or "", strict=False))
-        except (ValueError, TypeError):
+            data = json.loads(txt, strict=False)
+        except ValueError:
+            try:  # quotes or backslashes left unescaped in the offer's text (Welcome to the Jungle)
+                data = json.loads(_repair_json(txt), strict=False)
+            except ValueError:
+                continue
+        except TypeError:
             continue
+        walk(data)
     jobs = []
     for o in out:
         locs, country = [], None
@@ -466,6 +525,11 @@ def _parse_detail(html, url, now=None, card=None):
             and a.get_text(" ", strip=True) == h.get_text(" ", strip=True)
         h1 = next((h for h in soup.find_all("h1") if h.get_text(" ", strip=True) and not home(h)), None)
         title = h1.get_text(" ", strip=True) if h1 else _page_title(soup, url)
+        if code_title(title):  # '<h1>DTIS-2027-23</h1>': the subject is the page's short description
+            meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+            subject = re.sub(r"\s+", " ", (meta.get("content") or "") if meta else "").strip()
+            if 8 <= len(subject) <= 200 and re.search(r"[a-zà-ÿ]{3}", subject) and not code_title(subject):
+                title = f"{subject} ({title.strip()})" if title.strip() else subject
         job = _raw(title, url, description=_content_text(soup, "main", 15000), conf=0.4, provenance="html-fallback")
     if not job["location"]:
         job["location"] = html_location(soup) or location_from_text(job["description"])
@@ -497,7 +561,7 @@ def merge_detail(base, det):
     for k in ("employer", "location", "department", "employment_type", "country_hint"):
         if not out.get(k) and det.get(k):
             out[k] = det[k]
-    if len(re.sub(r"\W", "", out.get("title") or "")) < 3 and det.get("title"):
+    if code_title(out.get("title")) and det.get("title") and not code_title(det["title"]):
         out["title"] = det["title"]
     out["date"], out["date_conf"], out["date_source"], out["date_text"] = reconcile_date(
         merge_dates(_get_date(out), _get_date(det)), [("job description", out["description"], True)])
@@ -513,6 +577,9 @@ def _open_detail(f, cfg, raw, budget, fetch_url=None):
     try:
         u = fetch_url or raw["url"]
         return merge_detail(raw, _parse_detail(f.get(u).text, raw["url"], card=_get_date(raw) if raw.get("date") else None))
+    except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+        f.note(f"job page not read {raw['url'][:90]}: {e}")
+        return raw
     except AccessError:
         raise
     except Exception as e:
@@ -550,6 +617,30 @@ _CONTRACT_WORDS = re.compile(r"^(cdi|cdd|stage|internship|alternance|apprentissa
                              r"full[- ]time|part[- ]time|permanent|temporary|vie|v\.i\.e|contrat|cadre|non cadre)\b", re.I)
 
 
+def _feed_raw(it, flavor):
+    """One feed item -> a raw job (None for an item without title or address)."""
+    g = lambda k: (it.get(k) or [""])[0]
+    title, link = html_to_text(g("title")), g("link") or g("guid")
+    if not title or not syntactic_ok(link):
+        return None
+    desc = html_to_text(g("description") or g("content") or g("summary"))
+    cats = it.get("category", [])
+    cities, countries = it.get("city", []), it.get("country", [])
+    loc = " ; ".join(dict.fromkeys(", ".join(x for x in (c, k) if x) for c, k in zip(cities or [""] * len(countries),
+                                                                                     countries or [""] * len(cities)) if c or k))
+    places = [c for c in cats if not _CONTRACT_WORDS.match(c) and classify_location(c)["location_verified"]]
+    if not loc:
+        loc = " ; ".join(places) or location_from_text(desc)
+    etype = next((c for c in cats if _CONTRACT_WORDS.match(c)), "")
+    other = [c for c in cats if c not in places and c != etype]
+    remote = norm(g("remotestatus")) in ("remote", "fully", "fully_remote", "full remote")
+    return _raw(title, link, location=loc[:200], description=desc[:15000], employment_type=etype,
+                department=g("department") or g("role") or ", ".join(other)[:120], employer=g("company_name"),
+                country_hint=countries[0] if len(set(countries)) == 1 else None, remote_hint=remote or None,
+                conf=0.85, provenance=f"{flavor}-feed",
+                **_date(g("pubdate") or g("published") or g("updated"), f"{flavor} feed pubDate", 0.85))
+
+
 def crawl_feed(f, arg, cfg, known, st):
     """Teamtailor / Talentsoft / any job feed: one request gives every offer with its publication date."""
     feed_url, flavor = arg
@@ -558,45 +649,182 @@ def crawl_feed(f, arg, cfg, known, st):
     if not items:
         raise ConnectionError(f"feed has no items: {feed_url}")
     for it in items:
-        g = lambda k: (it.get(k) or [""])[0]
-        title, link = html_to_text(g("title")), g("link") or g("guid")
-        if not title or not syntactic_ok(link):
+        raw = _feed_raw(it, flavor)
+        if raw is None:
             continue
-        desc = html_to_text(g("description") or g("content") or g("summary"))
-        cats = it.get("category", [])
-        cities, countries = it.get("city", []), it.get("country", [])
-        loc = " ; ".join(dict.fromkeys(", ".join(x for x in (c, k) if x) for c, k in zip(cities or [""] * len(countries),
-                                                                                         countries or [""] * len(cities)) if c or k))
-        places = [c for c in cats if not _CONTRACT_WORDS.match(c) and classify_location(c)["location_verified"]]
-        if not loc:
-            loc = " ; ".join(places) or location_from_text(desc)
-        etype = next((c for c in cats if _CONTRACT_WORDS.match(c)), "")
-        other = [c for c in cats if c not in places and c != etype]
-        remote = norm(g("remotestatus")) in ("remote", "fully", "fully_remote", "full remote")
-        raw = _raw(title, link, location=loc[:200], description=desc[:15000], employment_type=etype,
-                   department=g("department") or g("role") or ", ".join(other)[:120], employer=g("company_name"),
-                   country_hint=countries[0] if len(set(countries)) == 1 else None, remote_hint=remote or None,
-                   conf=0.85, provenance=f"{flavor}-feed",
-                   **_date(g("pubdate") or g("published") or g("updated"), f"{flavor} feed pubDate", 0.85))
-        if len(desc) < 400 or not raw["location"]:
+        if len(raw["description"]) < 400 or not raw["location"]:
             raw = _open_detail(f, cfg, raw, budget)
         jobs.append(raw)
     yield Page("feed", feed_url, jobs, total=1, ordered=False)
 
 
+# --------------------------------------------------------------------------- Talentsoft (Cegid)
+_TS_ID = re.compile(r"(?:_|[?&]idOffre=)(\d+)(?=\.aspx\b|&|$)", re.I)
+_TS_FEEDS = re.compile(r"offerRss\.ashx\?.*\bRss_(?:Contract|Profile|JobRegion)=", re.I)
+_TS_MAX_FEEDS = 80
+_TS_DAY = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s*$")
+
+
+def _ts_id(url) -> str:
+    m = _TS_ID.search(url or "")
+    return m[1] if m else ""
+
+
+def _ts_link(origin, oid, lcid) -> str:
+    """ONE address per Talentsoft offer. The feed ('detailoffre.aspx?idOffre=42432&idOrigine=502…'), the list
+    ('…_42432.aspx') and the list's second host ('…-cand.talent-soft.com') each write it differently; this one opens it."""
+    return f"{origin}/Pages/Offre/detailoffre.aspx?idOffre={oid}&LCID={lcid}"
+
+
+def _ts_cards(html, base):
+    """The offer cards of a Talentsoft list page: (id, title, url, day written on the card or None, contract, places)."""
+    soup = BeautifulSoup(html, PARSER)
+    out = []
+    for card in soup.select(".ts-offer-card, li.ts-offer-list-item, .ts-offer-list-item"):
+        a = card.select_one("a[href*='offre-de-emploi/'], a[href*='idOffre=']")
+        oid = _ts_id(a["href"]) if a and a.get("href") else ""
+        if not oid or any(oid == o[0] for o in out):
+            continue
+        day, contract, places = None, "", []
+        for li in card.select("li"):
+            t = li.get_text(" ", strip=True)
+            if not t or re.match(r"(?i)r[ée]f\b", t):
+                continue
+            if _TS_DAY.match(t):
+                day = _TS_DAY.match(t)[1]
+            elif not contract and (_CONTRACT_WORDS.match(t) or re.match(r"(?i)(c\.\s*apprentissage|th[èe]se|post-?doc)", t)):
+                contract = t
+            else:
+                places.append(t)
+        out.append((oid, a.get_text(" ", strip=True), urljoin(base, a["href"]), day, contract, places))
+    nxt = next((urljoin(base, x["href"]) for x in soup.select("a[href*='page=']")
+                if x.get_text(strip=True) in ("»", ">", "Suivant", "Next", "suivant") or "next" in " ".join(x.get("class") or [])), None)
+    return out, nxt
+
+
 def crawl_talentsoft(f, arg, cfg, known, st):
-    """Talentsoft: the RSS feed holds only the 20 newest offers (exact dates); when even the 20th is still inside the date
-    range, the site's own offer list is read page by page for the older ones."""
+    """Talentsoft (Cegid). Every offer has ONE number and is stored once, under one address (_ts_link).
+    Dates, best first: the main RSS feed (the 20 newest offers, exact dates); the category feeds listed on the site's
+    'tous-les-flux-rss.aspx' (by contract, domain, region: the 20 newest of each); the date written on a list card
+    (Dassault). The list is sorted newest first - checked against the dated offers -, so an undated card between two
+    dated ones was published between their dates: inside the range when the older one is, outside when the newer one is
+    already too old. When the bracket straddles the range start the offer stays undated."""
     feed_url, list_url = arg
-    jobs = []
-    for pg in crawl_feed(f, (feed_url, "talentsoft"), cfg, known, st):
-        jobs += pg.jobs
-        yield pg
-    gate, oldest = cfg.get("_gate"), min((j["date"] for j in jobs if j.get("date")), default=None)
-    if len(jobs) >= 20 and not (gate and oldest and gate(oldest, 0.9, "") is False):
-        f.note("talentsoft: the feed is full, reading the offer list for older offers")
-        from .crawler import crawl_generic  # imported late: crawler imports this module
-        yield from crawl_generic(f, list_url, cfg, set(known) | {normalize_url(j["url"]) for j in jobs}, st)
+    q = dict(parse_qsl(urlparse(feed_url).query))
+    lcid, gate, budget = q.get("LCID", "1036"), cfg.get("_gate"), _Budget(cfg, st)
+    dated, origin = {}, None
+
+    def take(url):
+        nonlocal origin
+        items = feed_items(f.get(url).text)
+        for it in items:
+            raw = _feed_raw(it, "talentsoft")
+            if raw is None:
+                continue
+            oid = _ts_id(raw["url"])
+            if oid:
+                origin = origin or _origin(raw["url"])  # the host Talentsoft writes in its own links: the same at every search
+                raw["url"] = raw["apply_url"] = _ts_link(origin, oid, lcid)
+            dated.setdefault(oid or normalize_url(raw["url"]), raw)  # a link without a number keeps its own address
+        return len(items)
+
+    if not take(feed_url):
+        raise ConnectionError(f"feed has no items: {feed_url}")
+    origin = origin or _origin(feed_url)
+    oldest = min((j["date"] for j in dated.values() if j.get("date")), default=None)
+    if len(dated) < 20 or (gate and oldest and gate(oldest, 0.9, "") is False):  # the feed holds every offer of the range
+        yield Page("feed", feed_url, [_ts_finish(f, cfg, r, budget) for r in dated.values()], total=1, ordered=False)
+        return
+    f.note("talentsoft: the feed is full, reading the category feeds and the offer list for older offers")
+    try:
+        r = f.get(f"{_origin(feed_url)}/offre-de-emploi/tous-les-flux-rss.aspx?LCID={lcid}")
+        feeds = [urljoin(r.url, a["href"]) for a in BeautifulSoup(r.text, PARSER).find_all("a", href=_TS_FEEDS)]
+    except (AccessError, ConnectionError, OSError) as e:  # no feed page: the list alone
+        f.note(f"talentsoft: no list of feeds ({e})")
+        feeds = []
+    for u in list(dict.fromkeys(feeds))[:_TS_MAX_FEEDS]:
+        if st.deadline and time.time() > st.deadline:
+            break
+        try:
+            take(u)
+        except (AccessError, ConnectionError, OSError) as e:  # one category feed missing: the others still date offers
+            f.note(f"talentsoft feed not read {u}: {e}")
+    f.note(f"talentsoft: {len(dated)} offers dated by {1 + len(feeds)} feeds")
+    yield from _ts_list(f, cfg, list_url, dated, origin, lcid, known, st, budget)
+
+
+def _ts_finish(f, cfg, raw, budget):
+    return _open_detail(f, cfg, raw, budget) if len(raw["description"]) < 400 or not raw["location"] else raw
+
+
+def _ts_list(f, cfg, list_url, dated, origin, lcid, known, st, budget):
+    """The site's offer list, page by page, newest first; see crawl_talentsoft for the dates of undated cards."""
+    gate = cfg.get("_gate") or (lambda d, c=0.0, t="": True)
+    seen, pending, newer, in_order, url = set(), [], None, True, list_url
+    emitted = set()
+
+    def resolve(older):
+        """The cards waiting between the dated offer 'newer' and 'older' (None: the end of the list) get their bracket."""
+        out = []
+        for raw in pending:
+            lo, hi = (older["date"] if older else None), (newer["date"] if newer else None)
+            if in_order and hi and gate(hi, 0.9, "") is False:
+                raw.update(date=hi, date_conf=0.6, date_text="",
+                           date_source=f"talentsoft list order (listed after an offer of {hi:%Y-%m-%d})")
+            elif in_order and lo and gate(lo, 0.9, "") is True:
+                raw.update(date=lo, date_conf=0.6, date_text="", date_source=f"talentsoft list order (listed between offers of "
+                           f"{lo:%Y-%m-%d} and {hi:%Y-%m-%d})" if hi else f"talentsoft list order (listed before an offer of {lo:%Y-%m-%d})")
+            out.append(raw)
+        pending.clear()
+        return [_ts_finish(f, cfg, r, budget) if gate(r["date"], r["date_conf"], "") is not False and
+                normalize_url(r["url"]) not in known else r for r in out]
+
+    for page in range(1, cfg["max_pages"] + 1):
+        try:
+            cards, nxt = _ts_cards(f.get(url).text, url)
+        except RobotsRefused:
+            st.more_pages = True
+            break
+        fresh = [c for c in cards if c[0] not in seen]
+        if not fresh:
+            break
+        jobs = []
+        for oid, title, link, day, contract, places in fresh:
+            seen.add(oid)
+            raw = dated.get(oid)
+            if raw is None:
+                raw = _raw(title, _ts_link(origin, oid, lcid), location=", ".join(reversed(places))[:200],
+                           employment_type=contract, conf=0.75, provenance="talentsoft-list",
+                           **(_date(day, "talentsoft list date", 0.85, dayfirst=True) if day else {}))
+            elif not raw["location"] and places:
+                raw["location"] = ", ".join(reversed(places))[:200]
+            if raw.get("date"):
+                if newer and raw["date"] > newer["date"] + timedelta(days=1):
+                    in_order = False  # not sorted by date: no bracket for the undated cards
+                jobs += resolve(raw)
+                jobs.append(_ts_finish(f, cfg, raw, budget) if gate(raw["date"], raw["date_conf"], "") is not False
+                            and normalize_url(raw["url"]) not in known else raw)
+                newer = raw
+            else:
+                pending.append(raw)
+        emitted.update(j["url"] for j in jobs)
+        yield Page(f"page={page}", url, jobs, ordered=in_order, sorted=in_order)
+        url = nxt or _with_page(list_url, page + 1)
+    else:
+        st.truncated = True
+    if pending:
+        yield Page("end", list_url, resolve(None), ordered=False)
+    # dated offers the list did not show (the list was stopped by date, or the feed is newer than the list)
+    rest = [r for oid, r in dated.items() if oid not in seen and r["url"] not in emitted]
+    if rest:
+        yield Page("feeds", list_url, [_ts_finish(f, cfg, r, budget) if gate(r["date"], r["date_conf"], "") is not False
+                                       else r for r in rest], ordered=False)
+
+
+def _with_page(url, n):
+    p = urlparse(url)
+    q = [(k, v) for k, v in parse_qsl(p.query) if k.lower() != "page"] + [("page", str(n))]
+    return urlunparse(p._replace(query=urlencode(q)))
 
 
 # --------------------------------------------------------------------------- official job-board APIs
@@ -743,6 +971,8 @@ def crawl_smartrecruiters(f, company, cfg, known, st):
                     raw["url"] = det.get("postingUrl") or url
                     raw["apply_url"] = det.get("applyUrl") or raw["url"]
                     raw = refine_raw_date(raw)
+                except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                    f.note(f"smartrecruiters detail failed {p.get('id')}: {e}")
                 except AccessError:
                     raise
                 except Exception as e:
@@ -776,28 +1006,60 @@ def _workday_arg(url):
 
 
 def _workday_france(facets):
-    """The facet that filters on the country France (its parameter name differs between Workday tenants)."""
+    """The filter on the country France. Its name and place differ between Workday tenants: a country list
+    ('locationCountry'), a location hierarchy whose first level is the country ('locationHierarchy1', possibly inside a
+    group such as 'locationMainGroup'), or only the offices ('locations': Sonos). Best first: country, hierarchy, offices."""
+    found = []  # (rank, parameter, id)
     stack = [(f.get("facetParameter"), f) for f in facets or []]
     while stack:
         param, node = stack.pop()
         for v in node.get("values") or []:
             if "values" in v:
                 stack.append((v.get("facetParameter") or param, v))
-            elif norm(v.get("descriptor") or "") == "france" and "country" in norm(param or ""):
-                return {param: [v["id"]]}
-    # no country list: the offices in France of its location list (Sonos)
-    for f in facets or []:
-        ids = [v["id"] for v in f.get("values") or [] if "id" in v and "location" in norm(f.get("facetParameter") or "")
-               and re.search(r"\bfrance\b|\bfr\b", norm(v.get("descriptor") or ""))]
-        if ids:
-            return {f["facetParameter"]: ids}
-    return {}
+                continue
+            p, d = norm(param or ""), norm(v.get("descriptor") or "")
+            if "id" not in v or not p:
+                continue
+            if d in ("france", "fr", "fra") and "country" in p:
+                found.append((0, param, v["id"]))
+            elif d in ("france", "fr", "fra") and "location" in p:
+                found.append((1, param, v["id"]))
+            elif "location" in p and re.search(r"\bfrance\b|\bfr\b", d):
+                found.append((2, param, v["id"]))
+    if not found:
+        return {}
+    rank, param = min((r, p) for r, p, _ in found)
+    return {param: list(dict.fromkeys(i for r, p, i in found if (r, p) == (rank, param)))}
+
+
+_WD_MULTI = re.compile(r"^\s*(\d+)\s+(?:sites?|locations?|lieux|emplacements?|standorte|ubicaciones|sedi|localit[aà])\s*$", re.I)
+
+
+def _workday_place(text, path):
+    """A Workday list writes '2 sites' for an offer in several places; its address starts with the MAIN one
+    ('/job/France-Courbevoie/Title_JR123'): 'France Courbevoie (+1 other site)'. Only a French main site is taken from the
+    address: a foreign main site may have France among the others, which only the offer's page tells."""
+    m = _WD_MULTI.match(text or "")
+    seg = [x for x in (path or "").split("/") if x]
+    if not m or len(seg) < 3 or seg[0] != "job":
+        return text
+    main = re.sub(r"[-_]+", " ", unquote(seg[1])).strip()
+    others = int(m[1]) - 1
+    if not classify_location(main)["france_eligible"]:
+        return text
+    return f"{main} (+{others} other site{'s' if others > 1 else ''})" if others > 0 else main
 
 
 def crawl_workday(f, a, cfg, known, st):
     api = f"https://{a['host']}/wday/cxs/{a['tenant']}/{a['site']}"
     body = {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": ""}
-    first = f.post_json(api + "/jobs", {**body, "limit": 1}).json()
+    try:
+        first = f.post_json(api + "/jobs", {**body, "limit": 1}).json()
+    except RobotsRefused:
+        raise
+    except AccessError as e:  # not a protection of this website: Workday limits the requests of one reader for a while
+        raise AccessError(f"{e} - Workday refuses automated requests for some hours after many of them (all its websites "
+                          "on the same servers); search again later") from e
     if a.get("facets"):
         body["appliedFacets"] = a["facets"]
         f.note("workday: the filters written in the URL are applied")
@@ -812,7 +1074,8 @@ def crawl_workday(f, a, cfg, known, st):
         posts, jobs = data.get("jobPostings") or [], []
         for p in posts:
             path = p.get("externalPath") or ""
-            raw = _raw(p.get("title", ""), f"https://{a['host']}{a['prefix']}{path}", location=p.get("locationsText", ""),
+            raw = _raw(p.get("title", ""), f"https://{a['host']}{a['prefix']}{path}",
+                       location=_workday_place(p.get("locationsText", ""), path),
                        platform_id=(p.get("bulletFields") or [""])[0], conf=0.8, provenance="workday-api",
                        country_hint="France" if body["appliedFacets"] else None,
                        **_date(p.get("postedOn"), "workday list 'posted'", 0.75))
@@ -821,8 +1084,12 @@ def crawl_workday(f, a, cfg, known, st):
                     i = (f.get(api + path, headers={"Accept": "application/json"}).json() or {}).get("jobPostingInfo") or {}
                     country = ((i.get("country") or {}).get("descriptor")
                                or (((i.get("jobRequisitionLocation") or {}).get("country")) or {}).get("descriptor"))
+                    places = [x for x in [i.get("location")] + list(i.get("additionalLocations") or []) if isinstance(x, str) and x]
+                    if len(places) > 1:  # several sites: France may be one of the others, the main site's country says nothing
+                        country = None
                     raw.update(description=html_to_text(i.get("jobDescription", ""))[:15000],
-                               location=i.get("location") or raw["location"], country_hint=country or raw["country_hint"],
+                               location=" ; ".join(dict.fromkeys(places)) or raw["location"],
+                               country_hint=country or raw["country_hint"],
                                employment_type=i.get("timeType", ""), apply_url=i.get("externalUrl") or raw["url"],
                                platform_id=i.get("jobReqId") or raw["platform_id"], conf=0.9, provenance="workday-api+detail")
                     if i.get("startDate"):  # the posting date: exact, unlike 'Posted 30+ Days Ago'
@@ -830,6 +1097,8 @@ def crawl_workday(f, a, cfg, known, st):
                         raw["date"], raw["date_conf"], raw["date_source"], raw["date_text"] = merge_dates(
                             _get_date(raw), (d["date"], d["date_conf"], d["date_source"], d["date_text"]))
                     raw = refine_raw_date(raw)
+                except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                    f.note(f"workday detail failed {path}: {e}")
                 except AccessError:
                     raise
                 except Exception as e:
@@ -1015,6 +1284,9 @@ def _phenom_arg(url, html):
     seg = [x for x in p.path.split("/") if x]
     prefix = "/" + "/".join(seg[:2]) if len(seg) >= 2 and re.fullmatch(r"[a-z]{2}", seg[1]) else ""
     loc = re.search(r'"locale"\s*:\s*"([\w-]+)"', html)
+    m = re.fullmatch(r"([a-z]{2})_([A-Za-z]+)", loc[1]) if loc else None
+    if not prefix and m:  # 'orange.jobs/': offers open at '/gb/en/job/<id>' (country, language), never at '/job/<id>'
+        prefix = f"/{m[2].lower()}/{m[1]}"
     return dict(origin=_origin(url), prefix=prefix, locale=loc[1] if loc else "en_global",
                 keywords=next((v for k, v in parse_qsl(p.query) if k in ("keywords", "keyword", "q")), ""))
 
@@ -1072,6 +1344,8 @@ def crawl_eightfold(f, origin, cfg, known, st):
                 try:
                     det = f.get(f"{origin}/api/apply/v2/jobs/{p.get('id')}").json()
                     raw.update(description=html_to_text(det.get("job_description", ""))[:15000], conf=0.9)
+                except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                    f.note(f"eightfold detail failed {p.get('id')}: {e}")
                 except AccessError:
                     raise
                 except Exception as e:
@@ -1139,6 +1413,8 @@ def crawl_workable(f, account, cfg, known, st):
                     det = f.get(f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{p.get('shortcode')}").json()
                     raw.update(description=html_to_text(" ".join(det.get(k) or "" for k in
                                                                  ("description", "requirements", "benefits")))[:15000], conf=0.9)
+                except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                    f.note(f"workable detail failed {p.get('shortcode')}: {e}")
                 except AccessError:
                     raise
                 except Exception as e:
@@ -1205,6 +1481,8 @@ def crawl_softy(f, origin, cfg, known, st):
                     o = _softy_page(f.get(u).text).get("offer") or {}
                     raw.update(description=html_to_text(" ".join(o.get(k) or "" for k in
                                                                  ("description_html", "searched_profile_html")))[:15000])
+                except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+                    f.note(f"softy detail failed {u}: {e}")
                 except AccessError:
                     raise
                 except Exception as e:
@@ -1284,6 +1562,107 @@ def _origin(u):
     return f"{p.scheme}://{p.netloc}"
 
 
+# ---------------------------------------------------------------------------- France Travail: its official API, with your access
+_FT_TOKEN = "https://entreprise.francetravail.fr/connexion/oauth2/access_token?realm=%2Fpartenaire"
+_FT_SEARCH = "https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search"
+_FT_OFFER = "https://candidat.francetravail.fr/offres/recherche/detail/{}"
+_FT_SCOPE = "api_offresdemploiv2 o2dsoffre"
+_FT_SINCE = (1, 3, 7, 14, 31)  # the only 'publieeDepuis' values the API accepts (days)
+_FT_PAGE, _FT_MAX_START, _FT_MAX_WORDS = 150, 3000, 40  # 150 offers per request; the API refuses a start above 3000
+FT_HOSTS = re.compile(r"(?:^|\.)(?:francetravail\.(?:fr|io)|pole-emploi\.fr)$")
+FT_NO_ACCESS = ("access_restricted: France Travail's offers are read through its official API, which needs your own access: "
+                "ask for it on https://francetravail.io (contact form: the 'Offres d'emploi' API is not open to new users at "
+                "the moment), then add FRANCE_TRAVAIL_CLIENT_ID=... and FRANCE_TRAVAIL_CLIENT_SECRET=... to api_keys.txt")
+
+
+def _ft_credentials(cfg):
+    keys = {**load_keys(), **(cfg.get("_keys") or {})}
+    return (keys.get("francetravail_id") or os.environ.get("FRANCE_TRAVAIL_CLIENT_ID", ""),
+            keys.get("francetravail_secret") or os.environ.get("FRANCE_TRAVAIL_CLIENT_SECRET", ""))
+
+
+def _ft_words(url, cfg):
+    """The words of a France Travail search address ('motsCles=data+scientist'), else the search profile's keywords. A
+    phrase becomes words that must all be in the offer ('machine learning' -> 'machine,learning')."""
+    given = [w for w in re.split(r"[,;]", dict(parse_qsl(urlparse(url).query)).get("motsCles", ""))]
+    words = [w for w in given if w.strip()] or [w for w in (cfg.get("_profile") or PROFILE_DEFAULT).get("keywords", [])
+                                                  if len(w) >= 4]  # 'ia', 'ai', 'nlp': found through the longer keywords
+    terms = [",".join(re.findall(r"[^\W_]{2,}", w)) for w in words]
+    return list(dict.fromkeys(t for t in terms if t))[:_FT_MAX_WORDS]
+
+
+def _ft_since(cfg, now=None):
+    """The date range as the API's 'published within' (rounded up: the app filters the exact range). None = no limit."""
+    preset = cfg.get("date_preset")
+    if preset == "All dates":
+        return None
+    days = PRESET_DAYS.get(preset)
+    if preset == "Custom date range":
+        start = _cfg_day(cfg.get("date_from"))
+        days = ((now or utcnow()).date() - start).days + 1 if start else None
+    return next((d for d in _FT_SINCE if days and d >= days), None)
+
+
+def _ft_offer(o):
+    lieu, ent, orig = o.get("lieuTravail") or {}, o.get("entreprise") or {}, o.get("origineOffre") or {}
+    partner = next((x["url"] for x in orig.get("partenaires") or [] if x.get("url")), "")  # the offer on the partner's site
+    url = _FT_OFFER.format(o.get("id"))
+    apply = partner or (o.get("contact") or {}).get("urlPostulation") or url
+    return _raw(o.get("intitule") or "", url, employer=ent.get("nom") or "", location=lieu.get("libelle") or "",
+                description=o.get("description") or "", country_hint="FR", apply_url=apply,
+                employment_type=o.get("typeContratLibelle") or o.get("typeContrat") or "", platform_id=str(o.get("id") or ""),
+                conf=0.9, provenance="francetravail-api", **_date(o.get("dateCreation"), "France Travail API dateCreation"))
+
+
+def crawl_francetravail(f, url, cfg, known, st):
+    """France Travail's offers (its own and its partners') through the official 'Offres d'emploi' API, with the user's own
+    access (client id + secret of an application on francetravail.io). One search per keyword, newest first, inside the
+    date range; each offer once."""
+    cid, secret = _ft_credentials(cfg)
+    if not (cid and secret):
+        raise AccessError(FT_NO_ACCESS)
+    try:
+        r = f.request("POST", _FT_TOKEN, data={"grant_type": "client_credentials", "client_id": cid, "client_secret": secret,
+                                               "scope": _FT_SCOPE}, headers={"Accept": "application/json"})
+        token = r.json().get("access_token")
+    except RobotsRefused:
+        raise
+    except Exception as e:
+        raise AccessError(f"access_restricted: France Travail gave no API access ({str(e)[:100]}): check FRANCE_TRAVAIL_CLIENT_ID"
+                          " / FRANCE_TRAVAIL_CLIENT_SECRET and that your application subscribes to 'Offres d'emploi'") from e
+    if not token:
+        raise AccessError("access_restricted: France Travail refused the API credentials: check FRANCE_TRAVAIL_CLIENT_ID / "
+                          "FRANCE_TRAVAIL_CLIENT_SECRET and that your application subscribes to 'Offres d'emploi'")
+    head, since, seen = {"Authorization": f"Bearer {token}", "Accept": "application/json"}, _ft_since(cfg), set()
+    f.note(f"France Travail API: {len(_ft_words(url, cfg))} searches" + (f", published within {since} days" if since else ""))
+    for terms in _ft_words(url, cfg):
+        start = 0
+        while start <= _FT_MAX_START:
+            if st.deadline and time.time() > st.deadline:
+                st.truncated = True  # this website's time is up
+                return
+            params = {"motsCles": terms, "range": f"{start}-{start + _FT_PAGE - 1}", "sort": 1}
+            if since:
+                params["publieeDepuis"] = since
+            r = f.get(_FT_SEARCH, params=params, headers=head)
+            try:  # 204 'No Content': nothing for these words
+                found = (r.json() or {}).get("resultats") or [] if r.status_code != 204 else []
+            except ValueError:
+                found = []
+            jobs = []
+            for o in found:
+                oid = str(o.get("id") or "")
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    jobs.append(_ft_offer(o))
+            m = re.search(r"/(\d+)", r.headers.get("Content-Range") or "")  # 'offres 0-149/1234'
+            # several keyword lists, each sorted by date: one list reaching old offers does not end the others
+            yield Page(f"francetravail:{terms}:{start}", r.url, jobs, ordered=False)
+            start += _FT_PAGE
+            if len(found) < _FT_PAGE or (m and start >= int(m[1])):
+                break
+
+
 def detect_from_url(url):
     p = urlparse(url)
     host, seg = (p.hostname or "").lower(), [x for x in p.path.split("/") if x]
@@ -1322,7 +1701,8 @@ def detect_from_url(url):
 
 
 _ICIMS_SKIP = {"www", "cdn", "cdn01", "cdn02", "images", "cookie-policy-scripts", "static", "login", "api", "community"}
-_FEED_TITLE = re.compile(r"job|offre|emploi|career|carri|recrut|poste|vacanc|opening|stellen", re.I)
+_FEED_TITLE = re.compile(r"job|offre|emploi|career|carri|recrut|poste|vacanc|opening|stellen|stage|intern|th[eè]se|thesis|"
+                         r"phd|doctora", re.I)
 
 
 def detect_from_page(f, url, html):
@@ -1378,6 +1758,13 @@ def detect_from_page(f, url, html):
                 and not re.search(r"comment", title, re.I)):
             flavor = "teamtailor" if "teamtailor" in low else "rss"
             return flavor, (urljoin(url, ln["href"]), flavor)
+    for a in soup.find_all("a", href=True):  # a visible 'Flux RSS' link (ONERA internships: /stages/fr/rss.xml)
+        href = urljoin(url, a["href"])
+        path = urlparse(href).path or ""
+        if (re.search(r"(?:rss|atom)(?:\.xml)?$|\.rss$|/feed/?$", path, re.I) and _FEED_TITLE.search(path)
+                and re.search(r"\b(?:rss|atom|flux)\b", a.get_text(" ", strip=True) + " " + (a.get("title") or ""), re.I)
+                and not re.search(r"comment", path, re.I) and syntactic_ok(href)):
+            return "rss", (href, "rss")
     return None
 
 
@@ -1443,6 +1830,55 @@ def guess_board(f, url):
     return None
 
 
+_HOST_WORDS = {"www", "careers", "career", "jobs", "job", "recrutement", "recrute", "emploi", "emplois", "join", "apply",
+               "carrieres", "carriere", "talent", "talents", "work", "rejoindre"}
+
+
+def _brands(url):
+    """'https://recrute.carrefour.fr/offres' -> ['carrefour']; 'www.safran-group.com' -> ['safrangroup', 'safran']."""
+    labels = [x for x in (urlparse(url).hostname or "").lower().split(".")[:-1] if x not in _HOST_WORDS]
+    out = []
+    for x in labels[-1:]:
+        out += [re.sub(r"[^a-z0-9]", "", x), x.split("-")[0]]
+    return [b for b in dict.fromkeys(out) if len(b) >= 3 and b not in _NOT_BRAND]
+
+
+def _same_company(name, brand) -> bool:
+    n = re.sub(r"[^a-z0-9]", "", norm(name or ""))
+    return bool(n) and (n == brand or (len(brand) >= 5 and (n.startswith(brand) or brand.startswith(n) and len(n) >= 5)))
+
+
+def find_board(f, url):
+    """The company's offers on an open job platform, found from its domain name: used when its own career site blocks
+    the app or shows no offer (ALTEN, Devoteam, EPSA on SmartRecruiters; Deezer, Aqemia on Teamtailor). A board is taken only
+    when the platform names the SAME company ('ALTEN' for alten.fr), never another company that shares the name."""
+    for brand in _brands(url):
+        tries = (
+            ("smartrecruiters", f"https://careers.smartrecruiters.com/{brand}",
+             lambda r: (BeautifulSoup(r.text, PARSER).find("meta", property="og:site_name") or {}).get("content", "")
+             if urlparse(r.url).path.strip("/").lower() == brand and _smartrecruiters_ids(r.text) else "", brand),  # offers listed
+            ("workable", f"https://apply.workable.com/api/v1/widget/accounts/{brand}",
+             lambda r: r.json().get("name", "") if r.json().get("jobs") else "", brand),
+            ("recruitee", f"https://{brand}.recruitee.com/api/offers/",
+             lambda r: ((r.json().get("offers") or [{}])[0]).get("company_name", ""), f"https://{brand}.recruitee.com"),
+            ("teamtailor", f"https://{brand}.teamtailor.com/jobs.rss",
+             lambda r: (re.search(r"<title>([^<]*)", r.text) or ["", ""])[1] if "<item>" in r.text else "",
+             (f"https://{brand}.teamtailor.com/jobs.rss", "teamtailor")),
+            ("greenhouse", f"https://boards-api.greenhouse.io/v1/boards/{brand}",
+             lambda r: r.json().get("name", ""), brand))
+        for platform, probe, name_of, arg in tries:
+            try:
+                r = f.get(probe)
+                name = name_of(r)
+            except AccessError:
+                continue
+            except Exception:
+                continue
+            if _same_company(name, brand):
+                return platform, arg, name
+    return None
+
+
 def _talentsoft_arg(url):
     p = urlparse(url)
     q = dict(parse_qsl(p.query))
@@ -1459,4 +1895,5 @@ ADAPTERS = {"greenhouse": crawl_greenhouse, "lever": crawl_lever, "ashby": crawl
             "teamtailor": crawl_feed, "talentsoft": crawl_talentsoft, "rss": crawl_feed,
             "successfactors": crawl_successfactors, "icims": crawl_icims, "wordpress": crawl_wordpress,
             "phenom": crawl_phenom, "eightfold": crawl_eightfold, "jibe": crawl_jibe, "workable": crawl_workable,
-            "talentview": crawl_talentview, "softy": crawl_softy}
+            "talentview": crawl_talentview, "softy": crawl_softy,
+            "francetravail": crawl_francetravail}

@@ -7,15 +7,18 @@ import threading
 import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from urllib.parse import parse_qsl, urlparse
 
 from .adapters import ScanState, distrust_shared_dates, make_gate
-from .classify import analyze_title, classify_location, clean_title, location_from_text
+from .classify import (analyze_title, classify_location, clean_title, is_boilerplate_title, location_from_text,
+                       looks_like_date, offer_kinds_heading)
 from .config import LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
 from .dates import date_decision, refine_job_date, refine_raw_date
 from .store import Job, SeenOffer, SessionLocal, SiteMemory, Source, lock_scan, unlock_scan
-from .web import AccessError, Fetcher, normalize_url
+from .web import AccessError, Fetcher, norm, normalize_url
 
 
 # --------------------------------------------------------------------------- persistence / filters
@@ -24,8 +27,11 @@ def upsert_job(s, src, raw, hidden=False) -> bool:
     so that the website is not re-opened for it at the next search."""
     raw = refine_raw_date(dict(raw))  # an explicit 'Date de publication' in the description beats a feed / refresh date
     original_title, raw["title"] = raw["title"], clean_title(raw["title"])  # 'Ingénieur IA H/F (REQ123)' -> 'Ingénieur IA'
+    if raw["location"] and ((not re.search(r"[^\W\d_]{2}", raw["location"]) and not re.fullmatch(r"\s*\d{5}\s*", raw["location"]))
+                            or looks_like_date(raw["location"])):
+        raw["location"] = ""  # '1758' (an internal number), 'Jeudi, 5 novembre, 2026' (a date): not a place
     if not raw["location"] and raw["description"]:
-        raw["location"] = location_from_text(raw["description"])
+        raw["location"] = location_from_text(raw["description"], raw["title"])
     url = normalize_url(raw["url"]) if raw.get("url") else ""
     ident = url or f"{src.id}:{raw.get('platform_id')}:{raw['title']}"
     uid = hashlib.sha1(ident.encode()).hexdigest()[:16]
@@ -83,6 +89,12 @@ def apply_filters(s, cfg, profile, now=None):
     for job in s.query(Job).filter(Job.status == "new").all():
         flags, ex = [], job.extra or {}
         refine_job_date(job, now)  # the description may state the real publication date
+        first = ex.get("first_seen")
+        if first and job.pub_date and job.pub_date.date() > datetime.strptime(first, "%Y-%m-%d").date() + timedelta(days=1):
+            # the website re-dated an offer already online (a 'refresh'): it cannot have been published after the app saw it
+            job.pub_date_text = f"{job.pub_date:%Y-%m-%d} on the website, but first seen on {first}"
+            job.pub_date, job.date_conf = datetime.strptime(first, "%Y-%m-%d"), min(job.date_conf or 0.7, 0.7)
+            job.date_source = f"first seen by the app (the website re-dated it: {job.date_source})"
         d, why = date_decision(job.pub_date, job.date_conf, cfg, now, job.pub_date_text)
         if d is False:  # DATE FIRST: outside the range -> hidden, never analysed, never shown (relevant or not)
             hide_out_of_range(s, job, why)
@@ -101,6 +113,15 @@ def apply_filters(s, cfg, profile, now=None):
             flags.append("publication_date_unknown")
         loc = classify_location(job.location_original, ex.get("country_hint"),
                                 ex.get("remote_hint") if cfg["include_remote_fr"] else None, ex.get("applicant_countries"))
+        if not loc["location_verified"] and job.description:
+            # the location field says nothing ('2 sites', a typo): the offer's own text may name its French place
+            # ('notre agence de Lille', '(H/F) à Lyon'). Only France is taken from it: one foreign site named in the text of a
+            # multi-site offer does not prove that France is not among the others.
+            alt = location_from_text(job.description, job.title)
+            alt_loc = classify_location(alt) if alt and alt != job.location_original else None
+            if alt_loc and alt_loc["france_eligible"]:
+                loc = {**alt_loc, "location_original": job.location_original,
+                       "location_evidence": f"the offer's text names '{alt}' (location field: '{job.location_original or '-'}')"}
         job.country_code, job.location_verified, job.france_eligible = loc["country_code"], loc["location_verified"], loc["france_eligible"]
         job.remote_status, job.location_evidence, job.city = loc["remote_status"], loc["location_evidence"], loc["city"]
         if loc["remote_status"] == "remote" and not cfg["include_remote_fr"]:
@@ -113,6 +134,11 @@ def apply_filters(s, cfg, profile, now=None):
             continue
         if not loc["location_verified"]:
             flags.append("location_unverified")
+        if is_boilerplate_title(job.title) or offer_kinds_heading(job.title):
+            # 'Postdoc, PhD or Master 2', '<<INTERNAL JOB DESCRIPTION>>': a page about offers or a template, not an offer
+            job.status, job.reason = "excluded", f"title: '{job.title[:60]}' names no offer (a page about offers or a template)"
+            st["title_x"] += 1
+            continue
         ti = analyze_title(job.title, ex.get("department"), profile, job.employment_type)
         job.extra = {**ex, "title_info": ti.as_dict()}  # reassigned so the JSON change is saved
         verdict, twhy = ti.verdict, ti.reason
@@ -121,11 +147,90 @@ def apply_filters(s, cfg, profile, now=None):
             st["title_x"] += 1
             st["type_x"] += "not wanted" in twhy
             continue
-        job.status = "review" if flags else "candidate"
+        doubts = [x for x in flags if x != "publication_date_unknown"]  # no date alone: still returned with the others
+        job.status = "review" if doubts else "candidate"
         job.review_flags, job.reason = ",".join(flags), f"title: {twhy}; date: {why}"
-        st["review" if flags else "candidate"] += 1
+        st["review" if doubts else "candidate"] += 1
     s.commit()
+    st["dups_merged"] = merge_duplicates(s, cfg, now)
     return dict(st)
+
+
+def _offer_key(job, label):
+    """Same offer = same title (without gender marks / codes), same employer, same city."""
+    norm_ = lambda x, n: re.sub(r"[^a-z0-9]", "", norm(x or ""))[:n]
+    return norm_(clean_title(job.title), 60), norm_(job.employer or label, 12), norm_(job.city or job.location_original, 12)
+
+
+_LANG_SEG = re.compile(r"(?i)[a-z]{2}(?:[-_][a-z]{2})?|int-[a-z]{2}")
+_LANG_PARAM = re.compile(r"(?i)lcid|lang|language|locale|hl|lg")
+
+
+def _lang_free(url):
+    """'jobs.makesense.org/en/jobs/x' and 'jobs.makesense.org/fr/jobs/x': one offer shown in two languages. The query stays
+    (minus its language): 'detailoffre.aspx?idOffre=39221' and '?idOffre=38837' are two offers."""
+    p = urlparse(url or "")
+    query = sorted((k.lower(), v) for k, v in parse_qsl(p.query) if not _LANG_PARAM.fullmatch(k))
+    return (p.netloc + "/".join(x for x in p.path.split("/") if not _LANG_SEG.fullmatch(x))).lower() + str(query)
+
+
+def _same_posting(a, b, board):
+    """Two copies of ONE offer on one website (same title, employer and city): the same address in another language, or the
+    same text posted again (a job board reposting it through several advertising links, a company re-publishing it under a
+    new reference). Several openings with one title have different texts (another team, subject or client): kept."""
+    if a.url and b.url and _lang_free(a.url) == _lang_free(b.url):
+        return True
+    x, y = (a.description or "")[:2500], (b.description or "")[:2500]
+    if min(len(x), len(y)) < 300:
+        return False
+    need, sm = (0.9 if board else 0.97), SequenceMatcher(None, x, y)
+    return sm.real_quick_ratio() >= need and sm.quick_ratio() >= need and sm.ratio() >= need
+
+
+def merge_duplicates(s, cfg, now=None):
+    """One offer published on several websites (a Thales internship on Thales' site and on stage.fr, a Framatome offer on
+    EDF's site) is shown once: the copy from the company's own site (not a job board), dated by the EARLIEST reliable date of
+    its copies (job boards pick offers up later). The other copies leave the lists as 'duplicate', pointing at the kept one."""
+    from .urlclean import is_job_board
+    srcs = {x.id: x for x in s.query(Source).all()}
+    groups = {}
+    for j in s.query(Job).filter(Job.status.in_(["candidate", "review", "relevant"])):
+        src = srcs.get(j.source_id)
+        if src and j.title:
+            groups.setdefault(_offer_key(j, src.label), []).append(j)
+    merged = 0
+    for key, js in groups.items():
+        if not key[0]:
+            continue
+        js.sort(key=lambda j: (j.pub_date or datetime.max, len(j.url or "")))  # the earliest copy is the publication
+        kept = []
+        for j in js:  # copies of one offer on ONE website first; the same title with another text is another opening
+            twin = next((k for k in kept if k.source_id == j.source_id and
+                         _same_posting(k, j, is_job_board(srcs[j.source_id].url))), None)
+            if twin is None:
+                kept.append(j)
+                continue
+            j.status, j.reason = "excluded", f"duplicate: the same offer published again on this website ({twin.url})"
+            twin.extra = {**(twin.extra or {}), "also_on": sorted(set((twin.extra or {}).get("also_on", [])) | {j.url})[:10]}
+            merged += 1
+        js = kept
+        if len({j.source_id for j in js}) < 2:
+            continue
+        js.sort(key=lambda j: (is_job_board(srcs[j.source_id].url), len(j.description or "") < 200, j.pub_date or datetime.max))
+        keep, dated = js[0], [j for j in js if j.pub_date and (j.date_conf or 0) >= 0.5]
+        first = min(dated, key=lambda j: j.pub_date) if dated else None
+        if first and first is not keep and (keep.pub_date is None or first.pub_date < keep.pub_date):
+            keep.pub_date, keep.date_conf, keep.pub_date_text = first.pub_date, first.date_conf, first.pub_date_text
+            keep.date_source = f"{first.date_source} (earliest of {len(js)} copies, on {srcs[first.source_id].label})"
+        copies = [j for j in js[1:] if j.source_id != keep.source_id]  # same website, other text: another opening, kept
+        for j in copies:
+            j.status, j.reason = "excluded", f"duplicate: the same offer on {srcs[keep.source_id].label} ({keep.url})"
+            merged += 1
+        keep.extra = {**(keep.extra or {}), "also_on": sorted(set((keep.extra or {}).get("also_on", [])) | {j.url for j in copies})[:10]}
+        if date_decision(keep.pub_date, keep.date_conf, cfg, now, keep.pub_date_text)[0] is False:
+            hide_out_of_range(s, keep, "earliest copy of this offer is older than the range")
+    s.commit()
+    return merged
 
 
 def reset_filters(s):

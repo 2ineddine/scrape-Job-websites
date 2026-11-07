@@ -5,7 +5,8 @@ engineering offers, establishes their actual publication date, retains offers lo
 open to France), and uses a language model to assess their relevance, compare them with the user's CVs and draft
 French cover letters in LaTeX.
 
-The interface is built with Streamlit and follows the Ubuntu / GNOME (Yaru) visual style.
+The interface is built with Streamlit: a navy website look (top navigation bar, navy page headers with live
+counters, white cards) set in the Telegraf typeface, which the application serves itself (`static/fonts`).
 
 ## Contents
 
@@ -92,11 +93,38 @@ resets and states when this will happen.
 Keys entered in the application are stored in `api_keys.txt` next to `app.py`. This file is excluded from version
 control. Environment variables take the same role and are preferred for server deployments.
 
+### France Travail
+
+France Travail's offers (its own and those of its partner job boards) are read only through its official "Offres
+d'emploi" API, with your own access; its web pages are never read. At the time of writing, France Travail no longer
+opens this API to new users on francetravail.io and grants access on request:
+
+1. ask for access with the contact form of https://francetravail.io (organisation, use: job search for your client);
+2. once granted, create an application on francetravail.io that subscribes to the "Offres d'emploi" API;
+3. add its two identifiers to `api_keys.txt` (or as environment variables):
+
+   ```
+   FRANCE_TRAVAIL_CLIENT_ID=...
+   FRANCE_TRAVAIL_CLIENT_SECRET=...
+   ```
+
+4. add a France Travail address to the website list: `https://www.francetravail.fr/accueil` searches the profile's
+   keywords; a search address such as `https://candidat.francetravail.fr/offres/recherche?motsCles=data+scientist`
+   searches its own words.
+
+Each keyword is one search, newest first, limited to the date range ("published within 1, 3, 7, 14 or 31 days"). The
+offer's link is its France Travail page; for a partner offer, the application link is the partner's page. Without
+the identifiers the website is reported with these steps and nothing is sent. This reader is tested against the API's
+documented answers; it has not yet been run against the live API.
+
 ### Search profile
 
 **Settings > Search profile** holds the research interests (free text), the wanted topics and titles (French or
 English, one per line), the words that exclude an offer, and the minimum relevance score. Settings are saved
-automatically.
+automatically. The default list holds about 130 job titles and topics in both languages (machine learning
+and AI roles, perception, LiDAR / SLAM, imaging, audio and speech, signal processing, robotics, MLOps, generative AI...).
+Keywords added to the defaults in a new version are added once to a saved profile; the user's own keywords stay, and a
+keyword deleted afterwards is not added back. Every keyword is given to the AI that judges relevance.
 
 ## Usage
 
@@ -110,7 +138,8 @@ streamlit run app.py
 Then open `http://localhost:8501`. The **Search** page guides the user through three steps:
 
 1. **Career websites.** Upload one or more HTML files that list career page URLs (for example `websites.html`), or paste
-   URLs directly. Files are read as text and never executed.
+   URLs directly. Files are read as text and never executed. `websites5.html` lists STATION F startups in AI, robotics,
+   vision and data (their pages on the STATION F job board) and Future 40 alumni on their own career pages.
 2. **CV.** Upload one or more PDF CVs. Contact details for cover letters can be entered in this step. Sending CV text to
    a hosted model requires explicit consent (checkbox).
 3. **Analysis.** Select the offer types (jobs, internships, apprenticeships, PhD / post-doc) and the publication period
@@ -148,7 +177,7 @@ Each website is processed by the most precise reader available, selected automat
 
 | Platform | Data source | Publication date |
 |---|---|---|
-| Workday | JSON API with the site's country filter; detail API | `startDate` of each posting |
+| Workday | JSON API with the site's France filter (country list, or the first level of its location hierarchy); detail API with every location of an offer listed in several places | `startDate` of each posting |
 | SAP SuccessFactors | job table sorted by date; job page | listing date, `datePosted` |
 | iCIMS | job list with the site's date sort; job page | posting date in the list |
 | Phenom (Thales, Bouygues, Orange, Philips) | search API with the country filter | `postedDate` |
@@ -157,8 +186,12 @@ Each website is processed by the most precise reader available, selected automat
 | Workable | job API with location filter; detail API | `published` |
 | SmartRecruiters | postings API with country filter, or the public career page | `releasedDate`, `datePosted` |
 | Greenhouse, Lever, Ashby, Recruitee, Breezy | official job-board APIs | first publication date |
-| Teamtailor, Talentsoft, RSS feeds | the site's job feed, then its list pages | `pubDate` |
+| Talentsoft (CEA, Air France, Dassault Aviation, Framatome) | main RSS feed, the category feeds of `tous-les-flux-rss.aspx` (contract, domain, region), then the list pages; one offer number, one address | feed `pubDate`, date on the list card, else the position in the newest-first list between two dated offers |
+| Teamtailor, RSS feeds | the site's job feed, then its list pages | `pubDate` |
+| France Travail | official "Offres d'emploi" API with your access (see [France Travail](#france-travail)) | `dateCreation` |
+| Hellowork | company pages and keyword pages (`/fr-fr/emploi/mot-cle_deep-learning.html`); a search URL, which robots.txt closes, is read on the keyword page of its words | `datePosted`, confirmed by "Publiée le" |
 | Talentview (Parrot) | public campaign list | last activation date |
+| Welcome to the Jungle career sites (`<company>.welcomekit.co`, the STATION F job board `jobs.stationf.co`) | the company's page of offers, in plain HTML; a `welcometothejungle.com/.../companies/<company>` address is read on the company's own career site when it has one | `datePosted` of the offer page |
 | Softy (Inserm) | page data of the offer list, newest first | "mise en ligne" date (the offer's last update) |
 | Offers published as PDF files | the offer's own page when its card links one, else the PDF (when `robots.txt` allows it), else the card's title | WordPress post date, date written in the PDF, PDF creation date; the month in the PDF's address only proves an offer too old |
 | WordPress job post types | REST API, sorted by date | publication date |
@@ -180,9 +213,20 @@ Additional detection rules:
 - a careers home page linking to its job list is followed one step to identify the platform;
 - a careers page that loads a Greenhouse, Ashby or Lever board without naming it is matched to the board carrying the
   company's name, accepted only when the board's offers link back to the company's website or the page names the
-  platform;
+  platform. No board is ever guessed from the address of a job board or of a platform hosting many companies' career
+  sites (`welcometothejungle.com`, `welcomekit.co`, `jobs.stationf.co`, the ATS platforms): its name is the
+  platform's, not the company's;
 - an expired offer URL is replaced by the list it belonged to;
-- menus, legal pages, list pages and spontaneous application pages are never taken for offers.
+- menus, legal pages, list pages and spontaneous application pages are never taken for offers;
+- a title that names only kinds of offers ("Postdoc, PhD or Master 2", "Apprenticeships, internships, thesis and VIE",
+  "Open positions for 2026 internships/PhDs") is a page about offers and is excluded; "PhD position" or "Stage M2"
+  alone may be one offer and stays. A template placeholder ("<<INTERNAL JOB DESCRIPTION>>") is not a title;
+- when the page data mixes other content with its offers, an entry outside the offers' numbered folder, with no place
+  and no contract, is dropped (Ubisoft's "Anti-Cheat Software" next to `/careers/search/744000160215749-...`);
+- gender marks are removed from titles, including the non-binary forms "(F/H/NB)" and "(W/M/X)";
+- structured offer data (JSON-LD) that its template leaves invalid - quotes or backslashes not escaped in the offer's
+  text, as on Welcome to the Jungle career sites - is repaired before reading, so the offer keeps its publication date,
+  employer and places.
 
 ### URL normalisation
 
@@ -223,6 +267,41 @@ the result:
 - A website that was down or refused once gets one more try at the end of the scan. `robots.txt` refusals are not retried.
 - When a website announces many more offers than its page gives, its sitemap is read as well. A sitemap without dates is
   read in its own order and left after 50 offers in a row older than the range (3DS lists its newest offers first).
+- When a company's own career site blocks automated reading (HTTP 403, anti-bot page) or shows no offer, the app looks
+  for the company's board on an open job platform (SmartRecruiters, Workable, Recruitee, Teamtailor, Greenhouse, Ashby,
+  Lever), named after its domain. A board is used only when the platform names the same company and lists offers
+  (ALTEN on SmartRecruiters for alten.fr); otherwise the website stays "blocked" with its reason. Anti-bot protections
+  are never bypassed.
+- `robots.txt` closing one offer's page or PDF only skips that document: the offer is kept with what its list shows. Only
+  a refusal of the website's own page makes the website "blocked".
+- The headless browsers apply `robots.txt` to the page's own data requests too (documents, frames, XHR / fetch): a job
+  widget whose API host closes itself to robots (TalentLink, used by ONERA's job offers) stays empty instead of being
+  read through the browser.
+- An offer titled only by its reference number ("DTIS-2027-23" in ONERA's internship feed) is always opened, and its
+  page's short description gives its subject.
+- On a lab page read by the AI, the offers' cards are also read without AI: the same offer keeps the model's title with
+  the card's date (WordPress post, PDF) and openable page; offers the model left out are added.
+- HTTP 406 from a website's firewall, and HTTP 999 (the "request denied" of Workday and LinkedIn), count as a refusal
+  ("blocked"), not as a technical failure.
+- When the address is the job platform itself (`*.myworkdayjobs.com`, `careers.smartrecruiters.com`...), a refusal of its
+  API is reported as such: its pages come from the same servers, so neither the generic reader nor the AI browser is tried.
+- A job feed linked as a visible "Flux RSS" link is read like a declared one, when its address names jobs or
+  internships (ONERA: `/stages/fr/rss.xml`). When even the oldest offer of a feed is inside the range, the page is read
+  too, for the older offers the feed no longer holds.
+- The same offer found on several websites (same title, employer and city) is shown once: the copy from the company's
+  own site, dated by the earliest reliable date of its copies; the other copies are excluded as "duplicate".
+- On one website, the same offer is shown once when it appears in two languages (`/fr/jobs/x` and `/en/jobs/x`) or
+  is published again with the same text (a job board reposting it through several advertising links, a company
+  republishing it under a new reference); the earliest copy is kept and the other links stay listed with it. Offers
+  with the same title but another text (another team, subject or client) remain separate openings.
+- An offer whose page states no publication date is still returned in its normal list, with the flag
+  "publication date unknown" and the day the app first saw it.
+- A date can never be later than the day the app first saw the offer: an offer re-dated by its website ("refreshed"
+  to look new) keeps its first-seen day, and the change is shown in its date source.
+- Every offer carries the link that opens it (results table, CSV export, "Open the offer"): its own page; else its
+  job-platform page; else, for an offer written as text on a list page, that page with a text anchor (`#:~:text=`) that
+  browsers open scrolled to the title. A link chosen by the AI page reader is checked against the link inside the offer's
+  own block on the page, and offers that come with an id only get the address pattern of their sibling offers.
 - A list whose next page is a form sent with POST (CNRS: `toPage('SearchForm', 2)`) is paged the way a browser does it.
 - When a page is gone (404, 410, 5xx), its home page is searched for a career page, and the possible new address is shown in
   the note. The address is not replaced automatically.
@@ -311,6 +390,32 @@ Locations are read from structured data, listing fields and labelled text ("Lieu
 "Location"). An offer is retained when it is located in France or is remote and open to France; offers with no
 verifiable location are placed in "To check".
 
+- French places are checked against the official list of communes, departments and regions
+  (`jobfinder/data/fr_places.txt`, from geo.api.gouv.fr): "Gif sur Yvette", "Saint-Paul-lez-Durance", "Chusclan (30)"
+  are in France. Hyphens, accents and case do not matter, and one wrong letter is forgiven in a name of several words
+  ("GIF SUY YVETTE"). One-word names that are also English words, foreign cities or a company (Vienne, Bruges, Mons,
+  La Haye, Orange) are left out of the list.
+- Every country (English and French names), US states, Canadian provinces and large foreign cities are known, so
+  "Riga, Latvia" or "Montevideo, Uruguay" is excluded as outside France instead of being placed in "To check". A French
+  name of several words is read first: "Porto-Vecchio" and "Saint-Maurice" are in France.
+- Without a location field, the place written in the offer's text is used when a cue introduces it and it is a real
+  place: "location_on Lyon", "notre agence de Lille", "poste basé à Toulouse", "(H/F) à Lyon", "based in London",
+  "location in France", a label ("Lieu du stage : • ENS Paris-Saclay", "Ville : Centre Inria de l'Université Grenoble
+  Alpes"), a postcode before its town ("06107 Nice"), a breadcrumb ("CDI / FRANCE Occitanie / Montpellier") or the
+  offer's title followed by its town ("SOFTWARE CRAFTSMAN Paris"). A label starts with a capital letter, so "mobility
+  location: Evidence from Kunming, China" in a bibliography is not read as one, and a search form's prompt
+  ("Localisation : Veuillez sélectionner") is not a place. A number ("1758") or a date ("Jeudi, 5 novembre, 2026") in
+  the location field is not a place.
+- A commune written without the end of its name is recognised when the start is unambiguous ("Montbonnot" for
+  Montbonnot-Saint-Martin, "Le Chesnay" for Le Chesnay-Rocquencourt, "CHERBOURG"); when several communes start the same
+  way, the place is French but is shown as written. A French street address with its postcode ("11 boulevard
+  d'Alembert, 78280"), the French national research institutes (CNRS, Inria, INRAE, CEA, Inserm, ONERA...) and
+  Roissy-Charles-de-Gaulle are in France; an institute's site abroad is named with its country ("Inria Chile").
+- When the location field says nothing ("2 sites", a misspelt town), the offer's text can only confirm France; a
+  foreign place named there does not exclude an offer that may have France among its other sites.
+- Workday writes "2 sites" for an offer in several places; its address starts with the main one
+  (`/job/France-Courbevoie/...`), which is used when it is in France. Otherwise the offer's page lists all its places.
+
 ### Title analysis
 
 The title analysis (`jobfinder/classify.py`) handles both conventional job titles (for example "Ingénieur Machine
@@ -327,7 +432,10 @@ technical field is reviewed by the language model. Only sales, administrative an
 words and unwanted offer types are rejected on the title alone; an internship or thesis subject expressed in
 specialised terms is always reviewed by the language model. Rejected roles include store, cashier, finance and management
 control, purchasing, HR, legal, reception and customer-service roles, by full role name ("contrôleur de gestion",
-"hôte de caisse"), so that technical titles in those fields ("Stage - Analyste data RH") are still reviewed.
+"hôte de caisse"), so that technical titles in those fields ("Stage - Analyste data RH") are still reviewed. Startup
+business roles are rejected too, whatever their AI flavour ("Bras droit du CEO - Legaltech IA", "Founders Associate",
+"Chief of Staff", product and UX/UI designers, "SDR / chargé de prospection"); "SDR" alone stays a signal-processing
+subject (Software-Defined Radio).
 
 ### AI analysis and CV matching
 
@@ -356,7 +464,8 @@ against the CV text.
 - Text taken from websites is escaped before display, and only HTTP(S) links are offered.
 - Cover letter fields are escaped for LaTeX, and compilation runs with `-no-shell-escape`.
 - URLs are checked against private and local network addresses before any request.
-- robots.txt is respected according to RFC 9309, and anti-bot protections are never bypassed.
+- robots.txt is respected according to RFC 9309, including the data requests made by a page rendered in the headless
+  browser, and anti-bot protections are never bypassed.
 
 ## Deployment
 
@@ -395,7 +504,8 @@ language model per run.
 
 ```
 app.py                  Streamlit interface: Search (three steps), Results, Settings
-assets/                 Interface styles (ubuntu.css), logo and icon
+assets/                 Interface styles (navy.css), logo and icon (letters drawn from Telegraf)
+static/fonts/           Telegraf font files, served by the app (server.enableStaticServing)
 .streamlit/config.toml  Theme and upload limit
 Dockerfile              Container image (Python, dependencies, Chromium)
 requirements.txt        Python dependencies
@@ -414,6 +524,7 @@ jobfinder/
   llm.py                Language model providers, structured answers, cache, quotas
   analysis.py           AI analysis of each offer
   cv.py                 CV extraction, CV matching, LaTeX cover letters
+  data/fr_places.txt    Official French communes, departments and regions (location check)
 tests/                  Offline test suite (no network access)
 ```
 
@@ -427,24 +538,35 @@ The test suite runs offline. Platform readers are tested against recorded respon
 
 ## Known limitations
 
-- LinkedIn and Indeed require authentication or block automated access; the company's own career page should be used
-  instead.
+- LinkedIn and Indeed require authentication or block automated access (Indeed answers with a Cloudflare challenge and
+  its robots.txt closes every offer page); they are reported without any request, and the company's own career page
+  should be used instead. Apec protects its whole website, robots.txt included, with an anti-bot service and has no
+  public API: it is reported the same way.
 - Websites that refuse automated access (HTTP 403, anti-bot pages), forbid it in robots.txt, have an invalid
   certificate or are unavailable are reported per website and never bypassed. At the time of writing this includes
-  APEC, JobTeaser, Glassdoor, Hellowork search, Carrefour, Prairie, Master IASD, Welcome to the Jungle, Alten, Tuito
-  and optioncarriere search URLs; the LISN offer page is restricted to internal access.
+  JobTeaser, Glassdoor, Carrefour, Equans, Acensi, Tuito, Inetum (HTTP 406) and optioncarriere search URLs; the LISN offer pages are restricted to internal access. When such a company publishes its offers on a job
+  platform (SmartRecruiters, Workable, Recruitee, Teamtailor, Greenhouse), they are read there instead.
+- Welcome to the Jungle (`welcometothejungle.com`: its search and its company pages) loads its offers with a script, and
+  its servers refuse automated browsers (HTTP 403). A company page is read on the company's own career site on the same
+  platform (`<company>.welcomekit.co`) when it has one; otherwise it is reported, and the company's own career site
+  should be added (for a STATION F startup, its page on `jobs.stationf.co`).
+- Workday sites may refuse requests for a while (HTTP 403) after a large worldwide list has been read; their France
+  filter keeps a normal search small.
 - When robots.txt forbids a search URL but not the page itself, the page and its sitemap are read instead.
 - Network problems (name resolution, timeouts) are retried and reported as "unreachable", never as "blocked"; a run
   made while the network is down should be started again.
 - Some career home pages give access to offers only through a search form; the URL of the result list should be
   supplied (for example `https://recrutement.michelin.fr/en/job-offer-result-list`).
-- A portal home page (for example francetravail.fr) is not a job list; the URL of a search result page should be
-  supplied.
+- A portal home page is not a job list; the URL of a search result page should be supplied (France Travail is read
+  through its API, see [France Travail](#france-travail)).
+- Hellowork's keyword pages show their first 20 offers without JavaScript (the next pages need `?`, which robots.txt
+  closes): a keyword page gives the newest offers of that keyword, enough for a daily search.
 - Some SuccessFactors sites populate their country filter with JavaScript; the application then filters by location
   itself.
 - Phenom and Eightfold lists cannot be sorted by date and are read in full.
 - Talentview job pages (Parrot) require JavaScript; their offers carry a title, location, contract type and date, but no
   description.
-- Offers whose page states no publication date (for example Inria, some laboratory pages) are placed in "To check".
+- Offers whose page states no publication date (for example Inria, some laboratory pages) are shown in their normal
+  list, marked "date not stated", with the day the application first saw them.
 - Free hosted plans limit tokens per minute and per day. Oversized requests are split automatically; an exhausted
   daily quota stops the analysis with an explicit message.

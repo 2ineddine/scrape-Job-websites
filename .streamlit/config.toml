@@ -1,19 +1,42 @@
 [theme]
 base = "light"
-primaryColor = "#E95420"
-backgroundColor = "#FAFAFA"
-secondaryBackgroundColor = "#F2F1F0"
-textColor = "#2C2C2C"
-linkColor = "#E95420"
-borderColor = "#DEDDDA"
+primaryColor = "#1B3A6B"
+backgroundColor = "#F4F6FA"
+secondaryBackgroundColor = "#E9EEF6"
+textColor = "#0E1C33"
+linkColor = "#1F5FD1"
+linkUnderline = false
+borderColor = "#DCE3EE"
 showWidgetBorder = true
-baseRadius = "8px"
+baseRadius = "10px"
+buttonRadius = "999px"
+font = "PP Telegraf, 'Helvetica Neue', Arial, sans-serif"
+headingFont = "PP Telegraf, 'Helvetica Neue', Arial, sans-serif"
+headingFontWeights = [800, 800, 800, 400, 400, 400]
+baseFontSize = 15
+dataframeHeaderBackgroundColor = "#EEF2F8"
 
-[theme.sidebar]
-backgroundColor = "#2C001E"
-textColor = "#F7F7F7"
-secondaryBackgroundColor = "#4A1F3D"
-borderColor = "#5E2750"
+# Telegraf, served by the app itself (static/fonts): no font is downloaded from another website
+[[theme.fontFaces]]
+family = "PP Telegraf"
+url = "app/static/fonts/PPTelegraf-Ultralight.otf"
+weight = 200
+
+[[theme.fontFaces]]
+family = "PP Telegraf"
+url = "app/static/fonts/PPTelegraf-Regular.otf"
+weight = 400
+
+[[theme.fontFaces]]
+family = "PP Telegraf"
+url = "app/static/fonts/PPTelegraf-RegularOblique.otf"
+weight = 400
+style = "italic"
+
+[[theme.fontFaces]]
+family = "PP Telegraf"
+url = "app/static/fonts/PPTelegraf-Ultrabold.otf"
+weight = 800
 
 [client]
 toolbarMode = "minimal"
@@ -23,3 +46,4 @@ gatherUsageStats = false
 
 [server]
 maxUploadSize = 10
+enableStaticServing = true

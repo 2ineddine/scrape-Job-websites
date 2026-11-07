@@ -10,6 +10,7 @@ COPY app.py ./
 COPY jobfinder ./jobfinder
 COPY assets ./assets
 COPY .streamlit ./.streamlit
+COPY static ./static
 
 # offers, CVs and letters; mount a volume here to keep CVs and settings between restarts
 VOLUME /app/data

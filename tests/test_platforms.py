@@ -1020,6 +1020,11 @@ def test_an_ai_slip_never_drops_an_offer_whose_title_matches(monkeypatch):
         analysis.analyze_job(s, other, prof, cfg)
         assert match.status == "review" and "title_matches_your_profile" in match.review_flags
         assert other.status == "excluded"  # no match in the title: the AI's 'no' stands
+        broad = mk(3, "Chargé de mission IA - transformation numérique (H/F)")  # one broad word only: the AI decides
+        s.add(broad)
+        s.commit()
+        analysis.analyze_job(s, broad, prof, cfg)
+        assert broad.status == "excluded"
 
 
 def test_store_finance_hr_roles_are_rejected_but_technical_ones_stay():
@@ -1032,3 +1037,633 @@ def test_store_finance_hr_roles_are_rejected_but_technical_ones_stay():
     for t in ("Stage - Data Scientist (H/F)", "Ingénieur achats data et IA", "Stage - Analyste data RH",
               "Alternance - Ingénieur Machine Learning"):
         assert analyze_title(t, "", prof).verdict != "reject", t
+
+
+def test_every_offer_gets_the_link_that_opens_it():
+    from jobfinder.web import offer_link
+    assert offer_link("https://co.fr/job/123-data-scientist", "Data Scientist") == "https://co.fr/job/123-data-scientist"
+    # written as text on a lab page: the page, scrolled to the offer's title ('-' and ',' escaped in the anchor)
+    assert offer_link("https://lab.fr/jobs?lang=fr&jboffer=ab12", "Post-doc - Vision 3D, robotique") == \
+        "https://lab.fr/jobs?lang=fr#:~:text=Post%2Ddoc%20%2D%20Vision%203D%2C%20robotique"
+    # an id without address, but the data names the offer's job-platform page: that page
+    assert offer_link("https://co.fr/careers?jbid=991", "Data", "https://co.wd3.myworkdayjobs.com/x/job/Paris/Data_R991") == \
+        "https://co.wd3.myworkdayjobs.com/x/job/Paris/Data_R991"
+    assert offer_link("https://co.fr/careers?page=2&jbcard=ff00&x=1", "Ingénieur ML").startswith("https://co.fr/careers?page=2&x=1#:~:text=")
+
+
+def test_exact_links_orange_lab_cards_and_ids_without_address():
+    from jobfinder.adapters import _phenom_arg
+    from jobfinder.crawler import _ids_to_links
+    from jobfinder.pagereader import _own_link
+    # Phenom site opened at its root: offers open at '/gb/en/job/<id>', never at '/job/<id>' (orange.jobs)
+    a = _phenom_arg("https://orange.jobs/", '<script>phApp = {"locale":"en_gb", "refNum":"ORANGE"}</script> phenom')
+    assert a is None or a["prefix"] == "/gb/en"
+    # lab page: each card holds its PDF BEFORE its title; every offer gets the PDF of its own card
+    soup = BeautifulSoup('<ul><li><a href="/pdf/3Dupdate.pdf">pdf</a><p>Change detection and updating of 3D models</p></li>'
+                         '<li><a href="/pdf/sunglint.pdf">pdf</a><p>Detection and correction of sunglint</p></li></ul>', "html.parser")
+    titles = ["Change detection and updating of 3D models", "Detection and correction of sunglint"]
+    assert _own_link(soup, titles[1], titles, "https://lab.fr/join") == "https://lab.fr/pdf/sunglint.pdf"
+    assert _own_link(soup, titles[0], titles, "https://lab.fr/join") == "https://lab.fr/pdf/3Dupdate.pdf"
+    # ids without address next to offers whose address holds their id
+    jobs = [{"url": "https://c.fr/carriere/2420", "apply_url": "", "platform_id": "2420"},
+            {"url": "https://c.fr/carriere/2421", "apply_url": "", "platform_id": "2421"},
+            {"url": "https://c.fr/?jbid=1655", "apply_url": "", "platform_id": "1655"}]
+    fresh = lambda: [dict(j) for j in jobs]
+    assert _ids_to_links(fresh())[2]["url"] == "https://c.fr/carriere/1655"
+    assert _ids_to_links(fresh()[1:])[1]["url"] == "https://c.fr/?jbid=1655"  # one example is not a pattern
+
+
+def test_an_offer_redated_by_the_website_keeps_the_day_it_was_first_seen():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import apply_filters
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    seen = (datetime.utcnow() - timedelta(days=20)).strftime("%Y-%m-%d")
+    with sessionmaker(bind=engine)() as s:
+        mk = lambda i: store.Job(uid=str(i), title="Ingénieur Machine Learning (H/F)", url=f"https://a.fr/{i}", status="new",
+                                 pub_date=datetime.utcnow(), date_conf=0.9, date_source="listing card", location_original="Paris",
+                                 extra={"first_seen": seen})
+        a, b = mk(1), mk(2)
+        s.add_all([a, b]); s.commit()
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 30 days"}), PROFILE_DEFAULT)
+        assert a.status in ("candidate", "review") and a.pub_date.strftime("%Y-%m-%d") == seen and "re-dated" in a.date_source
+        b.status = "new"; s.commit()
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT)
+        assert b.status == "out_of_range"  # 'published today' on the website, but online for 20 days
+
+
+def test_an_offer_without_a_date_is_returned_in_its_normal_list():
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import apply_filters
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as s:
+        j = store.Job(uid="1", title="Ingénieur Machine Learning (H/F)", url="https://a.fr/1", status="new", pub_date=None,
+                      location_original="Paris, France", extra={"first_seen": datetime.utcnow().strftime("%Y-%m-%d")})
+        s.add(j); s.commit()
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT)
+        assert j.status == "candidate" and "publication_date_unknown" in j.review_flags
+
+
+def test_the_same_offer_on_two_websites_is_shown_once_with_its_earliest_date():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import merge_duplicates
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    d1, d2 = datetime.utcnow() - timedelta(days=2), datetime.utcnow() - timedelta(days=1)
+    with sessionmaker(bind=engine)() as s:
+        own, board = store.Source(url="https://careers.thalesgroup.com/global/en/search-results", label="Thales"), \
+            store.Source(url="https://www.stage.fr/jobs/", label="Stage")
+        s.add_all([own, board]); s.commit()
+        mk = lambda i, src, d, t="STAGE - Ingénieur analyste Data Science (H/F)": store.Job(
+            uid=str(i), source_id=src.id, title=t, employer="Thales", city="Vélizy", url=f"https://x.fr/{i}",
+            pub_date=d, date_conf=0.9, date_source="api", status="candidate", description="x" * 300, extra={})
+        a, b, c = mk(1, board, d1), mk(2, own, d2), mk(3, own, d2, "STAGE - Ingénieur analyste Data Science 2 (H/F)")
+        s.add_all([a, b, c]); s.commit()
+        assert merge_duplicates(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"})) == 1
+        assert b.status == "candidate" and b.pub_date == d1 and "earliest of 2 copies" in b.date_source  # own site, earliest date
+        assert a.status == "excluded" and a.reason.startswith("duplicate") and c.status == "candidate"
+
+
+def test_robots_refusing_one_offer_page_keeps_the_offer_but_a_refused_site_is_blocked():
+    from jobfinder.adapters import _Budget, _open_detail, _raw
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError, RobotsRefused
+
+    class F(SiteFetcher):
+        def get(self, url, **kw):
+            if "/wp-content/" in url or "/closed-site/" in url:
+                raise RobotsRefused("access_restricted: disallowed by robots.txt")
+            return super().get(url, **kw)
+    raw = _raw("Stage - Data Scientist (H/F)", "https://lab.fr/wp-content/uploads/offre.pdf")
+    st = ScanState()
+    assert _open_detail(F({}), CFG(), raw, _Budget(CFG(), st)) is raw  # the offer stays, without its closed document
+    try:
+        list(crawl_source(F({}), "https://lab.fr/closed-site/jobs", CFG(), set(), st))
+        assert False, "a website whose own page is refused must be reported as blocked"
+    except AccessError:
+        pass
+
+
+def test_french_places_come_from_the_official_list_and_foreign_countries_are_known():
+    from jobfinder.classify import classify_location, fr_place
+    for loc in ("GIF SUY YVETTE", "Gif sur Yvette", "Villeneuve d'Ascq", "Bouches du Rhône (13) ; Saint-Paul-lez-Durance",
+                "Porto-Vecchio", "Saint-Maurice", "Dauphine - PSL", "Is-sur-Tille", "Hybrid - Paris"):
+        assert classify_location(loc)["france_eligible"], loc
+    assert fr_place("Saint-Paul-lez-Durance") == "Saint-Paul-lès-Durance"  # the longest official name, 'lez' = 'lès'
+    for loc in ("6 Duntes Street, Riga, Latvia", "Luis Alberto de Herrera, Montevideo, Uruguay", "Kolao Tower, Vientiane, Laos",
+                "The HeadHunter Ltd, Rr., Pristina, Kosovo", "Saint Louis, MO", "New Orleans, LA", "US, CA, Santa Clara"):
+        r = classify_location(loc)
+        assert r["location_verified"] and not r["france_eligible"], loc
+    for loc in ("Vienne", "Sales", "2 sites", "1758"):  # Vienna or the French town, a word, a count, a number: unknown
+        assert not classify_location(loc)["location_verified"], loc
+
+
+def test_the_place_written_in_an_offer_text_without_a_label():
+    from jobfinder.classify import location_from_text as lt
+    assert lt("Retour aux offres Analyste Mainframe (H/F) à Lyon calendar_month 17/08/2026 signature CDI location_on Lyon") == "Lyon"
+    assert lt("Retour Data Chef de projet BI & Big Data (F/H) Paris Il y a 6 jours Postuler") == "Paris"
+    assert lt("Nous recherchons pour notre agence de Lille des profils Data Analyst") == "Lille"
+    assert lt("We are a startup based in London working on AI") == "London"
+    assert lt("Ingénieur (H/F) Réf. : 2026-123 CDI Postuler") == ""  # a cue without a real place: nothing
+
+
+def test_an_unverified_location_is_confirmed_by_the_offer_text_only_for_france():
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import apply_filters
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    today = datetime.utcnow()
+    with sessionmaker(bind=engine)() as s:
+        mk = lambda i, loc, desc: store.Job(uid=str(i), title="Data Engineer (H/F)", url=f"https://a.fr/{i}", status="new",
+                                            pub_date=today, date_conf=0.9, location_original=loc, description=desc, extra={})
+        fr, us = mk(1, "2 sites", "Nous recherchons pour notre agence de Lille un Data Engineer"), \
+            mk(2, "2 sites", "Join our team based in Seattle to build data pipelines")
+        s.add_all([fr, us]); s.commit()
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT)
+        assert fr.status == "candidate" and fr.france_eligible and "Lille" in fr.location_evidence
+        assert us.status == "review" and "location_unverified" in us.review_flags  # not excluded: France may be a 2nd site
+
+
+def test_workday_france_filter_in_a_location_hierarchy_and_offers_in_several_places():
+    from jobfinder.adapters import _workday_france, _workday_place, crawl_workday
+    facets = [{"facetParameter": "locationMainGroup", "values": [
+        {"facetParameter": "locationHierarchy1", "descriptor": "Locations",
+         "values": [{"descriptor": "United States", "id": "US"}, {"descriptor": "France", "id": "FR1"}]},
+        {"facetParameter": "locations", "values": [{"descriptor": "France, Courbevoie", "id": "c"}]}]}]
+    assert _workday_france(facets) == {"locationHierarchy1": ["FR1"]}  # the country level, not one office
+    assert _workday_place("2 sites", "/job/France-Courbevoie/Solutions-Architect_JR1") == "France Courbevoie (+1 other site)"
+    assert _workday_place("2 sites", "/job/US-CA-Santa-Clara/Compiler-Engineer_JR2") == "2 sites"  # France may be the other
+    posts = [{"title": "Deep Learning Engineer", "externalPath": "/job/US-CA-Santa-Clara/DL_JR3", "locationsText": "2 sites",
+              "postedOn": "Posted Today", "bulletFields": ["JR3"]}]
+    f = FakeFetcher({'"limit": 1': {"total": 1, "jobPostings": posts, "facets": []},
+                     '"offset": 0': {"total": 1, "jobPostings": posts},
+                     "/job/US-CA-Santa-Clara/DL_JR3": {"jobPostingInfo": {
+                         "startDate": TODAY, "jobDescription": "<p>Deep learning</p>", "location": "US, CA, Santa Clara",
+                         "additionalLocations": ["France, Courbevoie"], "country": {"descriptor": "United States"}}}})
+    job = list(crawl_workday(f, _workday_arg("https://t.wd5.myworkdayjobs.com/Site"), CFG(), set(), ScanState()))[0].jobs[0]
+    from jobfinder.classify import classify_location
+    assert "France, Courbevoie" in job["location"] and job["country_hint"] is None
+    assert classify_location(job["location"], job["country_hint"])["france_eligible"]
+
+
+def _ts_rss(items):
+    from datetime import datetime, timedelta
+    body = "".join(
+        f"<item><link>https://www.x.fr/Pages/Offre/detailoffre.aspx?idOffre={i}&amp;idOrigine=502&amp;LCID=1036&amp;"
+        f"offerReference=2026-{i}</link><category>Stage</category><category>Saclay</category><title>2026-{i} - Stage - Data "
+        f"Scientist {i} H/F</title><description>{'Apprentissage profond. ' * 30}</description><pubDate>"
+        f"{(datetime.utcnow() - timedelta(days=d)):%a, %d %b %Y %H:%M:%S} Z</pubDate></item>" for i, d in items)
+    return f'<?xml version="1.0"?><rss version="2.0"><channel>{body}</channel></rss>'
+
+
+def _ts_page(cards, host="https://www.x.fr", day=None):
+    return "<html><body>" + "".join(
+        f'<div class="ts-offer-card"><h3><a class="ts-offer-card__title-link" href="{host}/offre-de-emploi/emploi-stage-'
+        f'data-{i}_{i}.aspx">Stage - Data Scientist {i} H/F</a></h3><ul><li>Réf. : 2026-{i}</li>'
+        + (f"<li>{day}</li>" if day else "") + '<li>Stage</li><li>Essonne (91)</li><li class="noBorder">Saclay</li></ul></div>'
+        for i in cards) + "</body></html>"
+
+
+def test_talentsoft_offers_are_stored_once_and_dated_by_category_feeds_and_list_order():
+    from jobfinder.adapters import crawl_talentsoft, _talentsoft_arg
+    f = FakeFetcher({
+        "Rss_Contract=579": _ts_rss([(90, 3), (80, 40)]),
+        "offerRss.ashx?LCID=1036": _ts_rss([(i, 0) for i in range(120, 100, -1)]),
+        "tous-les-flux-rss.aspx": '<a href="/handlers/offerRss.ashx?LCID=1036&Rss_Contract=579">Stage</a>',
+        "page=2": _ts_page([90, 85, 80, 75]),
+        "page=3": "<html></html>",
+        "liste-offres.aspx": _ts_page(list(range(120, 100, -1)) + [95], host="https://x-cand.talent-soft.com"),
+    })
+    cfg = CFG(date_preset="Last 7 days")
+    jobs = [j for pg in crawl_talentsoft(f, _talentsoft_arg("https://www.x.fr/offre-de-emploi/liste-offres.aspx?LCID=1036"),
+                                         cfg, set(), ScanState()) for j in pg.jobs]
+    ids = [j["url"].split("idOffre=")[1].split("&")[0] for j in jobs]
+    assert len(ids) == len(set(ids)) == 25  # the feed, the list and its second host: each offer once
+    assert all(j["url"] == f"https://www.x.fr/Pages/Offre/detailoffre.aspx?idOffre={i}&LCID=1036" for j, i in zip(jobs, ids))
+    by = dict(zip(ids, jobs))
+    gate = cfg["_gate"]
+    assert by["90"]["date_source"] == "talentsoft feed pubDate"  # dated by its category feed
+    assert "list order" in by["95"]["date_source"] and gate(by["95"]["date"], by["95"]["date_conf"]) is True
+    assert by["85"]["date"] is None  # between an offer of 3 days and one of 40 days: unknown, kept undated
+    assert "list order" in by["75"]["date_source"] and gate(by["75"]["date"], by["75"]["date_conf"]) is False
+
+
+def test_talentsoft_date_written_on_the_list_card():
+    from jobfinder.adapters import crawl_talentsoft, _talentsoft_arg
+    from datetime import datetime
+    day = datetime.utcnow().strftime("%d/%m/%Y")
+    f = FakeFetcher({"offerRss.ashx": _ts_rss([(i, 0) for i in range(120, 100, -1)]),
+                     "page=2": "<html></html>",
+                     "liste-offres.aspx": _ts_page([130], host="https://x-cand.talent-soft.com", day=day)})
+    jobs = [j for pg in crawl_talentsoft(f, _talentsoft_arg("https://www.x.fr/offre-de-emploi/liste-offres.aspx?LCID=1036"),
+                                         CFG(), set(), ScanState()) for j in pg.jobs]
+    card = next(j for j in jobs if "idOffre=130&" in j["url"])
+    assert card["date"].strftime("%d/%m/%Y") == day and card["date_source"] == "talentsoft list date"
+    assert card["location"] == "Saclay, Essonne (91)"
+
+
+def test_abbreviated_and_research_site_places_and_more_text_cues():
+    from jobfinder.classify import classify_location, location_from_text as lt
+    for loc in ("St-Paul-lez-Durance Langue /", "Chusclan", "Orme des Merisiers", "Ste-Foy-lès-Lyon"):
+        assert classify_location(loc)["france_eligible"], loc
+    assert not classify_location("Londres")["france_eligible"] and classify_location("Londres")["location_verified"]
+    assert lt("Vous cherchez à rejoindre une équipe jeune et dynamique sur Toulouse ? Travailler") == "Toulouse"
+    assert lt("Le poste est à pourvoir à Saint-Cloud dès que possible") == "Saint-Cloud"
+    assert lt("DTIS-2027-23 Localisation et cartographie Centre Toulouse Fichier joint") == "Toulouse"
+    assert lt("Formation sur Python et Docker, à Data Lake") == ""  # cue words before things that are not places
+
+
+def test_an_offer_titled_by_its_reference_number_takes_its_subject_from_its_page():
+    from jobfinder.adapters import _parse_detail, _raw, code_title, merge_detail, worth_opening
+    assert code_title("DTIS-2027-23") and code_title("REQ-12345") and code_title("2026-460")
+    assert not code_title("STAGE 2027 - DATA") and not code_title("R&D ENGINEER") and not code_title("Stage IA")
+    raw = _raw("DTIS-2027-23", "https://w3.onera.fr/stages/fr/node/1222", provenance="rss-feed")
+    assert worth_opening(CFG(), raw)  # a reference says nothing: the page is opened
+    html = ('<html><head><meta name="description" content="Localisation et cartographie simultanée (SLAM) à partir des '
+            'signaux télécom 4G"></head><body><main><h1>DTIS-2027-23</h1><p>Sujet de stage.</p> Centre Toulouse '
+            'Fichier joint</main></body></html>')
+    job = merge_detail(raw, _parse_detail(html, raw["url"]))
+    assert job["title"].startswith("Localisation et cartographie simultanée (SLAM)") and job["location"] == "Toulouse"
+
+
+def test_the_browser_does_not_load_data_that_robots_txt_closes():
+    from jobfinder.web import browser_guard
+
+    class Req:
+        def __init__(self, url, kind):
+            self.url, self.resource_type = url, kind
+
+    class Route:
+        def __init__(self, url, kind):
+            self.request, self.done = Req(url, kind), None
+
+        def continue_(self):
+            self.done = "continue"
+
+        def abort(self):
+            self.done = "abort"
+
+    class F:
+        notes = []
+
+        def robots_ok(self, url):
+            return "recruitmentplatform.com" not in url
+
+        def note(self, m):
+            self.notes.append(m)
+    guard = browser_guard(F())
+    cases = [("https://emea3.recruitmentplatform.com/fo/rest/jobs", "xhr", "abort"),       # the widget's API: closed
+             ("https://emea3.recruitmentplatform.com/static/widget.js", "script", "continue"),  # not data
+             ("https://rejoindre.onera.fr/", "document", "continue"),
+             ("http://127.0.0.1/admin", "image", "abort")]                                  # private address (SSRF)
+    for url, kind, want in cases:
+        r = Route(url, kind)
+        guard(r)
+        assert r.done == want, (url, kind)
+
+
+def test_websites_on_one_platform_share_its_request_pace():
+    import threading
+    import time as _t
+    from jobfinder import web
+    assert web._server("ag.wd3.myworkdayjobs.com") == web._server("sec.wd3.myworkdayjobs.com") == "wd3.myworkdayjobs.com"
+    assert web._server("api.smartrecruiters.com") == "api.smartrecruiters.com"
+    cfg = {"delay": 0.2}
+    a, b = web.Fetcher(cfg), web.Fetcher(cfg)  # two websites read in parallel
+    stamps = []
+    host = f"pace-test-{_t.time()}.wd9.myworkdayjobs.com"
+
+    def go(fx):
+        fx._wait(host)
+        stamps.append(_t.time())
+    ts = [threading.Thread(target=go, args=(fx,)) for fx in (a, b, a, b)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    stamps.sort()
+    assert all(y - x >= 0.18 for x, y in zip(stamps, stamps[1:]))  # one request at a time on the shared servers
+
+
+def test_a_refused_workday_site_is_reported_as_such_without_trying_its_pages_again():
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError
+
+    class F(SiteFetcher):
+        def post_json(self, url, payload):
+            self.calls.append(url)
+            raise AccessError("access_restricted: HTTP 999 / anti-bot page - inspect manually")
+
+        def get(self, url, **kw):
+            self.calls.append(url)
+            if "myworkdayjobs.com/wday/" in url:
+                raise AccessError("access_restricted: HTTP 999 / anti-bot page - inspect manually")
+            raise AssertionError(f"the refused platform's page was opened again: {url}")
+    f = F({})
+    try:
+        list(crawl_source(f, "https://valeo.wd3.myworkdayjobs.com/en-EN/valeo_jobs", CFG(), set(), ScanState()))
+        assert False, "must be reported as blocked"
+    except AccessError as e:
+        assert "Workday refuses automated requests" in str(e)
+
+
+def test_a_closed_hellowork_search_is_read_on_its_open_keyword_page():
+    from jobfinder.crawler import crawl_source, open_alternative
+    from jobfinder.web import RobotsRefused
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):  # Hellowork's robots.txt: every address with '?' and the search page are closed
+            return "?" not in url and "/emploi/recherche" not in url
+    search = "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+deep+learning&l=%C3%8Ele-de-France&c=Stage"
+    f = F({"mot-cle_deep-learning.html": "<html><h1>405 offres d'emploi Deep learning</h1></html>"})
+    assert open_alternative(f, search) == "https://www.hellowork.com/fr-fr/emploi/mot-cle_deep-learning.html"
+    assert any("mot-cle_stage-deep-learning" in c for c in f.calls)  # the exact words first (HTTP 404 here), then the keyword
+    assert open_alternative(f, "https://www.hellowork.com/fr-fr/emploi/recherche.html") is None  # no words: no page
+    assert open_alternative(f, "https://www.optioncarriere.com/emploi?s=AI") is None
+    try:  # no open page for these words: blocked, with the open pages to add instead
+        list(crawl_source(F({}), "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=zzz", CFG(), set(), ScanState()))
+        assert False, "must be refused"
+    except RobotsRefused as e:
+        assert "mot-cle_deep-learning.html" in str(e) and "company page" in str(e)
+
+
+def test_one_offer_twice_on_one_website_is_shown_once_but_other_openings_stay():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import merge_duplicates
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    d1, d2 = datetime.utcnow() - timedelta(days=3), datetime.utcnow() - timedelta(days=1)
+    text = "About Mistral. Mistral provides full-stack AI solutions, from frontier models to developer tools. " * 6
+    with sessionmaker(bind=engine)() as s:
+        board, own = store.Source(url="https://jobs.makesense.org/en/s/jobs/all/all?s=Data", label="Makesense"), \
+            store.Source(url="https://careers.thalesgroup.com/fr/fr/search-results", label="Thales")
+        s.add_all([board, own]); s.commit()
+        mk = lambda i, src, url, d, desc, t="Junior Python Developer (H/F)": store.Job(
+            uid=str(i), source_id=src.id, title=t, employer="AXA Climate", city="Paris", url=url, pub_date=d, date_conf=0.9,
+            date_source="api", status="candidate", description=desc, extra={})
+        fr = mk(1, board, "https://jobs.makesense.org/fr/jobs/axa-climate-junior-python-developer-hf-8ecNN0", d2, "x" * 50)
+        en = mk(2, board, "https://jobs.makesense.org/en/jobs/axa-climate-junior-python-developer-hf-8ecNN0", d2, "x" * 50)
+        late = mk(3, own, "https://careers.thalesgroup.com/fr/fr/job/R2/ingenieur-ivv", d2, text, "Ingénieur IVV")
+        early = mk(4, own, "https://careers.thalesgroup.com/fr/fr/job/R1/ingenieur-ivv", d1, text + " Réf R1", "Ingénieur IVV")
+        other = mk(5, own, "https://careers.thalesgroup.com/fr/fr/job/R3/ingenieur-ivv", d2,
+                   "Une autre équipe, un autre sujet : radar de surveillance côtière, tests en mer et en bassin. " * 6, "Ingénieur IVV")
+        copy = mk(6, board, "https://jobs.makesense.org/fr/jobs/thales-ingenieur-ivv-Zr41", d2, text, "Ingénieur IVV")
+        s.add_all([fr, en, late, early, other, copy]); s.commit()
+        assert merge_duplicates(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"})) == 3
+        assert {fr.status, en.status} == {"candidate", "excluded"}  # the same offer in French and in English
+        assert early.status == "candidate" and late.status == "excluded" and "published again" in late.reason
+        assert copy.status == "excluded" and "on Thales" in copy.reason  # the job board's copy: the company's own is kept
+        assert {late.url, copy.url} <= set(early.extra["also_on"])  # the other links stay reachable
+        assert other.status == "candidate"  # same title, another text: another opening
+        assert other.url not in early.extra["also_on"]  # ...and it is not listed as a copy
+
+
+def test_france_travail_offers_come_from_its_official_api_with_your_access(monkeypatch):
+    from jobfinder import adapters
+    from jobfinder.adapters import crawl_francetravail
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError
+    from test_adapters import R
+    monkeypatch.setattr(adapters, "load_keys", lambda: {})  # never the real api_keys.txt
+    for k in ("FRANCE_TRAVAIL_CLIENT_ID", "FRANCE_TRAVAIL_CLIENT_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+
+    def offer(i, title, day=TODAY, partner=None):
+        return {"id": f"20{i}", "intitule": title, "description": "Développement de modèles de vision par ordinateur. " * 5,
+                "dateCreation": f"{day}T08:30:00.000Z", "dateActualisation": f"{TODAY}T09:00:00.000Z",
+                "lieuTravail": {"libelle": "91 - Gif-sur-Yvette", "codePostal": "91190"},
+                "entreprise": {"nom": "Labo Vision"}, "typeContrat": "CDD", "typeContratLibelle": "CDD - 18 Mois",
+                "origineOffre": {"origine": "2" if partner else "1", "partenaires": [{"nom": "APEC", "url": partner}] if partner else []}}
+
+    class F:
+        def __init__(self):
+            self.calls, self.notes = [], []
+
+        def note(self, m):
+            self.notes.append(m)
+
+        def request(self, method, url, **kw):
+            self.calls.append((method, url, kw.get("data")))
+            return R(url, js={"access_token": "tok", "expires_in": 1499})
+
+        def get(self, url, params=None, headers=None, **kw):
+            self.calls.append(("GET", url, dict(params or {})))
+            assert headers["Authorization"] == "Bearer tok" and "api.francetravail.io" in url
+            if params["motsCles"] == "computer,vision":
+                if params["range"] == "0-149":
+                    r = R(url, js={"resultats": [offer(i, f"Ingénieur vision {i}") for i in range(149)] +
+                                   [offer(999, "Ingénieur vision partenaire", partner="https://www.apec.fr/offre/999")]},
+                          headers={"Content-Range": "offres 0-149/151"})
+                else:
+                    r = R(url, js={"resultats": [offer(1, "Ingénieur vision 1")]}, headers={"Content-Range": "offres 150-150/151"})
+                r.status_code = 206 if params["range"] == "0-149" else 200
+                return r
+            r = R(url, "")
+            r.status_code = 204  # nothing for this keyword
+            return r
+    cfg = CFG(date_preset="Last 7 days")
+    try:  # no access yet: says how to get it, sends nothing
+        list(crawl_francetravail(F(), "https://www.francetravail.fr/accueil", cfg, set(), ScanState()))
+        assert False, "must say that an access is needed"
+    except AccessError as e:
+        assert "francetravail.io" in str(e) and "FRANCE_TRAVAIL_CLIENT_ID" in str(e)
+    monkeypatch.setattr(adapters, "load_keys", lambda: {"francetravail_id": "id", "francetravail_secret": "secret"})
+    f = F()
+    url = "https://candidat.francetravail.fr/offres/recherche?motsCles=computer+vision,deep+learning&offresPartenaires=true"
+    jobs = [j for pg in crawl_source(f, url, cfg, set(), ScanState()) for j in pg.jobs]
+    token = f.calls[0]
+    assert token[0] == "POST" and "realm=%2Fpartenaire" in token[1] and token[2]["scope"] == "api_offresdemploiv2 o2dsoffre"
+    searches = [c[2] for c in f.calls if c[0] == "GET"]
+    assert {s["motsCles"] for s in searches} == {"computer,vision", "deep,learning"}
+    assert all(s["publieeDepuis"] == 7 and s["sort"] == 1 for s in searches)
+    assert [s["range"] for s in searches if s["motsCles"] == "computer,vision"] == ["0-149", "150-299"]
+    assert len(jobs) == 150 and len({j["platform_id"] for j in jobs}) == 150  # offer '201' of page 2 was already read
+    j = next(x for x in jobs if x["platform_id"] == "20999")
+    assert j["url"] == "https://candidat.francetravail.fr/offres/recherche/detail/20999"
+    assert j["apply_url"] == "https://www.apec.fr/offre/999" and j["employer"] == "Labo Vision"
+    assert j["date"].strftime("%Y-%m-%d") == TODAY and "dateCreation" in j["date_source"] and j["country_hint"] == "FR"
+    assert not any("www.francetravail.fr" in str(c[1]) for c in f.calls)  # its pages are never opened
+    from jobfinder.adapters import _ft_since
+    assert (_ft_since(CFG(date_preset="Last 30 days")), _ft_since(CFG(date_preset="All dates"))) == (31, None)
+
+
+def test_boards_without_any_open_access_are_reported_without_a_request():
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError
+    for url, word in (("https://www.apec.fr/candidat/recherche-emploi.html/emploi?lieux=75", "Apec"),
+                      ("https://fr.indeed.com/jobs?q=deep+learning&l=France", "Indeed")):
+        f = SiteFetcher({})
+        try:
+            list(crawl_source(f, url, CFG(), set(), ScanState()))
+            assert False, "must be reported"
+        except AccessError as e:
+            assert word in str(e) and "career page" in str(e) and not f.calls
+
+
+def test_places_written_in_more_forms_in_an_offer_text():
+    from jobfinder.classify import classify_location, location_from_text
+    cases = [  # (text, title, expected place) - all seen in a full run
+        ("offres d’emploi / Systèmes embarqués Architecte Cloud Azure H/F CDI / FRANCE Occitanie / Montpellier Postuler", "", "Montpellier"),
+        ("Lieu : Stage M2 de 6 mois Equipe ICARE Campus Pasteur 28 avenue Valombrose 06107 Nice Hôpital Pasteur", "", "Nice"),
+        ("Lieu du stage : • LURPA ENS Paris-Saclay, 4 avenue des sciences, 91190 Gif-sur-Yvette", "", "ENS Paris-Saclay"),
+        ("Ville : Centre Inria de l'Université Grenoble Alpes ou Siège (Grenoble ou Paris) Centre Inria : Siège", "", "Grenoble"),
+        ("Retour Technology SOFTWARE CRAFTS(WO)MAN Paris Il y a 7 jours Postuler", "SOFTWARE CRAFTS(WO)MAN", "Paris"),
+        ("Job ID 528498 Company Siemens SAS ... location in France Dans un monde industriel qui bouge vite", "", "France"),
+    ]
+    for text, title, want in cases:
+        got = location_from_text(text, title)
+        assert want.lower() in got.lower() and classify_location(got)["france_eligible"], (text[:40], got)
+    # a sentence is not a label, a search form's prompt is not a place
+    assert location_from_text("Representation of urban mobility location: Evidence from Kunming, China. ISPRS Journal") == ""
+    assert location_from_text("Localisation : Veuillez sélectionner une valeur Amérique du Nord Europe Asie") == ""
+    assert location_from_text("Liens rapides Accueil Offres d'emploi", "Formateur à Saint Avertin (Tours) : atelier") == "Saint-Avertin"
+    assert not classify_location("Erlangen")["france_eligible"] and classify_location("Erlangen")["location_verified"]
+    loc = classify_location("11 boulevard d’Alembert, 78280")  # a French street address with its postcode
+    assert loc["location_verified"] and loc["france_eligible"]
+    for field in ("INRAE", "CNRS", "École nationale des ponts et chaussées", "Roissy Charles de Gaulle"):
+        assert classify_location(field)["france_eligible"], field
+    assert not classify_location("Inria Chile, Santiago")["france_eligible"]
+
+
+def test_a_commune_written_without_the_end_of_its_name():
+    from jobfinder.classify import classify_location, fr_place
+    assert fr_place("Montbonnot") == "Montbonnot-Saint-Martin" and fr_place("Le Chesnay") == "Le Chesnay-Rocquencourt"
+    assert fr_place("CHERBOURG") == "Cherbourg-en-Cotentin"
+    assert fr_place("BONNEVILLE") == "Bonneville"  # several communes start so: French, without inventing which one
+    for foreign in ("Vienne", "Bellevue", "Sainte"):  # Vienna in French, Bellevue (Washington), a word
+        assert not classify_location(foreign)["france_eligible"], foreign
+
+
+def test_a_date_in_the_location_field_and_pages_that_are_not_offers():
+    from jobfinder.classify import clean_title, is_boilerplate_title, looks_like_date, offer_kinds_heading
+    assert looks_like_date("Jeudi, 5 novembre, 2026 - Vendredi, 6 novembre, 2026") and looks_like_date("12/11/2026")
+    assert not looks_like_date("Saint-Martin-d'Hères") and not looks_like_date("Marseille 13e")
+    for t in ("Postdoc, PhD or Master 2", "Apprenticeships, internships, thesis and VIE",
+              "Open positions for 2026 internships/PhDs.", "Offres de stages et thèses"):
+        assert offer_kinds_heading(t), t
+    for t in ("PhD position", "Stage M2", "Stage - Data Scientist", "Internship - Machine Learning Research", "Thèse CIFRE IA"):
+        assert not offer_kinds_heading(t), t
+    assert is_boilerplate_title("<<INTERNAL JOB DESCRIPTION>> Follow the rules and procedures")
+    assert clean_title("Video Editor (F/H/NB) [AAA Project]") == "Video Editor [AAA Project]"
+    assert clean_title("Cloud administrator (W/M/NB)") == "Cloud administrator"
+
+
+def test_page_data_mixing_other_content_with_offers():
+    from jobfinder.crawler import _drop_odd_links
+    base = "https://www.ubisoft.com/fr-fr/company/careers"
+    jobs = [{"url": f"{base}/search/74400016{i}-video-editor-f-h", "location": "", "employment_type": ""} for i in range(6)]
+    odd = {"url": f"{base}/anti-cheat-software", "location": "", "employment_type": ""}
+    assert _drop_odd_links(jobs + [odd]) == jobs
+    pages = [{"url": f"{base}/{x}", "location": "", "employment_type": ""} for x in ("working-at-ubisoft", "locations", "news-1")]
+    assert _drop_odd_links(jobs + pages + [odd]) == jobs  # site pages around the offers in the same page data
+    assert _drop_odd_links(jobs[:3] + pages) == jobs[:3] + pages  # too few numbered offers to tell: nothing dropped
+    kept = {"url": f"{base}/stage-data", "location": "Paris", "employment_type": ""}  # a place: may be an offer, kept
+    assert kept in _drop_odd_links(jobs + [kept])
+
+
+def test_two_offers_on_one_platform_page_address_are_not_one_offer():
+    from jobfinder.scan import _lang_free
+    a = "https://www.emploi.cea.fr/Pages/Offre/detailoffre.aspx?idOffre=39221&LCID=1036"
+    assert _lang_free(a) != _lang_free(a.replace("39221", "38837"))  # two CEA offers
+    assert _lang_free(a) == _lang_free(a.replace("LCID=1036", "LCID=2057"))  # one offer in two languages
+
+
+def test_keywords_added_to_the_defaults_reach_a_saved_profile_once():
+    from jobfinder.config import PROFILE_DEFAULT, upgrade_profile
+    old = {"description": "x", "keywords": ["data scientist", "computer vision", "consultant ia"], "exclude_titles": [],
+           "offer_types": ["job"]}  # saved before the keyword revisions
+    up, changed = upgrade_profile(old)
+    assert changed and up["keywords_rev"] == PROFILE_DEFAULT["keywords_rev"]
+    assert {"mlops", "lidar", "ingenieur perception", "consultant ia"} <= set(up["keywords"])  # added; own word kept
+    assert up["keywords"][:3] == old["keywords"]  # the user's order first
+    trimmed = {**up, "keywords": [k for k in up["keywords"] if k != "lidar"]}
+    assert upgrade_profile(trimmed) == (trimmed, False)  # a keyword deleted afterwards is not added back
+    assert len(PROFILE_DEFAULT["keywords"]) == len(set(PROFILE_DEFAULT["keywords"]))
+
+
+def test_welcome_to_the_jungle_pages_are_read_on_the_company_career_site_or_reported(monkeypatch):
+    from jobfinder import crawler
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))  # no real browser in tests
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    job = ('<html><script type="application/ld+json">{"@type": "JobPosting", "title": "Ingénieur Vision par Ordinateur (H/F)",'
+           f' "datePosted": "{TODAY}", "jobLocation": {{"address": {{"addressLocality": "Paris", "addressCountry": "FR"}}}},'
+           ' "description": "Vision par ordinateur et apprentissage profond pour l\'audio et l\'image."}</script></html>')
+    site = ('<html><ul class="jobs-list"><li><a class="jobs-list-item-link" href="/jobs/ingenieur-vision_paris">'
+            '<h3>Ingénieur Vision par Ordinateur (H/F)</h3></a></li></ul></html>')
+    f = F({"devialet.welcomekit.co/jobs/ingenieur-vision_paris": job, "devialet.welcomekit.co/": site,
+           "dxo.welcomekit.co": "No career website for dxo.welcomekit.co."})
+    jobs = [j for pg in crawl_source(f, "https://www.welcometothejungle.com/fr/companies/devialet/jobs", CFG(), set(), ScanState())
+            for j in pg.jobs]
+    assert [j["title"] for j in jobs] == ["Ingénieur Vision par Ordinateur (H/F)"]  # read on the company's own career site
+    assert any("devialet.welcomekit.co" in n for n in f.notes)
+    for url in ("https://www.welcometothejungle.com/en/companies/dxo/jobs",  # no career site of its own
+                "https://www.welcometothejungle.com/fr/jobs?query=stage+deep+learning"):  # the board's search
+        g = F({"dxo.welcomekit.co": "No career website for dxo.welcomekit.co."})
+        try:
+            list(crawl_source(g, url, CFG(), set(), ScanState()))
+            assert False, "must be reported"
+        except AccessError as e:
+            assert "Welcome to the Jungle" in str(e) and "jobs.stationf.co" in str(e)
+        assert not any(x in c for c in g.calls for x in ("teamtailor", "greenhouse", "smartrecruiters", "workable", "lever"))
+
+
+def test_no_job_board_is_guessed_from_the_name_of_a_platform_that_hosts_the_page(monkeypatch):
+    from jobfinder import crawler
+    from jobfinder.crawler import _board_host, crawl_source
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    page = ('<html><ul class="jobs-list"><li><a class="jobs-list-item-link" href="/companies/rainpath/jobs/operations-intern_paris">'
+            '<h3>Operations Intern</h3></a></li></ul></html>')  # only an offer the profile does not want
+    f = F({"jobs.stationf.co/companies/rainpath": page, "teamtailor.com/jobs.rss": "<rss><title>STATION F</title><item/></rss>"})
+    assert [j for pg in crawl_source(f, "https://jobs.stationf.co/companies/rainpath", CFG(), set(), ScanState()) for j in pg.jobs] == []
+    assert not any(x in c for c in f.calls for x in ("teamtailor", "greenhouse", "smartrecruiters", "workable", "recruitee"))
+    assert _board_host("https://devialet.welcomekit.co/") and _board_host("https://jobs.stationf.co/companies/x")
+    assert _board_host("https://www.welcometothejungle.com/fr/companies/dxo/jobs") and not _board_host("https://www.parrot.com/en/jobs")
+
+
+def test_offer_data_with_unescaped_quotes_and_company_pages_on_shared_sites():
+    from jobfinder.adapters import _parse_detail
+    from jobfinder.store import company_from_url
+    # Welcome to the Jungle (STATION F job board) leaves the quotes of the offer's text unescaped in its JSON-LD
+    page = ("<html><script type='application/ld+json'>{\"@context\": \"https://schema.org\", \"@type\": \"JobPosting\",\n"
+            f"\"title\": \"Data Scientist Engineer\", \"datePosted\": \"{TODAY}T01:03:28+01:00\",\n"
+            "\"description\": \"You are a proactive \"doer\": autonomous, \"hands-on\" and curious.\nAnd more: "
+            "[blog\\](file:///C:/Users/MARIEB~1/clip\\_filelist.xml)\",\n"  # a pasted Windows path: invalid escapes
+            "\"hiringOrganization\": {\"@type\": \"Organization\", \"name\": \"Sekoia\"},\n"
+            "\"jobLocation\": [{\"@type\": \"Place\", \"address\": {\"addressLocality\": \"Rennes\", \"addressCountry\": \"France\"}}]}"
+            "</script><h1>Data Scientist Engineer</h1><p>Paris, Rennes Possible partial remote Apply Now</p></html>")
+    job = _parse_detail(page, "https://jobs.stationf.co/companies/sekoia/jobs/data-scientist-engineer")
+    assert job["provenance"] == "json-ld" and job["employer"] == "Sekoia" and job["location"] == "Rennes, France"
+    assert str(job["date"])[:10] == TODAY and '"doer"' in job["description"]
+    assert company_from_url("https://jobs.stationf.co/companies/neurobus") == "Neurobus"
+    assert company_from_url("https://jobs.stationf.co/companies/joko-1") == "Joko"
+    assert company_from_url("https://www.welcometothejungle.com/en/companies/dxo/jobs") == "DXO"
+    assert company_from_url("https://www.hellowork.com/fr-fr/entreprises/-proxiad--86909.html") == "Proxiad"
+    assert company_from_url("https://jobs.ashbyhq.com/arago") == "Arago"  # unchanged

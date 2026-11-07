@@ -1,4 +1,4 @@
-"""app.py - Job Finder (Ubuntu / GNOME look).   Run:  streamlit run app.py
+"""app.py - Job Finder (navy website look, Telegraf type).   Run:  streamlit run app.py
 Flow: 1. career websites  ->  2. your CV  ->  3. analysis  ->  results."""
 import atexit
 import hashlib
@@ -6,7 +6,6 @@ import html
 import json
 import os
 import threading
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,18 +16,18 @@ from jobfinder import cv as cvm
 from jobfinder import llm
 from jobfinder.analysis import analyze_pipeline
 from jobfinder.classify import OFFER_TYPES
-from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config
+from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config, upgrade_profile
 from jobfinder.scan import Progress, run_scan
 from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, get_setting,
                              init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
                              wipe_session_data)
-from jobfinder.web import extract_urls
+from jobfinder.web import extract_urls, offer_link
 
 ASSETS = Path(__file__).parent / "assets"
 st.set_page_config(page_title="Job Finder", page_icon=str(ASSETS / "icon.svg"), layout="wide")
 init_db()
 ensure_gitignore()
-st.html(f"<style>{(ASSETS / 'ubuntu.css').read_text(encoding='utf-8')}</style>")
+st.html(f"<style>{(ASSETS / 'navy.css').read_text(encoding='utf-8')}</style>")
 
 
 @st.cache_resource
@@ -43,6 +42,9 @@ prog = _launch()
 with SessionLocal() as _s:
     CFG, PROFILE, APPLICANT = (get_setting(_s, "config", CONFIG_DEFAULT), get_setting(_s, "profile", PROFILE_DEFAULT),
                                get_setting(_s, "applicant", APPLICANT_DEFAULT))
+    PROFILE, _upgraded = upgrade_profile(PROFILE)  # keywords added to the defaults since this profile was saved
+    if _upgraded:
+        set_setting(_s, "profile", PROFILE)
 c, p, ap = (json.loads(json.dumps(x)) for x in (CFG, PROFILE, APPLICANT))  # working copies, auto-saved at the end
 KEYS = load_keys()
 PRESETS = list(PRESET_DAYS) + ["All dates"]
@@ -50,12 +52,15 @@ STATUS = {"relevant": ("Relevant", "green"), "review": ("To check", "yellow"), "
           "excluded": ("Excluded", "red")}
 
 
-# =================================================================== shell: GNOME top panel, header bar, dock
-def shell(title, subtitle=""):
-    st.html(f'<div class="ub-panel"><span class="ub-activities">Activities</span>'
-            f'<span class="ub-clock">{datetime.now():%a %d %b  %H:%M}</span><span class="ub-tray"><span>⏻</span><span>▾</span></span></div>'
-            f'<div class="ub-headerbar"><div><span class="ub-title">{title}</span><span class="ub-sub">{subtitle}</span></div>'
-            '<div class="ub-wm"><span>&#8211;</span><span>&#9633;</span><span class="close">&#10005;</span></div></div>')
+# =================================================================== shell: navy top bar and page header
+def shell(title, subtitle="", eyebrow="Job Finder"):
+    """The page's navy header: its title, one line about it, and the live counters."""
+    n, d = counts(), prog.snap()[0]
+    stats = [(n["sites"], "websites", ""), (n["cvs"], "CVs", ""), (n["relevant"], "relevant offers", ""),
+             (n["review"], "to check", ""), ("running" if d["running"] else "idle", "analysis", "live" if d["running"] else "")]
+    st.html(f'<div class="jf-hero"><div class="jf-eyebrow">{html.escape(eyebrow)}</div><h1>{html.escape(title)}</h1>'
+            f'<p class="jf-lead">{html.escape(subtitle)}</p><div class="jf-stats">'
+            + "".join(f'<div class="jf-stat {cls}"><b>{v}</b><span>{k}</span></div>' for v, k, cls in stats) + "</div></div>")
 
 
 def counts():
@@ -65,19 +70,12 @@ def counts():
                     review=s.query(Job).filter(Job.status == "review").count())
 
 
-def dock():
-    n, d = counts(), prog.snap()[0]
-    st.logo(str(ASSETS / "logo.svg"), size="large", icon_image=str(ASSETS / "icon.svg"))
-    with st.sidebar:
-        st.html(f'<div class="ub-dockstat"><span>Websites</span><b>{n["sites"]}</b></div>'
-                f'<div class="ub-dockstat"><span>CVs</span><b>{n["cvs"]}</b></div>'
-                f'<div class="ub-dockstat"><span>Relevant offers</span><b>{n["relevant"]}</b></div>'
-                f'<div class="ub-dockstat"><span>To check</span><b>{n["review"]}</b></div>'
-                f'<div class="ub-dockstat"><span>Analysis</span><b>{"running" if d["running"] else "idle"}</b></div>')
+def brand():
+    st.logo(str(ASSETS / "logo.svg"), size="large")  # the whole logo in the navy top bar
 
 
 def chips(items):  # texts come from websites and CV file names: always escaped
-    return '<div class="ub-chips">' + "".join(f'<span class="ub-chip {cls}">{html.escape(str(txt))}</span>'
+    return '<div class="jf-chips">' + "".join(f'<span class="jf-chip {cls}">{html.escape(str(txt))}</span>'
                                               for txt, cls in items if txt) + "</div>"
 
 
@@ -87,7 +85,7 @@ def web_link(u):
 
 
 def step(n, title, done):
-    st.html(f'<div class="ub-step"><span class="ub-stepnum {"done" if done else ""}">{"✓" if done else n}</span>{title}</div>')
+    st.html(f'<div class="jf-step"><span class="jf-stepnum {"done" if done else ""}">{"✓" if done else n}</span>{title}</div>')
 
 
 def autosave(name, new, old):
@@ -105,7 +103,7 @@ def _sig(files):
 
 # =================================================================== page 1: the three steps
 def step_websites(running, n):
-    with st.container(border=True):
+    with st.container(border=True, key="card_websites"):
         step(1, "Career websites", n["sites"] > 0)
         files = st.file_uploader("HTML file(s) with the career pages — read, never executed", type=["html", "htm"],
                                  accept_multiple_files=True, disabled=running)
@@ -160,7 +158,7 @@ READ_OUTCOME = {"offers_found": "offers found", "nothing_in_range": "read: nothi
 
 
 def step_cv(running, n):
-    with st.container(border=True):
+    with st.container(border=True, key="card_cv"):
         step(2, "Your CV", n["cvs"] > 0)
         up = st.file_uploader("PDF CV(s) — compared with every relevant offer", type=["pdf"], accept_multiple_files=True,
                               key="cvup", disabled=running)
@@ -176,7 +174,7 @@ def step_cv(running, n):
         with SessionLocal() as s:
             for cv in s.query(CVDocument).all():
                 a, b = st.columns([6, 1], vertical_alignment="center")
-                a.html(chips([(cv.name, "aubergine"), (cv.language, ""),
+                a.html(chips([(cv.name, "navy"), (cv.language, ""),
                               ("needs OCR (scanned PDF)" if cv.status == "needs_ocr" else "", "red")]))
                 if b.button("Remove", key=f"rm{cv.id}", disabled=running):
                     cvm.delete_cv(s, cv.id)
@@ -229,7 +227,7 @@ def _monitor():
 
 
 def step_analysis(running, n):
-    with st.container(border=True):
+    with st.container(border=True, key="card_analysis"):
         step(3, "Analysis", bool(prog.snap()[0]["finished"]))
         cur = p.get("offer_types") or ["job"]
         p["offer_types"] = st.pills("I am looking for", list(OFFER_TYPES), selection_mode="multi", default=cur,
@@ -256,7 +254,9 @@ def step_analysis(running, n):
 
 
 def page_search():
-    shell("Job Finder", "1 · websites   2 · CV   3 · analysis")
+    shell("Find research & engineering offers in France",
+          "Load the career websites, add your CV, then let the app read every offer, date it, place it and rank it.",
+          "Search · 3 steps")
     elsewhere = scan_running_elsewhere()
     if elsewhere:  # a scan started outside this app (script, other window): its data is kept and nothing can change
         st.warning("A scan is running in another process: its websites and offers are kept. Loading websites and "
@@ -276,17 +276,19 @@ def _rows():
             r = j.relevance_json or {}
             kind = r.get("contract_kind") if r.get("contract_kind") not in (None, "unknown") else (ti.get("training") or ti.get("contract") or "")
             out.append(dict(uid=j.uid, title=j.title, company=j.employer, location=j.location_original or "",
-                            published=j.pub_date.date() if j.pub_date else None, first_seen=(j.extra or {}).get("first_seen"), type=kind,
+                            # ISO text: sorts by date, and an offer without a stated date shows an empty cell, not 'None'
+                            published=f"{j.pub_date:%Y-%m-%d}" if j.pub_date else "", first_seen=(j.extra or {}).get("first_seen") or "", type=kind,
                             topics=", ".join(r.get("research_topics") or ti.get("topics", [])),
-                            relevance=j.relevance_score, match=j.match_score, status=j.status))
+                            relevance=j.relevance_score, match=j.match_score, link=web_link(offer_link(j.url, j.title, j.apply_url)),
+                            status=j.status))
     return pd.DataFrame(out)
 
 
 def page_results():
-    shell("Results", "offers found")
+    shell("Results", "Every offer found, with its exact link, its publication date and why it was kept.", "Offers")
     df = _rows()
     if df.empty:
-        st.html('<div class="ub-empty"><div class="ub-big">No offers yet</div>Follow the three steps on the Search page.</div>')
+        st.html('<div class="jf-empty"><div class="jf-big">No offers yet</div>Follow the three steps on the Search page.</div>')
         return
     views = {"Relevant": ["relevant"], "To check": ["review"], "Not analysed": ["candidate"], "Excluded": ["excluded"], "All": None}
     label = lambda k: f"{k} ({len(df) if views[k] is None else int(df.status.isin(views[k]).sum())})"
@@ -302,9 +304,12 @@ def page_results():
                        column_config={"title": st.column_config.TextColumn(width="medium"),
                                       "location": st.column_config.TextColumn(width="small"),
                                       "company": st.column_config.TextColumn(width="small"),
-                                      "published": st.column_config.DateColumn(format="DD MMM YYYY"),
+                                      "published": st.column_config.TextColumn(
+                                          help="Empty: the website does not state it (see 'first seen')"),
+                                      "first_seen": st.column_config.TextColumn("first seen", help="The day the app first found the offer"),
                                       "relevance": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-                                      "match": st.column_config.ProgressColumn("CV match", min_value=0, max_value=100, format="%d")})
+                                      "match": st.column_config.ProgressColumn("CV match", min_value=0, max_value=100, format="%d"),
+                                      "link": st.column_config.LinkColumn("offer", display_text="open")})
     st.download_button("Export CSV", v.drop(columns=["uid"]).to_csv(index=False), "offers.csv", icon=":material/download:")
     rows = sel.selection.rows if sel and sel.selection else []
     if rows:
@@ -318,22 +323,25 @@ def job_detail(uid):
         j = s.query(Job).filter_by(uid=uid).first()
         ti, r = (j.extra or {}).get("title_info") or {}, j.relevance_json or {}
         label, cls = STATUS.get(j.status, (j.status, ""))
-        with st.container(border=True):
+        with st.container(border=True, key="card_offer"):
             st.subheader(j.title, anchor=False)
             kind = r.get("contract_kind") if r.get("contract_kind") not in (None, "unknown") else ti.get("training")
-            st.html(chips([(j.employer, "aubergine"), (label, cls), (OFFER_TYPES.get(kind or "", ""), "orange"),
-                           ("research subject" if ti.get("kind") == "research_topic" else "", "orange"),
+            st.html(chips([(j.employer, "navy"), (label, cls), (OFFER_TYPES.get(kind or "", ""), "blue"),
+                           ("research subject" if ti.get("kind") == "research_topic" else "", "blue"),
                            ({"fr": "français", "en": "English"}.get(ti.get("lang"), ""), "")]
                           + [(t, "") for t in (r.get("research_topics") or ti.get("topics") or [])[:6]]))
             l1, l2, _ = st.columns([1, 1, 3])
-            if web_link(j.url):
-                l1.link_button("Open the offer", j.url.split("jboffer=")[0].rstrip("?&"), icon=":material/open_in_new:", width="stretch")
-            if web_link(j.apply_url) and j.apply_url != j.url and "jboffer=" not in j.apply_url:
+            link = web_link(offer_link(j.url, j.title, j.apply_url))
+            if link:
+                l1.link_button("Open the offer", link, icon=":material/open_in_new:", width="stretch", type="primary")
+            if web_link(j.apply_url) and j.apply_url not in (j.url, link) and "jboffer=" not in j.apply_url:
                 l2.link_button("Apply page", j.apply_url, icon=":material/send:", width="stretch")
             a, b = st.columns(2)
-            a.html(f'<div class="ub-kv"><b>Published</b> {f"{j.pub_date:%d %b %Y}" if j.pub_date else "unknown"}</div>')
+            seen = (j.extra or {}).get("first_seen")
+            when = f"{j.pub_date:%d %b %Y}" if j.pub_date else "not stated by the website" + (f" — first seen by the app on {seen}" if seen else "")
+            a.html(f'<div class="jf-kv"><b>Published</b> {when}</div>')
             a.caption(f"{j.date_source or '—'} · “{(j.pub_date_text or '')[:80]}”")
-            b.html(f'<div class="ub-kv"><b>Location</b> {html.escape(j.location_original or "unknown")}</div>')
+            b.html(f'<div class="jf-kv"><b>Location</b> {html.escape(j.location_original or "unknown")}</div>')
             b.caption(j.location_evidence or "")
             if r:
                 st.markdown(f"**Relevance {r.get('relevance_score', 0):.0f}/100** · {r.get('reasoning_summary', '')}")
@@ -354,8 +362,8 @@ def _cv_and_letter(s, j):
     cvs = [x for x in s.query(CVDocument).filter_by(enabled=True).all() if x.status == "ok"]
     if not cvs:
         return
-    with st.container(border=True):
-        st.html('<div class="ub-section">CV match & cover letter</div>')
+    with st.container(border=True, key="card_letter"):
+        st.html('<div class="jf-section">CV match & cover letter</div>')
         if j.match_json:
             st.dataframe(pd.DataFrame([{"cv": k, "score": x["match_score"], "advice": x["recommendation"],
                                         "missing": ", ".join(x["missing_requirements"]), "not shown in CV": ", ".join(x["not_evidenced"])}
@@ -443,18 +451,18 @@ def settings_profile():
 
 
 def page_settings():
-    shell("Settings", "saved automatically")
+    shell("Settings", "The AI model and your search profile. Every change is saved automatically.", "Preferences")
     t1, t2 = st.tabs(["AI model", "Search profile"])
-    with t1, st.container(border=True):
+    with t1, st.container(border=True, key="card_ai"):
         settings_ai()
-    with t2, st.container(border=True):
+    with t2, st.container(border=True, key="card_profile"):
         settings_profile()
 
 
 # =================================================================== navigation
 RESULTS = st.Page(page_results, title="Results", icon=":material/work:", url_path="results")
-dock()
+brand()
 st.navigation([st.Page(page_search, title="Search", icon=":material/travel_explore:", default=True), RESULTS,
-               st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings")]).run()
+               st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings")], position="top").run()
 for _n, _new, _old in (("config", c, CFG), ("profile", p, PROFILE), ("applicant", ap, APPLICANT)):
     autosave(_n, _new, _old)

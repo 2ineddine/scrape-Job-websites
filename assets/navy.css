@@ -1,0 +1,139 @@
+/* Job Finder - navy website look: navy top bar and page header, white cards, pill buttons, Telegraf type.
+   Fonts and base colours are set in .streamlit/config.toml; this file shapes the page around them. */
+
+:root {
+  --navy-950: #071226;
+  --navy-900: #0B1B33;
+  --navy-800: #12284A;
+  --navy-700: #1B3A6B;
+  --navy-600: #24508C;
+  --blue: #3D7BFF;
+  --blue-soft: #8FB8FF;
+  --ink: #0E1C33;
+  --ink-dim: #5B6B82;
+  --page: #F4F6FA;
+  --card: #FFFFFF;
+  --line: #DCE3EE;
+  --line-soft: #E9EEF6;
+  --green: #1F8A5B;
+  --amber: #B7791F;
+  --red: #C0392B;
+  --nav-h: 64px;
+}
+
+/* icon fonts keep their own family */
+[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] {
+  font-family: "Material Symbols Rounded" !important;
+}
+
+/* ---- top navigation bar (st.navigation(position="top")) */
+header[data-testid="stHeader"] {
+  background: var(--navy-900) !important; height: var(--nav-h); border-bottom: 1px solid rgba(255,255,255,.06);
+  box-shadow: 0 6px 24px rgba(7, 18, 38, .18);
+}
+[data-testid="stDecoration"], footer { display: none !important; }
+[data-testid="stLogo"], [data-testid="stHeaderLogo"] { height: 34px !important; max-width: 220px; }
+[data-testid="stTopNavLink"] {
+  border-radius: 999px !important; padding: 6px 16px !important; margin: 0 2px; transition: background .15s;
+}
+[data-testid="stTopNavLink"], [data-testid="stTopNavLink"] * { color: #D5E0F2 !important; }
+[data-testid="stTopNavLink"] span { font-weight: 400; letter-spacing: .2px; }
+[data-testid="stTopNavLink"]:hover { background: rgba(255,255,255,.08) !important; }
+[data-testid="stTopNavLink"][aria-current="page"], [data-testid="stTopNavLink"].active {
+  background: rgba(61,123,255,.22) !important;
+}
+[data-testid="stTopNavLink"][aria-current="page"] *, [data-testid="stTopNavLink"].active * { color: #FFFFFF !important; }
+[data-testid="stToolbar"] button, [data-testid="stToolbar"] svg, [data-testid="stMainMenu"] * { color: #D5E0F2 !important; fill: #D5E0F2; }
+
+.stApp { background: var(--page); }
+.block-container { padding-top: calc(var(--nav-h) + 26px) !important; padding-bottom: 4rem; max-width: 1240px; }
+
+/* ---- page header: navy band with the page title and the live counters */
+.jf-hero {
+  position: relative; overflow: hidden; border-radius: 22px; padding: 34px 38px 30px; margin: 0 0 22px;
+  background: radial-gradient(120% 140% at 100% 0%, #24508C 0%, rgba(36,80,140,0) 55%),
+              linear-gradient(135deg, var(--navy-800) 0%, var(--navy-900) 60%, var(--navy-950) 100%);
+  color: #FFFFFF; box-shadow: 0 18px 40px rgba(11, 27, 51, .18);
+}
+.jf-hero::after {  /* a quiet grid, like a map of offers */
+  content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .07;
+  background-image: linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px);
+  background-size: 34px 34px; mask-image: linear-gradient(90deg, transparent 30%, #000 100%);
+}
+.jf-eyebrow { font-size: 12px; letter-spacing: 2.4px; text-transform: uppercase; color: var(--blue-soft); margin-bottom: 10px; }
+.jf-hero h1 { color: #FFFFFF !important; font-weight: 800 !important; font-size: 2.6rem !important; line-height: 1.05;
+  letter-spacing: -.8px; margin: 0 0 8px; padding: 0 !important; }
+.jf-hero .jf-lead { font-size: 1.05rem; font-weight: 200; color: #C9D7EE; max-width: 680px; margin: 0; }
+.jf-stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; position: relative; z-index: 1; }
+.jf-stat { min-width: 132px; padding: 10px 16px; border-radius: 14px; background: rgba(255,255,255,.07);
+  border: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(2px); }
+.jf-stat b { display: block; font-size: 1.55rem; font-weight: 800; color: #FFFFFF; line-height: 1.1; }
+.jf-stat span { font-size: 12.5px; color: #AFC2E2; letter-spacing: .2px; }
+.jf-stat.live b { color: var(--blue-soft); }
+
+/* ---- cards: st.container(border=True, key="card_...") */
+[class*="st-key-card_"] {
+  background: var(--card); border: 1px solid var(--line) !important; border-radius: 18px !important;
+  box-shadow: 0 1px 2px rgba(11,27,51,.04), 0 8px 24px rgba(11,27,51,.05); padding: 22px 24px !important;
+}
+h1, h2, h3 { color: var(--ink); letter-spacing: -.4px; }
+h3 { font-size: 1.25rem !important; }
+.jf-section { font-size: 12px; font-weight: 400; color: var(--navy-600); text-transform: uppercase; letter-spacing: 1.8px; margin: 2px 0 8px; }
+
+/* ---- buttons: navy pill for the main action, outlined pills for the others */
+.stButton > button, .stDownloadButton > button, .stLinkButton > a {
+  font-weight: 400 !important; border: 1px solid var(--line) !important; background: var(--card);
+  color: var(--ink) !important; padding-left: 18px !important; padding-right: 18px !important; transition: all .15s;
+}
+.stButton > button:hover, .stDownloadButton > button:hover, .stLinkButton > a:hover {
+  border-color: var(--navy-700) !important; color: var(--navy-700) !important; background: #F7F9FD;
+}
+.stButton > button[kind="primary"], .stButton > button[data-testid="stBaseButton-primary"],
+.stLinkButton > a[kind="primary"], .stLinkButton > a[data-testid="stBaseLinkButton-primary"] {
+  background: var(--navy-700) !important; border-color: var(--navy-700) !important; color: #fff !important;
+  box-shadow: 0 6px 16px rgba(27,58,107,.25);
+}
+.stButton > button[kind="primary"]:hover, .stButton > button[data-testid="stBaseButton-primary"]:hover,
+.stLinkButton > a[kind="primary"]:hover, .stLinkButton > a[data-testid="stBaseLinkButton-primary"]:hover {
+  background: var(--navy-900) !important; border-color: var(--navy-900) !important; color: #fff !important;
+}
+.stButton > button p, .stDownloadButton > button p, .stLinkButton > a p { font-weight: 400 !important; }
+
+/* ---- tabs: an underlined menu */
+[data-testid="stTabs"] [role="tablist"] { gap: 26px; border-bottom: 1px solid var(--line) !important; }
+[data-testid="stTabs"] [role="tab"] { padding: 10px 2px !important; height: auto !important; }
+[data-testid="stTabs"] [role="tab"] p { font-size: 15px; color: var(--ink-dim); }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] p { color: var(--ink); font-weight: 800; }
+[data-baseweb="tab-highlight"] { background: var(--navy-700) !important; height: 3px !important; border-radius: 3px; }
+
+/* ---- metrics as small cards */
+[data-testid="stMetric"] { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 14px 18px; }
+[data-testid="stMetricLabel"] p { color: var(--ink-dim) !important; font-size: 12.5px !important; letter-spacing: .3px; }
+[data-testid="stMetricValue"] { font-weight: 800; color: var(--navy-800); }
+
+/* ---- inputs, progress, expanders, tables */
+[data-testid="stProgress"] [role="progressbar"] > div > div { background: linear-gradient(90deg, var(--navy-700), var(--blue)) !important; }
+[data-testid="stExpander"] details { border-radius: 14px !important; border-color: var(--line) !important; background: var(--card); }
+[data-testid="stExpander"] summary p { font-weight: 400; color: var(--navy-800); }
+[data-testid="stDataFrame"] { border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: var(--card); }
+[data-testid="stFileUploaderDropzone"] { border-radius: 14px; background: #F7F9FD; border: 1.5px dashed #B9C6DC; }
+[data-testid="stAlert"] { border-radius: 14px; }
+
+/* ---- tags */
+.jf-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.jf-chip { font-size: 12.5px; padding: 3px 11px; border-radius: 999px; background: var(--line-soft); color: #33435C; border: 1px solid var(--line); }
+.jf-chip.navy { background: var(--navy-800); color: #FFFFFF; border-color: var(--navy-800); }
+.jf-chip.blue { background: #E6EEFF; color: #1C4FB8; border-color: #C7D8FF; }
+.jf-chip.green { background: #E4F4EC; color: #17694A; border-color: #BFE3D0; }
+.jf-chip.yellow { background: #FBF1DC; color: #8A5A12; border-color: #F0DCAE; }
+.jf-chip.red { background: #FBE6E3; color: #A1291E; border-color: #F2C1BA; }
+.jf-kv { font-size: 14px; color: var(--ink-dim); }
+.jf-kv b { color: var(--ink); font-weight: 800; }
+.jf-empty { text-align: center; padding: 56px 10px; color: var(--ink-dim); background: var(--card); border: 1px dashed var(--line); border-radius: 18px; }
+.jf-empty .jf-big { font-size: 22px; font-weight: 800; color: var(--ink); margin-bottom: 6px; }
+
+/* ---- numbered steps */
+.jf-step { display: flex; align-items: center; gap: 14px; font-size: 1.3rem; font-weight: 800; color: var(--ink); margin: 2px 0 10px; letter-spacing: -.3px; }
+.jf-stepnum { width: 34px; height: 34px; border-radius: 50%; background: var(--line-soft); color: var(--navy-700);
+  display: inline-flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; border: 1px solid var(--line); }
+.jf-stepnum.done { background: var(--navy-700); color: #fff; border-color: var(--navy-700); }

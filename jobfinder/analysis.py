@@ -78,7 +78,7 @@ def build_prompt(job, profile, text, cands, ti):
     wanted = ", ".join(OFFER_TYPES[k] for k in OFFER_TYPES if k in want)
     unwanted = ", ".join(OFFER_TYPES[k] for k in OFFER_TYPES if k not in want) or "nothing"
     return (
-        f"Candidate research profile: {profile['description']}\nTarget topics: {', '.join(profile['keywords'][:40])}\n"
+        f"Candidate research profile: {profile['description']}\nTarget topics: {', '.join(profile['keywords'][:150])}\n"
         "The candidate wants: offers located in FRANCE (or remote and explicitly open to France), published recently; "
         "research / applied-science / machine-learning / deep-learning / vision / audio-speech / signal / robotics work. "
         "Offers may be written in French or English. An offer can be a classic job title or a RESEARCH SUBJECT (the title "
@@ -175,7 +175,10 @@ def analyze_job(s, job: Job, profile, cfg, keys=None):
         flags.append("location_unverified")
     # ---- role and relevance. A title that matches the profile by itself ('Stage - Data Scientist') is never dropped on the
     # AI's word alone: free models slip now and then (the same offer judged right twice, wrong once), so it goes to 'To check'
-    title_match = ti.verdict == "pass"
+    # only a SPECIFIC match protects ('data scientist', 'research engineer', a research topic); one broad word ('IA', 'drone')
+    # matches chatbot project managers and AI transformation consultants, which the model rightly turns down
+    hits = re.findall(r"'([^']+)'", ti.reason) if ti.reason.startswith("title matches") else []
+    title_match = ti.verdict == "pass" and (not hits or any(" " in h or "&" in h for h in hits))
     if res.role_type in ("sales_business", "admin_support"):
         if not title_match:
             return _exclude(s, job, res, f"role: {res.role_type} - {res.reasoning_summary}")
@@ -190,7 +193,10 @@ def analyze_job(s, job: Job, profile, cfg, keys=None):
         flags.append("relevance_needs_review")
     job.relevance_score, job.relevance_json = res.relevance_score, res.model_dump()
     job.review_flags = ",".join(flags)
-    job.status, job.reason = ("review" if flags else "relevant"), res.reasoning_summary
+    # an offer without a publication date is still returned: that alone does not send it to 'To check' (it keeps the flag,
+    # and the app shows the day it was first seen instead)
+    doubts = [x for x in flags if x != "publication_date_unknown"]
+    job.status, job.reason = ("review" if doubts else "relevant"), res.reasoning_summary
     s.commit()
     return res
 

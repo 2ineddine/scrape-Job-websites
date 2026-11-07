@@ -26,7 +26,7 @@ from .config import PRESET_DAYS, PROFILE_DEFAULT, utcnow
 from .dates import NO_DATE, _cfg_day, merge_dates, reconcile_date, refine_raw_date
 from .llm import AIError, RequestTooLarge, call_json
 from .store import SessionLocal
-from .web import PARSER, UA, AccessError, check_url, normalize_url, syntactic_ok
+from .web import PARSER, UA, AccessError, RobotsRefused, browser_guard, check_url, normalize_url, syntactic_ok
 
 # Elements the browser must never click, whatever the AI says (applications, accounts, forms, alerts).
 DENY = re.compile(r"apply|postuler|candidater|sign ?in|log ?in|connexion|se connecter|register|create account|"
@@ -236,14 +236,6 @@ class Capture:
 
 
 # --------------------------------------------------------------------------- browser helpers
-def _guard(route):
-    u = route.request.url
-    if syntactic_ok(u) or u.startswith(("data:", "blob:")):
-        route.continue_()
-    else:
-        route.abort()
-
-
 def _settle(pg, ms=4000):
     try:
         pg.wait_for_load_state("networkidle", timeout=ms)
@@ -267,7 +259,7 @@ def _goto(pg, url, f, cfg):
     if not ok:
         raise AccessError(f"access_restricted: {why}")
     if not f.robots_ok(url):
-        raise AccessError("access_restricted: disallowed by robots.txt")
+        raise RobotsRefused("access_restricted: disallowed by robots.txt")
     f._wait(urlparse(url).hostname)
     pg.goto(url, timeout=cfg["timeout"] * 1000, wait_until="domcontentloaded")
     _settle(pg, 6000)
@@ -440,6 +432,9 @@ def _read_job(pg, url, f, cfg):
     in the browser (timeout) is read with a plain HTTP request instead."""
     try:
         _goto(pg, url, f, cfg)
+    except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
+        f.note(f"browser could not open the job page ({str(e)[:60]}): plain HTTP read")
+        return _parse_detail(f.get(url).text, url)
     except AccessError:
         raise
     except Exception as e:
@@ -502,7 +497,7 @@ def crawl_ai(f, url, cfg, known, st):
     with sync_playwright() as pw, SessionLocal() as s:
         browser = pw.chromium.launch()
         ctx = browser.new_context(user_agent=UA)
-        ctx.route("**/*", _guard)
+        ctx.route("**/*", browser_guard(f))
         pg, dp = ctx.new_page(), ctx.new_page()  # pg = the list, dp = job detail pages
         capture = Capture()
         pg.on("response", capture)
@@ -685,7 +680,7 @@ class Renderer:
                 self.pw = sync_playwright().start()
                 self.br = self.pw.chromium.launch()
                 ctx = self.br.new_context(user_agent=UA)
-                ctx.route("**/*", _guard)
+                ctx.route("**/*", browser_guard(self.f))
                 self.pg = ctx.new_page()
             except Exception as e:
                 self.dead = True

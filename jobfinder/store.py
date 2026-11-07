@@ -162,7 +162,9 @@ def init_db():
 # --------------------------------------------------------------------------- API key file (local, chmod 600)
 ENV_KEYS = {"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
             "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "gemini#2": "GEMINI_API_KEY_2", "groq#2": "GROQ_API_KEY_2",
-            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY"}  # '#2': a second key, its own quota
+            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY",  # '#2': a second key, its own quota
+            # not AI: your France Travail API access (francetravail.io), kept when an AI key is saved from Settings
+            "francetravail_id": "FRANCE_TRAVAIL_CLIENT_ID", "francetravail_secret": "FRANCE_TRAVAIL_CLIENT_SECRET"}
 
 
 def load_keys() -> dict:
@@ -235,6 +237,7 @@ _ATS_DOMAINS = ("myworkdayjobs.com", "smartrecruiters.com", "breezy.hr", "teamta
                 "welcomekit.co", "talent-soft.com")
 _ATS_PATH = {"careers.smartrecruiters.com": 0, "jobs.smartrecruiters.com": 0, "jobs.lever.co": 0, "jobs.ashbyhq.com": 0,
              "apply.workable.com": 0, "careers.werecruit.io": 1}  # host -> position of the company in the path
+_COMPANY_PAGES = ("jobs.stationf.co", "www.welcometothejungle.com", "welcometothejungle.com")  # '/companies/<company>'
 _HOST_PREFIX = {"www", "jobs", "job", "careers", "career", "carrieres", "carriere", "carrieresfrance", "recrutement", "emploi",
                 "emplois", "join", "apply", "talents", "talent", "work", "hiring"}
 
@@ -243,7 +246,11 @@ def company_from_url(url: str) -> str:
     """'recrutement.mitsubishielectric.fr' -> 'Mitsubishielectric'; 'expleo-jobs-fr-fr.icims.com' -> 'Expleo'."""
     host = (urlparse(url).hostname or "").lower()
     parts, seg = host.split("."), [x for x in urlparse(url).path.split("/") if x]
-    if host in _ATS_PATH and len(seg) > _ATS_PATH[host]:
+    board = next((m for m in ("companies", "entreprises") if m in seg[:-1]), None)
+    if board and (host in _COMPANY_PAGES or host.endswith(".hellowork.com")):  # one company's page on a shared site
+        # '/companies/joko-1' -> 'joko', Hellowork '/fr-fr/entreprises/-proxiad--86909.html' -> 'proxiad'
+        name = re.sub(r"(?:-+\d+)?(?:\.html?)?$", "", seg[seg.index(board) + 1]).strip("-") or seg[seg.index(board) + 1]
+    elif host in _ATS_PATH and len(seg) > _ATS_PATH[host]:
         name = seg[_ATS_PATH[host]]
     elif any(host.endswith(d) for d in _ATS_DOMAINS) and len(parts) > 2:
         words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external")]

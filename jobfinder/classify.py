@@ -10,10 +10,12 @@ verdict: pass (clearly wanted) / maybe (the AI reads the description) / reject (
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from functools import lru_cache
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from .web import _wb, norm
+from .web import norm
 
 
 _UI_WORDS = re.compile(r"\s+(?:t[ée]l[ée]charger|download|postuler|apply|partager|share|imprimer|print|voir|see|plus d|"
@@ -48,9 +50,22 @@ def html_location(soup) -> str:
     return " ; ".join(res)[:200]
 
 
-_LOC_LABEL = re.compile(r"(?:(?:localisation|lieu(?: de travail)?|location|ville|city|site|implantation)\s*:|"
-                        r"(?:localisation du poste|lieu du poste|lieu de travail|job locations?|work locations?)\s*[:|]?)"
-                        r"\s*([^\n|;•]{2,60}?)(?=\s{2,}|\s*[|;•\n]|\s+[A-Z][a-zé]+(?:\s+[A-Za-zé]+)?\s*:|\s+Ville\b|$)", re.I)
+# a label starts with a capital ('Lieu du stage :', 'Ville :'): 'mobility location: Evidence from Kunming' in a
+# bibliography is a sentence, not a label
+_LOC_LABEL = re.compile(r"(?:\b(?:Localisation|LOCALISATION|Lieu|LIEU|Location|LOCATION|Ville|VILLE|City|CITY|Site|SITE|"
+                        r"Implantation|Affectation)(?i:\s+(?:de travail|du stage|de stage|de la th[eè]se|du poste|"
+                        r"d'affectation|d'exercice))?\s*:|"
+                        r"(?i:localisation du poste|lieu du poste|lieu de travail|job locations?|work locations?)\s*[:|]?)"
+                        r"\s*[•\-–]?\s*([^\n|;•]{2,120})")
+# a search form's prompt after its label ('Localisation ▼ Veuillez sélectionner une valeur'), not a place
+_FORM_PROMPT = re.compile(r"(?i)^\W*(?:veuillez|s[ée]lectionne|select|choisi|choose|tou(?:te)?s?\b|all\b|any\b|rechercher|search)")
+# where a label's value ends: two spaces, a separator, the next label ('Contrat :'), 'Ville'
+_LABEL_END = re.compile(r"\s{2,}|\s*[|;•\n]|\s+[A-Z][a-zé]+(?:\s+[A-Za-zé]+)?\s*:|\s+Ville\b")
+
+
+def _label_value(v):
+    m = _LABEL_END.search(v, 2)
+    return (v[:m.start()] if m else v)[:80].strip(" .-,")
 _BOILER = re.compile(r"^(error|erreur|404|page not found|page introuvable|not found|mentions legales|politique (?:des|de) "
                      r"(?:cookies|confidentialite)|cookies?|privacy|privacy policy|confidentialite|cgu|conditions generales|"
                      r"contact|contactez-nous|accessibilite|accessibility|plan du site|sitemap|faq|login|log in|sign in|connexion|"
@@ -59,16 +74,101 @@ _BOILER = re.compile(r"^(error|erreur|404|page not found|page introuvable|not fo
 
 
 def is_boilerplate_title(title) -> bool:
-    """'Mentions légales', 'Error', 'Politique des cookies'...: a site page, not an offer."""
+    """'Mentions légales', 'Error', 'Politique des cookies'...: a site page, not an offer. '<<INTERNAL JOB DESCRIPTION>>':
+    a template's placeholder, not a title."""
     t = norm(title or "").strip(" -:|")
-    return bool(_BOILER.match(t)) or not re.search(r"[a-z]{2}", t)  # '<': no words, no offer
+    return bool(_BOILER.match(t)) or not re.search(r"[a-z]{2}", t) or bool(re.search(r"<<|>>|\{\{|\}\}", t))
 
 
-def location_from_text(text) -> str:
+_DATE_LIKE = re.compile(r"(?i)^\W*(?:(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|"
+                        r"friday|saturday|sunday)\b|\d{1,2}(?:er)?\s+(?:janv|f[ée]vr|mars|avr|mai|juin|juil|ao[uû]t|sept?|oct|"
+                        r"nov|d[ée]c|jan|feb|apr|may|jun|jul|aug|dec)\w*\.?,?\s+\d{4}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b|\d{4}-\d{2}-\d{2})")
+
+
+def looks_like_date(text) -> bool:
+    """'Jeudi, 5 novembre, 2026 - Vendredi...' written in a location field: a date, not a place."""
+    return bool(_DATE_LIKE.search(text or ""))
+
+
+_KINDS = {"internship": r"internships?|stages?|stagiaires?|interns?", "phd": r"ph\s?ds?|th[eè]ses?|thesis|doctora\w*",
+          "postdoc": r"post\s?docs?|postdoctora\w*", "apprentice": r"apprentice\w*|apprenti\w*|alternances?|vie"}
+_KIND_FILLER = set("""open opened available current new our nos les des de du la le et and or ou for pour of in en a au aux the
+position positions poste postes job jobs emploi emplois offer offers offre offres vacancy vacancies opportunity
+opportunities opening openings sujet sujets proposal proposals proposition propositions recrutement recruitment master m1 m2
+research recherche call appel candidature candidatures application applications""".split())
+
+
+def offer_kinds_heading(title) -> bool:
+    """'Postdoc, PhD or Master 2', 'Apprenticeships, internships, thesis and VIE', 'Open positions for 2026
+    internships/PhDs': a page about offers, not one offer: only kinds of offers, several of them or in the plural, and no
+    subject. 'PhD position' or 'Stage M2' alone may be one offer and stay."""
+    t = norm(title or "")
+    words = re.findall(r"[a-z0-9]+", t.replace("ph.d", "phd").replace("post-doc", "postdoc"))
+    kind_rx = re.compile(r"^(?:" + "|".join(_KINDS.values()) + r")$")
+    if not words or any(not (kind_rx.match(w) or w in _KIND_FILLER or w.isdigit()) for w in words):
+        return False
+    kinds = {k for k, rx in _KINDS.items() if any(re.fullmatch(rx, w) for w in words)}
+    plural = any(w in {"positions", "offers", "offres", "postes", "jobs", "emplois", "vacancies", "opportunities", "openings",
+                       "internships", "stages", "theses", "phds", "postdocs", "sujets", "propositions"} for w in words)
+    return len(kinds) >= 2 or (plural and bool(kinds))
+
+
+_PLACE = r"[A-ZÀ-Ý][\wÀ-ÿ'’-]*(?:[ -](?:sur|sous|en|le|la|les|de|du|des|d'|l'|lès|lez|aux|[A-ZÀ-Ý][\wÀ-ÿ'’-]*)){0,5}"
+# the place of an offer written without a label: an icon name kept as text ('location_on Lyon'), 'notre agence de Lille',
+# 'poste basé à Toulouse', 'based in Paris', 'Centre Toulouse', 'une équipe sur Bordeaux', or the place written after the
+# title's gender mark ('(H/F) à Lyon', 'F/H Paris'). Every candidate must be a place of the official list (or a known
+# foreign one): 'sur Python', 'à Data' name nothing.
+_LOC_CUE = re.compile(r"(?:\b(?:location_on|pin_drop)\s+|"
+                      r"(?i:\b(?:agence|bureaux?|locaux|si[eè]ge|campus|implantation|centre de recherche)s?\s+(?:de|d'|du|des|à|a)\s*)|"
+                      r"(?i:\b(?:bas[ée]e?s?|situ[ée]e?s?|localis[ée]e?s?|implant[ée]e?s?)\s+(?:à|a|au|sur|dans)\s+(?:la\s+r[ée]gion\s+(?:de\s+)?)?)|"
+                      r"(?i:\b(?:based|located|location)\s+(?:in|at)\s+)|"
+                      r"(?i:\bcentre\s+(?:de\s+|d')?)|(?<![\w'])(?:à|au|sur)\s+|"
+                      r"\b[HFMW]\s*/\s*[HFMWXD](?:\s*/\s*[HFMWXDN])?\s*\)?\s*(?:[-–—|,]\s*|(?:à|a)\s+)?)"
+                      r"(" + _PLACE + ")")
+# a French postcode before its town ('Campus Pasteur 28 avenue Valombrose 06107 Nice'), and the country, region and town of
+# a breadcrumb ('CDI / FRANCE Occitanie / Montpellier')
+_POSTCODE_PLACE = re.compile(r"\b(?:F-)?(?:0[1-9]|[1-8]\d|9[0-5]|97)\d{3}\s+(" + _PLACE + ")")
+_FR_TRAIL = re.compile(r"\b(?:FRANCE|France)\s*[/>|,–-]?\s*(" + _PLACE + r")(?:\s*[/>|,–-]\s*(" + _PLACE + "))?")
+# a French street address with its postcode ('11 boulevard d'Alembert, 78280')
+_FR_STREET = re.compile(r"(?i)\b(?:rue|avenue|boulevard|bd|all[ée]e|chemin|impasse|quai|place|route|cours|square|esplanade|"
+                        r"parvis)\b[^,;\n]{1,60}[,\s]\s*(?:F-)?(?:0[1-9]|[1-8]\d|9[0-5]|97)\d{3}\b")
+
+
+def location_from_text(text, title="") -> str:
     """'Localisation : Rueil-Malmaison (92)' / 'Localisation du poste France, Occitanie, Gard (30)' written in a job
-    text. A search form can also say 'Localisation ...': a value that names a real place is preferred."""
-    found = [m.group(1).strip(" .-,") for m in _LOC_LABEL.finditer(str(text or "")[:8000])]
-    return next((x for x in found if classify_location(x)["location_verified"]), found[0] if found else "")
+    text. A search form can also say 'Localisation ...': a value that names a real place is preferred. Without a label,
+    a place written after a cue ('location_on Lyon', 'notre agence de Lille', '(H/F) à Lyon') counts only when it is a real
+    French place of the official list (or a known foreign place), in the first lines of the text (not in 'other offers')."""
+    t = str(text or "")[:8000]
+    found = [v for v in (_label_value(m.group(1)) for m in _LOC_LABEL.finditer(t)) if not _FORM_PROMPT.search(v)]
+    verified = next((x for x in found if classify_location(x)["location_verified"]), "")
+    if verified:
+        return verified
+    head = t[:3000]
+    for m in _LOC_CUE.finditer(head):
+        place = fr_place(m.group(1))
+        if place:
+            return place
+        if classify_location(m.group(1))["location_verified"]:  # 'based in London', 'location in France Dans un...'
+            return "France" if _FR_MARK_RX.match(norm(m.group(1))) else m.group(1).strip(" .-,")
+    for rx in (_POSTCODE_PLACE, _FR_TRAIL):  # '06107 Nice', 'CDI / FRANCE Occitanie / Montpellier'
+        for m in rx.finditer(head):
+            place = fr_place(" ".join(x for x in m.groups() if x))
+            if place:
+                return place
+    for m in _LOC_CUE.finditer(title or ""):  # 'Formateur à Saint Avertin (Tours) : animation d'un atelier'
+        place = fr_place(m.group(1))
+        if place:
+            return place
+    words = re.findall(r"\w+", clean_title(title)) if title else []
+    if words:  # the offer's title followed by its town at the top of its page ('SOFTWARE CRAFTSMAN Paris Il y a 7 jours')
+        after = re.compile(r"\W+".join(map(re.escape, words)) + r"\W{0,4}(?:[HFMW]\s*/\s*[HFMWXD](?:\s*/\s*\w{1,2})?\W{0,3})?(" +
+                           _PLACE + ")", re.I)
+        for m in after.finditer(t[:1500]):
+            place = fr_place(m.group(1))
+            if place:
+                return place
+    return next((fr_place(x) for x in found if fr_place(x)), "") or (found[0] if found else "")
 
 
 # --------------------------------------------------------------------------- location (France)
@@ -88,7 +188,16 @@ FR_PLACES = ["paris", "ile-de-france", "ile de france", "idf", "lyon", "toulouse
              "niort", "vannes", "lorient", "saint-nazaire", "la ciotat", "aubagne", "istres", "vernon", "chartres",
              "troyes", "belfort", "sochaux", "villeurbanne", "ecully", "saint-priest", "venissieux", "pessac", "talence",
              "hauts-de-france", "nouvelle-aquitaine", "provence-alpes-cote d'azur", "paca", "pays de la loire",
-             "centre-val de loire", "bourgogne-franche-comte"]
+             "centre-val de loire", "bourgogne-franche-comte",
+             # research and higher-education sites written as the place of an offer ('Dauphine - PSL', 'AgroParisTech')
+             "psl", "dauphine", "agroparistech", "sorbonne", "jussieu", "centralesupelec", "ensae", "ensta", "upsaclay",
+             "sciences po", "mines paristech", "telecom sudparis", "telecom paristech", "institut pasteur", "institut curie",
+             "ens ulm", "ens paris-saclay", "universite paris cite", "universite paris-saclay",
+             "ecole nationale des ponts et chaussees", "ecole des ponts", "enpc",
+             # French national research institutes written as the place ('INRAE', 'CNRS'): their sites abroad are named
+             # with their country ('Inria Chile'), which is checked first
+             "cnrs", "inria", "inrae", "inserm", "onera", "cea", "cnes", "ifremer", "ird", "brgm", "ineris", "ifpen",
+             "roissy", "roissy charles de gaulle", "aeroport charles de gaulle", "paris cdg", "paris-charles de gaulle"]
 FR_MARKERS = ["france", "french republic", "republique francaise"]
 OTHER_PLACES = ["united kingdom", "uk", "gb", "gbr", "great britain", "england", "scotland", "wales", "london", "germany",
                 "deutschland", "berlin", "munich", "united states", "usa", "us", "new york", "san francisco", "seattle",
@@ -105,18 +214,143 @@ OTHER_PLACES = ["united kingdom", "uk", "gb", "gbr", "great britain", "england",
                 "saudi arabia", "allemagne", "royaume-uni", "royaume uni", "espagne", "italie", "belgique", "suisse",
                 "pays-bas", "pays bas", "etats-unis", "etats unis", "inde", "chine", "pologne", "roumanie", "irlande",
                 "suede", "danemark", "norvege", "autriche", "japon", "singapour", "bresil", "mexique"]
+# every other country (English and French names, a few local ones), states and large cities: 'Riga, Latvia', 'Montevideo,
+# Uruguay', 'Pristina, Kosovo' are outside France, not 'unknown'. ('maurice' is left out: 'Saint-Maurice' is in France.)
+OTHER_PLACES += [w.strip() for w in """afghanistan, albania, andorra, angola, armenia, azerbaijan, bahrain, bangladesh, belarus, bhutan, bolivia,
+bosnia, botswana, brunei, burkina faso, burundi, cambodia, cameroon, cape verde, chad, comoros, congo,
+costa rica, cuba, cyprus, czechia, djibouti, dominican republic, ecuador, el salvador, estonia, eswatini,
+ethiopia, fiji, gabon, gambia, georgia, ghana, guatemala, guinea, guyana, haiti, honduras, hong kong, iceland,
+iran, iraq, ivory coast, jamaica, jordan, kazakhstan, kenya, kosovo, kuwait, kyrgyzstan, laos, latvia, lebanon,
+liberia, libya, liechtenstein, lithuania, macau, madagascar, malawi, maldives, mali, malta, mauritania,
+mauritius, moldova, monaco, mongolia, montenegro, mozambique, myanmar, namibia, nepal, new zealand, nicaragua,
+niger, nigeria, north macedonia, macedonia, oman, pakistan, panama, papua, paraguay, puerto rico, russia, rwanda,
+senegal, sierra leone, slovenia, somalia, south korea, sri lanka, sudan, suriname, syria, taiwan, tajikistan,
+tanzania, togo, trinidad, turkiye, turkmenistan, uganda, united arab emirates, uruguay, uzbekistan, venezuela,
+viet nam, yemen, zambia, zimbabwe, northern ireland, albanie, andorre, arabie saoudite, argentine, armenie,
+australie, azerbaidjan, bahrein, bielorussie, birmanie, bolivie, bosnie, cambodge, cameroun, cap vert, chili,
+chypre, colombie, comores, coree, cote d'ivoire, croatie, egypte, emirats arabes, equateur, estonie, ethiopie,
+finlande, georgie, grece, guinee, hongrie, indonesie, irak, islande, israel, jamaique, jordanie, koweit,
+lettonie, liban, libye, lituanie, malaisie, malte, ile maurice, mauritanie, moldavie, mongolie, nouvelle-zelande,
+ouganda, ouzbekistan, perou, republique tcheque, tchequie, russie, serbie, slovaquie, slovenie, somalie, soudan,
+syrie, tanzanie, tchad, thailande, ukraine, polska, espana, italia, nederland, belgie, schweiz, osterreich,
+sverige, norge, danmark, suomi, magyarorszag, ceska, slovensko, hellas, california, massachusetts, new jersey,
+pennsylvania, illinois, michigan, ohio, virginia, north carolina, florida, colorado, oregon, arizona, utah,
+minnesota, maryland, connecticut, wisconsin, indiana, tennessee, missouri, ontario, quebec, british columbia,
+alberta, karnataka, maharashtra, telangana, tamil nadu, haryana, uttar pradesh, kerala, gujarat, guangdong,
+bavaria, bayern, new orleans, washington, vancouver, ottawa, calgary, waterloo, boston, chicago, austin, denver,
+atlanta, dallas, houston, miami, los angeles, san diego, san jose, santa clara, sunnyvale, mountain view,
+palo alto, redmond, cupertino, menlo park, pittsburgh, philadelphia, detroit, phoenix, raleigh, minneapolis,
+baltimore, frankfurt, francfort, hamburg, hambourg, koln, stuttgart, dusseldorf, dresden, leipzig, hannover,
+nuremberg, nurnberg, bremen, karlsruhe, aachen, heidelberg, mannheim, bonn, essen, dortmund, rotterdam,
+eindhoven, utrecht, the hague, delft, antwerp, anvers, ghent, gand, liege, namur, charleroi, leuven, louvain,
+basel, bale, bern, lugano, luzern, zug, winterthur, graz, linz, salzburg, innsbruck, milano, rome, roma, turin,
+torino, naples, napoli, bologna, genoa, venice, venezia, padova, pisa, trieste, seville, sevilla, valencia,
+malaga, bilbao, zaragoza, edinburgh, glasgow, manchester, birmingham, bristol, leeds, oxford, cambridge, belfast,
+cardiff, riga, tallinn, vilnius, kyiv, kiev, minsk, belgrade, zagreb, ljubljana, bratislava, sofia, athens,
+athenes, nicosia, valletta, reykjavik, oslo, copenhagen, copenhague, gothenburg, malmo, aarhus, tampere, espoo,
+krakow, cracovie, wroclaw, gdansk, poznan, lodz, brno, ostrava, cluj, timisoara, iasi, braga, coimbra, haifa,
+jerusalem, herzliya, riyadh, jeddah, doha, abu dhabi, manama, muscat, amman, beirut, ankara, izmir, osaka, kyoto,
+yokohama, busan, shenzhen, guangzhou, hangzhou, chengdu, wuhan, nanjing, suzhou, taipei, hsinchu, melbourne,
+brisbane, adelaide, auckland, wellington, mumbai, delhi, new delhi, noida, gurgaon, gurugram, kolkata, ahmedabad,
+kochi, coimbatore, karachi, lahore, dhaka, colombo, kathmandu, cebu, kuala lumpur, penang, jakarta, ho chi minh,
+hanoi, bangkok, marrakech, tanger, sfax, sousse, alger, algiers, oran, dakar, abidjan, lagos, nairobi, accra,
+kigali, johannesburg, cape town, cairo, le caire, montevideo, buenos aires, sao paulo, rio de janeiro, santiago,
+bogota, lima, mexico city, londres, barcelone, edimbourg, varsovie, moscou, pekin, bombay, nouvelle-delhi, florence, bellevue, erlangen, karlstein, karlstein am main, offenbach, lingen,
+berne, venise""".split(",")]
 _FR_DEPT = re.compile(r"\((?:0[1-9]|[1-8]\d|9[0-5]|2a|2b|97[1-6])\)")  # 'Rueil-Malmaison (92)': French department number
 
 
+def _words_rx(words):
+    """One compiled pattern for a list of places (whole words): hundreds of separate searches would overflow re's cache."""
+    alts = sorted({re.escape(w) for w in words}, key=len, reverse=True)
+    return re.compile(r"(?<![a-z0-9])(?:" + "|".join(alts) + r")(?![a-z0-9])")
+
+
+_FR_MARK_RX, _OTHER_RX, _FR_RX = _words_rx(FR_MARKERS + ["fr", "fra"]), _words_rx(OTHER_PLACES), _words_rx(FR_PLACES)
+_PLACES_FILE = Path(__file__).with_name("data") / "fr_places.txt"
+
+
+_ABBREV = {"lez": "les", "st": "saint", "ste": "sainte"}
+
+
+def _place_key(s: str) -> str:
+    """'St-Paul-lez-Durance' = 'saint paul les durance' = the official 'Saint-Paul-lès-Durance'."""
+    k = re.sub(r"\s+", " ", re.sub(r"[-_.]", " ", norm(s))).strip()
+    return re.sub(r"(?<![a-z0-9'])(lez|st|ste)(?![a-z0-9'])", lambda m: _ABBREV[m[1]], k)
+
+
+@lru_cache(maxsize=1)
+def _fr_gazetteer():
+    """{key: official name} of the French communes, departments and regions (data/fr_places.txt), and the names of several
+    words by their first word (for the one-typo match)."""
+    names = {}
+    try:
+        with _PLACES_FILE.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() and not line.startswith("#"):
+                    names.setdefault(_place_key(line), line.strip())
+    except OSError:  # the list is missing: the hand-written places above still work
+        pass
+    by_first = {}
+    for k in names:
+        if " " in k:
+            by_first.setdefault(k.split(" ", 1)[0], []).append(k)
+    return names, by_first
+
+
+_NO_PREFIX = {"vienne", "orange", "bologne", "bruges", "cologne", "montreal", "montreux", "treves", "venise", "fribourg",
+              "martigny", "ardennes", "centre", "remote", "sainte", "grande", "petite", "chateau", "vallee", "plaine", "region",
+              "campus", "france", "nouvelle", "saint martin", "saint pierre"}
+
+
+@lru_cache(maxsize=8192)
+def fr_place(text) -> str:
+    """The official name of the French commune / department / region a short location text names ('' if none). Hyphens,
+    accents and case do not matter ('Gif sur Yvette', 'SAINT-PAUL-LES-DURANCE'); one wrong letter is forgiven in a name of
+    several words ('GIF SUY YVETTE'). The longest name wins: 'Saint-Paul-lès-Durance' rather than 'Saint-Paul'."""
+    names, by_first = _fr_gazetteer()
+    toks = re.findall(r"[a-z0-9']+", _place_key(text or ""))
+    best = ""
+    for i in range(len(toks)):
+        for j in range(min(len(toks), i + 8), i, -1):
+            cand = " ".join(toks[i:j])
+            if cand in names:
+                best = max(best, cand, key=len)
+                break
+    if best:
+        return names[best]
+    for i, t in enumerate(toks):
+        for k in by_first.get(t, ()):
+            n = k.count(" ") + 1
+            cand = " ".join(toks[i:i + n])
+            if len(cand) >= 10 and len(toks) - i >= n and SequenceMatcher(None, cand, k).ratio() >= 0.92:
+                return names[k]
+    # the start of a commune's name, written alone ('Montbonnot' for Montbonnot-Saint-Martin, 'Le Chesnay' for
+    # Le Chesnay-Rocquencourt). Never a foreign town written in French, a generic word or a short word.
+    key = " ".join(toks)
+    if toks and len(toks) <= 3 and len(key.replace(" ", "")) >= 6 and key not in _NO_PREFIX and not _OTHER_RX.search(key):
+        longer = [k for k in by_first.get(toks[0], ()) if k.startswith(key + " ")]
+        if len(longer) == 1:
+            return names[longer[0]]
+        if longer:  # 'BONNEVILLE', 'Champagne': French, but which commune is not known: the text itself
+            return " ".join(w.capitalize() for w in key.split())
+    return ""
+
+
 def _part_country(p: str):
-    if any(_wb(w, p) for w in FR_MARKERS) or _wb("fr", p) or _wb("fra", p):
+    if _FR_MARK_RX.search(p):
         return "FR"
-    if any(_wb(w, p) for w in OTHER_PLACES):
+    place = fr_place(p)
+    # a French name of several words is checked first: 'Porto-Vecchio' and 'Saint-Maurice' contain a foreign word
+    rest = _place_key(p).replace(_place_key(place), " ") if place and " " in _place_key(place) else p
+    if _OTHER_RX.search(rest) or _OTHER_RX.search(rest.replace(" ", "-")):
         return "OTHER"
-    m = re.search(r",\s*([a-z]{2})\s*$", p)  # "City, XX" with a foreign ISO country / state code
+    if _FR_STREET.search(p):
+        return "FR"
+    m = re.search(r",\s*([a-z]{2})\s*$", rest)  # "City, XX" with a foreign ISO country / state code
     if m and m[1] not in ("fr", "eu"):
         return "OTHER"
-    if any(_wb(w, p) for w in FR_PLACES) or _FR_DEPT.search(p):
+    if _FR_RX.search(p) or _FR_DEPT.search(p) or place:
         return "FR"
     return None
 
@@ -164,7 +398,7 @@ def _kw(k: str, t: str) -> bool:  # whole-word match, tolerant to plurals
 
 
 # ---- 1. cleaning: what is not part of the title itself
-_GENDER = re.compile(r"\s*[(\[]?\s*\b(?:[hfmwdx]\s*/\s*[hfmwdx](?:\s*/\s*[hfmwdxn])?|homme\s*/\s*femme|femme\s*/\s*homme|"
+_GENDER = re.compile(r"\s*[(\[]?\s*\b(?:[hfmwdx]\s*/\s*[hfmwdx](?:\s*/\s*(?:nb|[hfmwdxn]))?|homme\s*/\s*femme|femme\s*/\s*homme|"
                      r"all genders?|tous genres)\b\s*[)\]]?", re.I)
 _INCLUSIVE = re.compile(r"(?<=[a-zé])(?:\(e\)|\(ne\)|\(se\)|[·.]e\b|[·.]ne\b|[·.]se\b|·rice\b)", re.I)  # Ingénieur(e), chercheur·se
 _REF_LEAD = re.compile(r"^\s*(?:r[ée]f\.?\s*:?\s*)?(?=[\w-]*\d)[A-Z0-9][\w-]{2,}\s*[-–—:|]\s+")  # '2026-460 - ', 'REQ123 | '
@@ -346,7 +580,12 @@ _NON_RESEARCH = ("sales", "pre sales", "presales", "account manager", "account e
                  "assistante ressources humaines", "charge de ressources humaines", "chargee de ressources humaines",
                  "gestionnaire de paie", "gestionnaire paie", "juriste", "assistant juridique", "assistante juridique",
                  "charge de contrats", "chargee de contrats", "gestionnaire administratif", "gestionnaire administrative",
-                 "charge de communication", "chargee de communication", "chef de projet marketing", "commercial terrain")
+                 "charge de communication", "chargee de communication", "chef de projet marketing", "commercial terrain",
+                 # startup business roles, whatever their AI flavour ('Bras droit du CEO - Legaltech IA'); 'SDR / chargé de
+                 # prospection' is a sales rep, while 'SDR' alone stays Software-Defined Radio ('CSM' is left out: it is also
+                 # a 'Cyber Security Manager')
+                 "prospection", "sales development", "bras droit", "founders associate", "founder associate",
+                 "chief of staff", "product designer", "ux designer", "ui designer", "ux ui designer", "customer success")
 GENERIC_TECH = ("engineer", "ingenieur", "scientist", "scientifique", "chercheur", "researcher", "research",
                 "recherche", "r&d", "data", "developer", "developpeur", "analyst", "architect", "model", "models",
                 "modele", "modeles", "deploy", "deploying", "deployment", "deploiement", "inference", "pipeline",

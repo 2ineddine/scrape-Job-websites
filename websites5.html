@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Open Multiple Tabs</title>
+</head>
+<body>
+    <script>
+        // Add your URLs here
+        const urls = [
+            // STATION F startups in AI, robotics, vision and data, on the STATION F job board
+            'https://jobs.stationf.co/companies/neurobus',
+            'https://jobs.stationf.co/companies/scortex',
+            'https://jobs.stationf.co/companies/incepto-medical',
+            'https://jobs.stationf.co/companies/symbiose-management',
+            'https://jobs.stationf.co/companies/carbonfarm-technology',
+            'https://jobs.stationf.co/companies/ooak-data',
+            'https://jobs.stationf.co/companies/kickmaker',
+            'https://jobs.stationf.co/companies/revolt-eco',
+            'https://jobs.stationf.co/companies/allphins',
+            'https://jobs.stationf.co/companies/beamy',
+            'https://jobs.stationf.co/companies/mayday',
+            'https://jobs.stationf.co/companies/sekoia',
+            'https://jobs.stationf.co/companies/craft-ai',
+            'https://jobs.stationf.co/companies/matcha',
+            'https://jobs.stationf.co/companies/cocoparks',
+            'https://jobs.stationf.co/companies/joko-1',
+            'https://jobs.stationf.co/companies/fabriq',
+            'https://jobs.stationf.co/companies/sakana-research',
+            'https://jobs.stationf.co/companies/thunder-code',
+            'https://jobs.stationf.co/companies/mindflow',
+            'https://jobs.stationf.co/companies/rippletide',
+            'https://jobs.stationf.co/companies/rainpath',
+            'https://jobs.stationf.co/companies/oguste',
+            'https://jobs.stationf.co/companies/faber-ai',
+
+            // STATION F Future 40 alumni, on their own career pages
+            'https://www.raidium.eu/careers/',
+            'https://jobs.ashbyhq.com/arago',
+            'https://www.genesis.ai/careers',
+            'https://www.qevlar.com/careers',
+            'https://www.neuralk.ai/careers',
+            'https://www.biolevate.com/pages/careers',
+            'https://apply.workable.com/giskard/'
+
+
+        ];
+
+        // Open each URL in a new tab
+        urls.forEach(url => {
+            window.open(url, '_blank');
+        });
+
+        // Close the original blank tab (optional)
+        window.close();
+    </script>
+</body>
+</html>

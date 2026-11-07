@@ -71,3 +71,17 @@ def test_location_from_text_and_french_codes():
     assert classify_location("FR-33-Merignac")["france_eligible"] and classify_location("FR-33-Merignac")["city"] == "Merignac"
     assert classify_location("Geneva, Switzerland")["location_verified"] and not classify_location("Geneva")["france_eligible"]
     assert classify_location("Casablanca, Maroc")["location_verified"] and not classify_location("Casablanca, Maroc")["france_eligible"]
+
+
+def test_startup_business_roles_with_an_ai_word_are_not_research_offers():
+    from jobfinder.classify import analyze_title
+    from jobfinder.config import PROFILE_DEFAULT
+    p = {**PROFILE_DEFAULT, "offer_types": ["job", "internship", "apprenticeship", "phd_postdoc"]}
+    for t in ("SDR / chargé de prospection - Campus Paris", "Bras droit du CEO (F/H) - Stage 6 mois - Legaltech IA",
+              "Founders Associate Intern (Product) [January 2027]", "PMO IA / Chief of Staff",
+              "Freelance Product Designer — Human review interfaces for AI agents", "STAGE - UX/UI Designer"):
+        assert analyze_title(t, "", p, "").verdict == "reject", t
+    for t in ("Ingénieur SDR radio logicielle", "Stage - Traitement du signal SDR pour la 5G",  # Software-Defined Radio
+              "AI Engineer - Stage - Janvier 2027", "Machine Learning & Computer Vision Platform Engineer"):
+        assert analyze_title(t, "", p, "").verdict == "pass", t
+    assert analyze_title("Ingénieur Cyber Sécurité Manager (CSM)", "", p, "").verdict != "reject"

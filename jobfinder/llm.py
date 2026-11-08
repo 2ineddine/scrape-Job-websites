@@ -44,7 +44,7 @@ class RequestTooLarge(AIError):
     """The prompt is over what the model / the free plan accepts in one request: waiting does not help, a shorter one does."""
 
 
-PAID = {"openai", "openrouter", "anthropic", "gemini", "groq", "xai", "cohere"}  # hosted: need a key, have quotas / may bill
+PAID = {"openai", "openrouter", "anthropic", "gemini", "groq", "xai", "cohere", "nvidia"}  # hosted: need a key, have quotas / may bill
 USAGE = {"calls": 0, "cache_hits": 0, "in": 0, "out": 0, "model": ""}
 _USAGE_LOCK = threading.Lock()  # websites are read in parallel
 
@@ -137,13 +137,15 @@ def chat(provider, model, system, user, cfg, keys=None):
     if provider == "ollama":
         d = post(f"{base}/api/chat", {}, {"model": model, "messages": msgs, "stream": False, "format": "json"})
         return d["message"]["content"], d.get("prompt_eval_count", 0), d.get("eval_count", 0)
-    if provider in ("openai", "openrouter", "groq", "xai", "cohere"):
+    if provider in ("openai", "openrouter", "groq", "xai", "cohere", "nvidia"):
         # an explicit answer length: without it Groq counts 2048 output tokens and refuses on its output-per-minute limit
         d = post(f"{base}/chat/completions", {"Authorization": f"Bearer {key}"},
                   {"model": model, "messages": msgs, "response_format": {"type": "json_object"},
                    "max_tokens": _OUT_CAP.get((provider, model), 1500),
                    # OpenRouter: a reasoning model can spend the whole answer length thinking and answer nothing
-                   **({"reasoning": {"enabled": False}} if provider == "openrouter" else {})}, cap_key=(provider, model))
+                   **({"reasoning": {"enabled": False}} if provider == "openrouter" else {}),
+                   # NVIDIA's Nemotron models think by default and fill the whole answer length with it
+                   **({"chat_template_kwargs": {"enable_thinking": False}} if provider == "nvidia" else {})}, cap_key=(provider, model))
         u = d.get("usage", {})
         text = d["choices"][0]["message"].get("content")
         if not text:
@@ -168,10 +170,14 @@ _NOT_CHAT = re.compile(r"embed|whisper|tts|dall-e|moderation|transcri|image|audi
                        r"robotics|computer-use|deep-research|antigravity|veo|imagen|aqa|learnlm|omni|argon|allam|"
                        r"customtools|speech|vision-preview|gemma", re.I)  # gemma on the Gemini API cannot answer in JSON
 # models checked on the app's four AI tasks (offer analysis, date choice, lab-page reading, browser navigation)
-VERIFIED = {"groq": ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"],
-            "gemini": ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash"],
-            "openrouter": ["nvidia/nemotron-3.5-super-vl:free", "dots-studio/dots-3-note-preview:free"],  # analysis and lab pages only
-            "cohere": ["command-a-03-2025", "command-r-plus-08-2024", "command-r-08-2024"]}  # analysis and lab pages only
+VERIFIED = {"groq": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
+            "gemini": ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+            "openrouter": ["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-super-vl:free",
+                           "dots-studio/dots-3-note-preview:free", "nvidia/nemotron-3.5-lightning:free"],
+            "cohere": ["command-a-reasoning-08-2025", "command-a-03-2025", "command-r-plus-08-2024", "command-r-08-2024"],
+            # offer analysis checked (November 2026); thinking turned off on NVIDIA
+            "nvidia": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b",
+                       "nvidia/nemotron-3.5-lightning-30b-a3b"]}
 
 
 def list_models(provider, cfg, keys=None):
@@ -248,13 +254,20 @@ def _soften(schema, data):
 
 
 # THE RULE: start with the most capable model; when a limit is reached, the next one takes over (same provider or another),
-# and the better model is used again as soon as its limit has passed. A provider without a key is skipped.
-# Cohere's limit is monthly, so it comes after the models whose limit returns every day.
-LADDER = [("gemini", "gemini-3.5-flash"), ("groq", "openai/gpt-oss-120b"), ("gemini", "gemini-2.5-flash"),
-          ("openrouter", "nvidia/nemotron-3.5-super-vl:free"), ("cohere", "command-a-03-2025"),
-          ("cohere", "command-r-plus-08-2024"), ("groq", "qwen/qwen3.8-27b"),
-          ("gemini", "gemini-3.1-flash-lite"), ("openrouter", "dots-studio/dots-3-note-preview:free"),
-          ("cohere", "command-r-08-2024"), ("groq", "openai/gpt-oss-20b"),
+# and the better model is used again as soon as its limit has passed. A provider without a key is skipped; a second key
+# ('gemini#2', 'groq#2') gives the same model its own quota. Ranked by general capability, checked on the app's offer analysis
+# (November 2026). Left out: Gemini 3.7 / 3.8 Flash (time out), Gemini Pro models (no free quota), Cohere Command A Plus
+# (no valid JSON answer), NVIDIA's gpt-oss-120b (retired); SambaNova and Ollama Cloud need credits.
+LADDER = [("gemini", "gemini-3.6-flash"), ("gemini", "gemini-3.5-flash"),
+          ("groq", "openai/gpt-oss-120b"),
+          ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"), ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+          ("cohere", "command-a-reasoning-08-2025"),
+          ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"), ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
+          ("gemini", "gemini-2.5-flash"), ("cohere", "command-a-03-2025"), ("groq", "qwen/qwen3.8-27b"),
+          ("openrouter", "dots-studio/dots-3-note-preview:free"), ("gemini", "gemini-3.5-flash-lite"),
+          ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"), ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
+          ("cohere", "command-r-plus-08-2024"), ("gemini", "gemini-3.1-flash-lite"), ("groq", "openai/gpt-oss-20b"),
+          ("cohere", "command-r-08-2024"),
           ("xai", "grok-4.3")]  # billed per use: last, so that credits are spent only when every free quota has run out
 
 

@@ -42,6 +42,8 @@ prog = _launch()
 with SessionLocal() as _s:
     CFG, PROFILE, APPLICANT = (get_setting(_s, "config", CONFIG_DEFAULT), get_setting(_s, "profile", PROFILE_DEFAULT),
                                get_setting(_s, "applicant", APPLICANT_DEFAULT))
+    # providers added to the app since these settings were saved (NVIDIA): known without re-saving the settings
+    CFG = {**CFG, "providers": {**CONFIG_DEFAULT["providers"], **(CFG.get("providers") or {})}}
     PROFILE, _upgraded = upgrade_profile(PROFILE)  # keywords added to the defaults since this profile was saved
     if _upgraded:
         set_setting(_s, "profile", PROFILE)
@@ -412,7 +414,7 @@ def settings_ai():
     models = st.session_state.setdefault("models", {})
     a, b = st.columns([1, 2], vertical_alignment="bottom")
     prov = a.selectbox("Provider", provs, index=provs.index(CFG["model"]["provider"]) if CFG["model"]["provider"] in provs else 0,
-                       format_func=lambda x: {"ollama": "ollama (local, free)", "openrouter": "Open Router", "xai": "xAI (Grok)", "cohere": "Cohere"}.get(x, x))
+                       format_func=lambda x: {"ollama": "ollama (local, free)", "openrouter": "Open Router", "xai": "xAI (Grok)", "cohere": "Cohere", "nvidia": "NVIDIA NIM"}.get(x, x))
     if prov != "ollama":
         have = prov in KEYS or os.environ.get(ENV_KEYS[prov])
         key = b.text_input(f"API key for {prov}", type="password", placeholder="key saved" if have else "paste your key")

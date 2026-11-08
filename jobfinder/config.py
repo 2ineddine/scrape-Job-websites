@@ -37,6 +37,7 @@ CONFIG_DEFAULT = {
         "anthropic": {"base_url": "https://api.anthropic.com/v1"},
         "xai": {"base_url": "https://api.x.ai/v1"},
         "cohere": {"base_url": "https://api.cohere.ai/compatibility/v1"},
+        "nvidia": {"base_url": "https://integrate.api.nvidia.com/v1"},  # NVIDIA NIM (build.nvidia.com): free developer access
     },
 }
 

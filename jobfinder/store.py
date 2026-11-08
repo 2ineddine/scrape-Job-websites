@@ -162,7 +162,10 @@ def init_db():
 # --------------------------------------------------------------------------- API key file (local, chmod 600)
 ENV_KEYS = {"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
             "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "gemini#2": "GEMINI_API_KEY_2", "groq#2": "GROQ_API_KEY_2",
-            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY",  # '#2': a second key, its own quota
+            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY", "nvidia": "NVIDIA_API_KEY",  # '#2': a second key, its own quota
+            # kept in the file but not used: SambaNova and Ollama Cloud need credits, GitHub Models closed in July 2026
+            "sambanova": "SAMBANOVA_API_KEY", "ollama_cloud": "OLLAMA_API_KEY", "github_models": "GITHUB_MODELS_API_KEY",
+            "kaggle": "KAGGLE_API_TOKEN", "kaggle#2": "KAGGLE_API_TOKEN_2",  # Kaggle: datasets and notebooks, no AI chat API
             # not AI: your France Travail API access (francetravail.io), kept when an AI key is saved from Settings
             "francetravail_id": "FRANCE_TRAVAIL_CLIENT_ID", "francetravail_secret": "FRANCE_TRAVAIL_CLIENT_SECRET"}
 

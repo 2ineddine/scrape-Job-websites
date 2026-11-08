@@ -660,8 +660,9 @@ def test_ladder_order_starts_with_the_best_and_skips_missing_keys():
     from jobfinder import llm
     cfg = {"auto_models": True, "model": {"provider": "ollama", "model": "llama3.1"}}
     chain = llm.model_chain(cfg, {"gemini": "g1", "gemini#2": "g2", "groq": "q"})
-    assert chain[:3] == [("gemini", "gemini-3.5-flash", "gemini"), ("gemini", "gemini-3.5-flash", "gemini#2"),
-                         ("groq", "openai/gpt-oss-120b", "groq")]
+    assert chain[:3] == [("gemini", "gemini-3.6-flash", "gemini"), ("gemini", "gemini-3.6-flash", "gemini#2"),
+                         ("gemini", "gemini-3.5-flash", "gemini")]
+    assert chain[4] == ("groq", "openai/gpt-oss-120b", "groq")  # the next provider after both keys of the two best models
     assert not any(p == "openrouter" for p, _, _ in chain) and chain[-1][0] == "ollama"
     assert llm.model_chain({"auto_models": False, "model": {"provider": "groq", "model": "x"}}, {}) == [("groq", "x", "groq")]
 
@@ -670,9 +671,10 @@ def test_limit_moves_to_the_second_key_then_another_provider(monkeypatch):
     from jobfinder import llm as L
     q = L.QuotaExhausted("Daily quota")
     q.wait = 7200
-    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): q, ("gemini", "gemini-3.5-flash", "g2"): q})
+    gem = [("gemini", m, k) for m in ("gemini-3.6-flash", "gemini-3.5-flash") for k in ("g1", "g2")]
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {x: q for x in gem})
     assert llm.call_json("u", A, cfg, s, keys).ok
-    assert calls == [("gemini", "gemini-3.5-flash", "g1"), ("gemini", "gemini-3.5-flash", "g2"), ("groq", "openai/gpt-oss-120b", "q")]
+    assert calls == gem + [("groq", "openai/gpt-oss-120b", "q")]
     assert llm.USAGE["model"] == "groq / openai/gpt-oss-120b"
     calls.clear()
     assert llm.call_json("u2", A, cfg, s, keys).ok  # the used-up models are not asked again...
@@ -680,15 +682,16 @@ def test_limit_moves_to_the_second_key_then_another_provider(monkeypatch):
     llm._EXHAUSTED.clear()  # ...until their limit has passed: the best model is back
     calls.clear()
     llm.call_json("u3", A, cfg, s, keys)
-    assert calls[0][1] == "gemini-3.5-flash"
+    assert calls[0][1] == "gemini-3.6-flash"
 
 
 def test_gone_model_and_bad_answer_move_on(monkeypatch):
     from jobfinder import llm as L
-    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): L.AIError("HTTP 404: no longer available"),
-                                                        ("gemini", "gemini-3.5-flash", "g2"): "not json"})
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.6-flash", "g1"): L.AIError("HTTP 404: no longer available"),
+                                                        ("gemini", "gemini-3.6-flash", "g2"): "not json"})
     assert llm.call_json("u", A, cfg, s, keys).ok
-    assert calls[-1][0] == "groq" and llm._EXHAUSTED[("gemini", "gemini-3.5-flash", "gemini")] > __import__("time").time() + 3000
+    assert calls[-1] == ("gemini", "gemini-3.5-flash", "g1")  # the next model of the ladder
+    assert llm._EXHAUSTED[("gemini", "gemini-3.6-flash", "gemini")] > __import__("time").time() + 3000
 
 
 def test_all_models_at_their_limit_gives_one_clear_message(monkeypatch):
@@ -732,9 +735,9 @@ def test_second_groq_key_and_monthly_limit(monkeypatch):
     chain = L.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"groq": "a", "groq#2": "b"})
     assert chain[:2] == [("groq", "openai/gpt-oss-120b", "groq"), ("groq", "openai/gpt-oss-120b", "groq#2")]
     gone = L.AIError("Provider error 429: limited to 1000 API calls / month")
-    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): gone})
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.6-flash", "g1"): gone})
     assert llm.call_json("u", A, cfg, s, keys).ok
-    assert llm._EXHAUSTED[("gemini", "gemini-3.5-flash", "gemini")] > __import__("time").time() + 3000
+    assert llm._EXHAUSTED[("gemini", "gemini-3.6-flash", "gemini")] > __import__("time").time() + 3000
 
 
 def test_next_page_called_from_a_click_and_sitemap_job_paths():
@@ -797,10 +800,10 @@ def test_logo_heading_vague_age_and_error_page_redirect(monkeypatch):
 def test_a_model_the_provider_removed_is_skipped_until_next_week(monkeypatch):
     from jobfinder import llm as L
     L_error = L.AIError('HTTP 404: {"message": "This model models/gemini-2.5-flash is no longer available to new users"}')
-    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.5-flash", "g1"): L_error})
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.6-flash", "g1"): L_error})
     assert llm.call_json("u", A, cfg, s, keys).ok
     chain = llm.model_chain(cfg, keys)
-    assert ("gemini", "gemini-3.5-flash", "gemini") not in chain and ("gemini", "gemini-3.5-flash", "gemini#2") in chain
+    assert ("gemini", "gemini-3.6-flash", "gemini") not in chain and ("gemini", "gemini-3.6-flash", "gemini#2") in chain
 
 
 def test_a_scan_in_another_process_is_never_wiped(monkeypatch, tmp_path):
@@ -1667,3 +1670,19 @@ def test_offer_data_with_unescaped_quotes_and_company_pages_on_shared_sites():
     assert company_from_url("https://www.welcometothejungle.com/en/companies/dxo/jobs") == "DXO"
     assert company_from_url("https://www.hellowork.com/fr-fr/entreprises/-proxiad--86909.html") == "Proxiad"
     assert company_from_url("https://jobs.ashbyhq.com/arago") == "Arago"  # unchanged
+
+
+def test_nvidia_models_answer_without_thinking(monkeypatch):
+    from jobfinder import llm
+    sent = {}
+
+    def post(url, headers, payload, **kw):
+        sent.update(url=url, payload=payload, auth=headers.get("Authorization"))
+        return {"choices": [{"message": {"content": '{"ok": true}'}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+    monkeypatch.setattr(llm, "_post", post)
+    cfg = {"providers": {"nvidia": {"base_url": "https://integrate.api.nvidia.com/v1"}}, "auto_models": False}
+    assert llm.chat("nvidia", "nvidia/nemotron-3-ultra-550b-a55b", "s", "u", cfg, {"nvidia": "nvapi-x"})[0] == '{"ok": true}'
+    assert sent["url"] == "https://integrate.api.nvidia.com/v1/chat/completions" and sent["auth"] == "Bearer nvapi-x"
+    assert sent["payload"]["chat_template_kwargs"] == {"enable_thinking": False}  # else the answer length goes to thinking
+    chain = llm.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"nvidia": "k"})
+    assert chain[0] == ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b", "nvidia")

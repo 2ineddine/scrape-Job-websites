@@ -6,14 +6,18 @@ import html
 import json
 import os
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 from jobfinder import cv as cvm
 from jobfinder import llm
+from jobfinder import market
 from jobfinder.analysis import analyze_pipeline
 from jobfinder.classify import OFFER_TYPES
 from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config, upgrade_profile
@@ -33,7 +37,9 @@ st.html(f"<style>{(ASSETS / 'navy.css').read_text(encoding='utf-8')}</style>")
 @st.cache_resource
 def _launch():
     """Runs once per launch: websites and offers from a previous run are deleted (fresh start)."""
-    wipe_session_data()
+    wipe_session_data()  # the analysed offers are first copied into the market history
+    with SessionLocal() as s:
+        market.run_if_due(s)  # the statistics, every 15 days
     atexit.register(wipe_session_data)  # and again when the app is turned off
     return Progress()
 
@@ -241,6 +247,12 @@ def step_analysis(running, n):
         st.caption((f"AI models: starts with **{first[0]} / {first[1]}** and switches when a limit is reached — see Settings. "
                     if c["auto_models"] else f"AI model **{m['provider']} / {m['model']}** — change it in Settings. ")
                    + ("" if n["cvs"] else "No CV yet: offers are ranked, but not compared with a CV."))
+        with SessionLocal() as s:
+            due = market.due(s)
+        c["stats_with_scan"] = st.checkbox(
+            "Update the statistics at the end of this scan", value=bool(c.get("stats_with_scan")), disabled=running,
+            help="Computes the Statistics page from the offers analysed in the last 15 days as soon as this scan's AI analysis "
+                 "ends. Unticked, the statistics are updated every 15 days" + (" (due now)." if due else "."))
         x, y, _ = st.columns([1, 1, 3])
         if x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:", width="stretch"):
             with SessionLocal() as s:
@@ -408,7 +420,8 @@ def settings_ai():
     c["auto_models"] = st.toggle("Switch models automatically", c["auto_models"],
                                  help="Starts with the most capable model. When a limit is reached, the next one takes over.")
     if c["auto_models"]:
-        order = [f"{i}. {p} / {m}" + (" (second key)" if "#" in k else "") for i, (p, m, k) in enumerate(llm.model_chain(c, KEYS), 1)]
+        nth = {"#2": " (second key)", "#3": " (third key)", "#4": " (fourth key)"}
+        order = [f"{i}. {p} / {m}" + nth.get(k[len(p):], "") for i, (p, m, k) in enumerate(llm.model_chain(c, KEYS), 1)]
         st.caption("Order of use: " + " → ".join(order))
     provs = list(c["providers"])
     models = st.session_state.setdefault("models", {})
@@ -461,10 +474,211 @@ def page_settings():
         settings_profile()
 
 
+# =================================================================== page: market statistics (every 15 days)
+NAVY, INK_DIM = "#1B3A6B", "#5B6B82"
+LABELS = {"job": "Job (CDI / CDD)", "internship": "Internship", "apprenticeship": "Apprenticeship", "phd_postdoc": "PhD / post-doc",
+          "phd": "PhD", "master": "Master", "engineer": "Engineering degree", "bachelor": "Bachelor", "none": "None stated",
+          "intern": "Intern", "junior": "Junior", "mid": "Mid-level", "senior": "Senior", "lead": "Lead / principal",
+          "onsite": "On site", "hybrid": "Hybrid", "remote": "Remote", "unknown": "Not stated"}
+
+
+def hbar(rows, label, value="offers", prev=None):
+    """Ranked counts: one series, one colour, sorted, value written at the bar's end, tooltip on hover."""
+    df = pd.DataFrame([[LABELS.get(str(k), k), v] for k, v in rows], columns=[label, value])
+    if df.empty:
+        st.caption("No data in this period yet.")
+        return
+    tip = [alt.Tooltip(f"{label}:N"), alt.Tooltip(f"{value}:Q")]
+    if prev is not None:
+        df["previous period"] = [dict(prev).get(k, 0) for k, _ in rows]
+        tip.append(alt.Tooltip("previous period:Q"))
+    base = alt.Chart(df).encode(
+        y=alt.Y(f"{label}:N", sort="-x", title=None, axis=alt.Axis(ticks=False, domain=False, labelLimit=260, labelColor="#0E1C33",
+                                                                    labelOverlap=False, labelPadding=6)),
+        x=alt.X(f"{value}:Q", title=None, axis=alt.Axis(grid=False, labels=False, ticks=False, domain=False)))
+    bars = base.mark_bar(color=NAVY, cornerRadiusEnd=4, height=14).encode(tooltip=tip)
+    text = base.mark_text(align="left", dx=5, color=INK_DIM, fontSize=12).encode(text=f"{value}:Q")
+    st.altair_chart((bars + text).properties(height=28 * len(df) + 8, background="transparent").configure_view(stroke=None),
+                    width="stretch")
+
+
+def page_stats():
+    shell("Statistics", "The job market of your field: computed every 15 days from the offers the AI analysed.", "Market")
+    with SessionLocal() as s:
+        snaps = market.snapshots(s, 2)
+        kept = s.query(market.MarketOffer).count()
+        due_now = market.due(s)
+    cur = snaps[0] if snaps else None
+    prev = snaps[1].data if len(snaps) > 1 else None
+    with st.container(border=True, key="card_stats_head"):
+        a, b = st.columns([3, 1], vertical_alignment="center")
+        if cur:
+            nxt = cur.created + market.timedelta(days=market.PERIOD_DAYS)
+            a.markdown(f"**Period:** {cur.period_start:%d %b} – {cur.period_end:%d %b %Y} · next computation on "
+                       f"**{nxt:%d %b}** · {kept:,} analysed offers kept in the history (6 months)")
+        else:
+            a.markdown(f"No statistics yet: they are computed from the offers the AI analyses (history: {kept:,} offers). "
+                       "Run a scan with AI analysis first.")
+        if b.button("Compute now", disabled=not kept, help="Statistics of the last 15 days, from the offers kept in the history"):
+            with SessionLocal() as s:
+                market.archive_offers(s)
+                market.compute_snapshot(s)
+            st.rerun()
+        if due_now and cur:
+            st.caption("15 days have passed: the next scan with AI analysis computes a new snapshot.")
+    if not cur:
+        return
+    d = cur.data
+    pv = (lambda k: prev.get(k)) if prev else (lambda k: None)
+    share = lambda rows, key: round(100 * dict(rows).get(key, 0) / max(1, sum(v for _, v in rows)))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Relevant offers" if d["base"] == "relevant" else "Analysed offers", d["relevant"] or d["analysed"],
+              delta=(d["relevant"] - pv("relevant")) if prev else None)
+    m2.metric("Companies hiring", d["companies"], delta=(d["companies"] - pv("companies")) if prev else None)
+    m3.metric("Remote or hybrid", f"{share(d['remote'], 'remote') + share(d['remote'], 'hybrid')} %")
+    m4.metric("Average CV match", f"{d['avg_match']:.0f} / 100" if d.get("avg_match") is not None else "—",
+              help="Shown once CVs are compared with relevant offers")
+    if d["base"] != "relevant":
+        st.info("No offer was judged relevant in this period: the figures cover every offer the AI analysed.")
+    c1, c2 = st.columns(2)
+    with c1, st.container(border=True, key="card_stats_skills"):
+        st.markdown("**Most requested skills**")
+        st.caption("Number of offers asking for each skill, tool or method: what to put first on the CV.")
+        hbar(d["top_skills"], "skill", prev=pv("top_skills"))
+    with c2, st.container(border=True, key="card_stats_gaps"):
+        st.markdown("**Skills missing from the CV**")
+        st.caption("Requirements of the offers that the CV does not show: what to learn or to make visible.")
+        hbar(d["skill_gaps"], "requirement", prev=pv("skill_gaps"))
+    c3, c4 = st.columns(2)
+    with c3, st.container(border=True, key="card_stats_companies"):
+        st.markdown("**Companies hiring the most**")
+        hbar(d["top_companies"], "company", prev=pv("top_companies"))
+    with c4, st.container(border=True, key="card_stats_cities"):
+        st.markdown("**Cities**")
+        hbar(d["cities"], "city", prev=pv("cities"))
+    with st.container(border=True, key="card_stats_weeks"):
+        st.markdown("**Offers per week**")
+        wk = pd.DataFrame(d["weeks"], columns=["week", "offers"])
+        if len(wk):
+            st.altair_chart(alt.Chart(wk).mark_bar(color=NAVY, cornerRadiusEnd=4, size=26)
+                            .encode(x=alt.X("week:N", title=None, axis=alt.Axis(labelAngle=0, ticks=False, domain=False)),
+                                    y=alt.Y("offers:Q", title=None, axis=alt.Axis(grid=True, gridColor="#E9EEF6", domain=False, ticks=False)),
+                                    tooltip=["week", "offers"]).properties(height=180, background="transparent")
+                            .configure_view(stroke=None), width="stretch")
+    st.markdown('<div class="jf-section">Profile of the offers</div>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns(3)
+    for col, key, title in ((p1, "contracts", "Contract"), (p2, "degree", "Degree required"), (p3, "seniority", "Seniority")):
+        with col, st.container(border=True, key=f"card_stats_{key}"):
+            st.markdown(f"**{title}**")
+            hbar(d[key], title.lower())
+    p4, p5 = st.columns(2)
+    with p4, st.container(border=True, key="card_stats_languages"):
+        st.markdown("**Languages required**")
+        hbar(d["languages"], "language")
+    with p5, st.container(border=True, key="card_stats_remote"):
+        st.markdown("**Remote work**")
+        hbar(d["remote"], "remote work")
+    t1, t2 = st.tabs(["Best CV matches", "Salaries stated"])
+    with t1:
+        if d["best_titles"]:
+            st.dataframe(pd.DataFrame(d["best_titles"], columns=["offer", "company", "CV match"]), hide_index=True, width="stretch")
+        else:
+            st.caption("Upload a CV: the offers it matches best are listed here.")
+    with t2:
+        if d["salaries"]:
+            st.dataframe(pd.DataFrame(d["salaries"], columns=["offer", "company", "salary as written"]), hide_index=True, width="stretch")
+        else:
+            st.caption("No offer of this period states a salary.")
+    with st.expander("Websites giving the most offers of your field"):
+        hbar(d["websites"], "website")
+
+
+# =================================================================== page 4: what each AI key has left
+QUOTA_SLOTS = ("gemini", "gemini#2", "gemini#3", "gemini#4", "groq", "groq#2", "groq#3", "groq#4", "nvidia", "openrouter", "openrouter#2", "openrouter#3", "cohere", "cohere#2", "cohere#3", "xai")
+PROVIDER_NAME = {"gemini": "Gemini", "groq": "Groq", "nvidia": "NVIDIA NIM", "openrouter": "OpenRouter", "cohere": "Cohere",
+                 "xai": "xAI (billed)"}
+COHERE_MONTH = 1000  # Cohere trial keys: 1,000 calls a month
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _openrouter_info(key):
+    return llm.openrouter_key_info(key)
+
+
+def _share(left, total):
+    return max(0.0, min(1.0, left / total)) if total else 0.0
+
+
+def _model_bar(prov, model, slot, rec, now, gone):
+    """One model on one key: what the provider reported, or what the app counted."""
+    e, today = rec.get(f"{slot}|{model}", {}), time.strftime("%Y-%m-%d")
+    calls = e.get("calls", 0) if e.get("day") == today else 0
+    until = max(e.get("until", 0), llm._EXHAUSTED.get((prov, model, slot), 0))
+    if f"{slot}|{model}" in gone:
+        st.progress(0.0, text=f"{model} — no longer offered on this key: skipped for a week")
+    elif e.get("error") and e.get("error_at", 0) > e.get("last_ok", 0) and now - e.get("error_at", 0) < 86400:
+        st.progress(0.0, text=f"{model} — refused by the provider: {e['error'][:90]}")
+    elif until > now:
+        st.progress(0.0, text=f"{model} — limit reached, back at {datetime.fromtimestamp(until):%H:%M} ({calls} call{'s' if calls != 1 else ''} today)")
+    elif e.get("limit") and e.get("day") == today:
+        st.progress(_share(e["remaining"], e["limit"]),
+                    text=f"{model} — {e['remaining']:,} of {e['limit']:,} requests left today (reported by {PROVIDER_NAME[prov]})")
+    elif e.get("learned"):
+        left = max(0, e["learned"] - calls)
+        st.progress(_share(left, e["learned"]), text=f"{model} — about {left} of ~{e['learned']} calls left today "
+                                                     "(limit reached on an earlier day)")
+    else:
+        st.progress(1.0, text=f"{model} — available · {calls} call{'s' if calls != 1 else ''} today (no remaining count published)")
+
+
+def page_quota():
+    shell("AI quota", "What each API key has left: as the provider reports it, or as the app counts its calls.", "Settings")
+    st.caption("Gemini quotas reset around 09:00 (midnight Pacific time); Groq frees requests gradually over the day; "
+               "Cohere's trial limit is monthly; NVIDIA limits requests per minute. Models are used in this order, best first.")
+    rec, now, gone, keys = llm.quota_record(), time.time(), llm._gone(), load_keys()
+    today = time.strftime("%Y-%m-%d")
+    for slot in QUOTA_SLOTS:
+        prov = slot.split("#")[0]
+        key = keys.get(slot) or (os.environ.get(ENV_KEYS.get(slot, ""), "") if slot in ENV_KEYS else "")
+        if not key:
+            continue
+        with st.container(border=True, key=f"card_quota_{slot.replace('#', '_')}"):
+            nth = {"#2": " — second key", "#3": " — third key", "#4": " — fourth key"}.get(slot[len(prov):], "")
+            st.markdown(f"**{PROVIDER_NAME[prov]}**{nth} · `{llm.mask(key)}`")
+            entries = {k.split("|", 1)[1]: v for k, v in rec.items() if k.startswith(slot + "|")}
+            if prov == "cohere":
+                used = sum(v.get("month_calls", 0) for v in entries.values() if v.get("month") == today[:7])
+                st.progress(_share(COHERE_MONTH - used, COHERE_MONTH),
+                            text=f"Key — about {max(0, COHERE_MONTH - used):,} of {COHERE_MONTH:,} trial calls left this month")
+            if prov == "openrouter":
+                info = _openrouter_info(key)
+                cap = 50 if info.get("is_free_tier", True) else 1000  # free models: 50 a day, 1,000 after $10 of credits
+                used = sum(v.get("calls", 0) for v in entries.values() if v.get("day") == today)
+                st.progress(_share(cap - used, cap), text=f"Key — about {max(0, cap - used)} of {cap} free-model requests left today"
+                            + ("" if info else " (OpenRouter's account figures could not be read)"))
+            for p_, model in llm.LADDER:
+                if p_ == prov:
+                    _model_bar(prov, model, slot, rec, now, gone)
+    jp_key = keys.get("jobspipe") or os.environ.get("JOBSPIPE_API_KEY", "")
+    if jp_key:
+        with SessionLocal() as s:
+            jp = get_setting(s, "jobspipe_credits", {})
+        with st.container(border=True, key="card_quota_jobspipe"):
+            st.markdown(f"**JobsPipe** (job data, not AI) · `{llm.mask(jp_key)}`")
+            if jp.get("allowance"):
+                st.progress(_share(jp["remaining"], jp["allowance"]),
+                            text=f"{jp['remaining']:,} of {jp['allowance']:,} credits left "
+                                 f"(at the last scan, {datetime.fromtimestamp(jp['at']):%d %b %H:%M})")
+            else:
+                st.progress(1.0, text="Credits are shown after the first scan that reads JobsPipe")
+
+
 # =================================================================== navigation
 RESULTS = st.Page(page_results, title="Results", icon=":material/work:", url_path="results")
 brand()
 st.navigation([st.Page(page_search, title="Search", icon=":material/travel_explore:", default=True), RESULTS,
+               st.Page(page_stats, title="Statistics", icon=":material/insights:", url_path="statistics"),
+               st.Page(page_quota, title="AI quota", icon=":material/speed:", url_path="quota"),
                st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings")], position="top").run()
 for _n, _new, _old in (("config", c, CFG), ("profile", p, PROFILE), ("applicant", ap, APPLICANT)):
     autosave(_n, _new, _old)

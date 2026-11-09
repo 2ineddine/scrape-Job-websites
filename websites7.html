@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Open Multiple Tabs</title>
+</head>
+<body>
+    <script>
+        // Add your URLs here
+        const urls = [
+            // AI labs and AI startups with teams in Paris
+            'https://jobs.ashbyhq.com/openai',
+            'https://job-boards.greenhouse.io/anthropic',
+            'https://jobs.ashbyhq.com/cohere',
+            'https://jobs.ashbyhq.com/elevenlabs',
+            'https://pleias.ai/careers',
+            'https://batvoice.welcomekit.co/',
+            'https://whitelab-genomics.welcomekit.co/',
+            'https://fieldbox-ai.welcomekit.co/',
+            'https://cyclope.recruitee.com/',
+            'https://arturia.recruitee.com/',
+
+            // Quantum, chips, space and deep tech
+            'https://apply.workable.com/quandela/',
+            'https://jobs.lever.co/c12qe',
+            'https://www.welinq.fr/career',
+            'https://dolphindesign.teamtailor.com/jobs',
+            'https://hemeriagroup.recruitee.com/',
+            'https://jobs.infiniteorbits.io/jobs/',
+            'https://jobs.ashbyhq.com/the-exploration-company',
+            'https://lookup.recruitee.com/',
+            'https://www.u-space.fr/carrieres/',
+            'https://apply.workable.com/corwave-1/',
+
+            // French scale-ups and startups hiring engineers and data scientists
+            'https://papernest.wd502.myworkdayjobs.com/fr-FR/External_Careers_Global',
+            'https://job-boards.greenhouse.io/aircallioinc',
+            'https://jobs.lever.co/360learning',
+            'https://careers.deepki.com/',
+            'https://job-boards.greenhouse.io/dashlane',
+            'https://jobs.ashbyhq.com/gorgias',
+            'https://jobs.ashbyhq.com/ogury',
+            'https://jobs.ashbyhq.com/sorare',
+            'https://jobs.ashbyhq.com/ankorstore',
+            'https://jobs.lever.co/vestiairecollective',
+            'https://livestorm.recruitee.com/',
+            'https://ornikar.teamtailor.com/jobs',
+            'https://shine.teamtailor.com/jobs',
+            'https://hublo.teamtailor.com/jobs',
+            'https://yousign.teamtailor.com/jobs',
+            'https://padoa.teamtailor.com/jobs',
+            'https://dougs.welcomekit.co/',
+            'https://greenly.welcomekit.co/',
+            'https://hiflow.recruitee.com/',
+            'https://job-boards.greenhouse.io/flowdesk',
+            'https://planity-1651249729.teamtailor.com/jobs',
+            'https://sweep.teamtailor.com/jobs',
+            'https://botify.teamtailor.com/jobs',
+            'https://jobs.lever.co/doctrine',
+            'https://splio.welcomekit.co/',
+            'https://medadom.welcomekit.co/',
+            'https://tehtris.taleez.com/',
+            'https://getaround.com/careers',
+            'https://carriere.mailinblack.com/',
+
+            // Ventures and subsidiaries of large groups
+            'https://jobs.free2move.com/',
+
+            // Large groups and multinationals with R&D or tech teams in France
+            'https://careers.roche.com',
+            'https://www.novartis.com/careers',
+            'https://ptc.wd1.myworkdayjobs.com/PTC',
+            'https://gevernova.wd5.myworkdayjobs.com/fr-FR/Vernova_ExternalSite',
+            'https://pernodricard.wd3.myworkdayjobs.com/pernod-ricard',
+            'https://careers.snowflake.com/us/en',
+            'https://job-boards.greenhouse.io/mongodb'
+        ];
+
+        // Open each URL in a new tab
+        urls.forEach(url => {
+            window.open(url, '_blank');
+        });
+
+        // Close the original blank tab (optional)
+        window.close();
+    </script>
+</body>
+</html>

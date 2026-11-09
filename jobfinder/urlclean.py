@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 # multi-company job boards: their search words define the search and are kept
 JOB_BOARDS = ("optioncarriere.", "hellowork.", "welcometothejungle.com", "jobteaser.", "stage.fr", "apec.fr", "glassdoor.",
               "indeed.", "linkedin.", "jobs.makesense.org", "jobsinparis.fr", "francetravail.", "choisirleservicepublic.",
-              "monster.", "cadremploi.", "regionsjob.", "meteojob.", "jobijoba.")
+              "monster.", "cadremploi.", "regionsjob.", "meteojob.", "jobijoba.", "jobspipe.")
 
 _TRACKING = re.compile(r"^(utm_\w+|gad_\w+|gclid|gbraid|wbraid|fbclid|msclkid|mc_\w+|_ga|ig\w{2,4}|source|src|ref|refid|"
                        r"trk|trackingid|campaign\w*|cid)$", re.I)

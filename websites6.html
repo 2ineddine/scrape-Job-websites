@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Open Multiple Tabs</title>
+</head>
+<body>
+    <script>
+        // Add your URLs here
+        const urls = [
+            // JobsPipe job-data API (needs JOBSPIPE_API_KEY): offers in France from career sites, ATS platforms and France Travail
+            'https://jobspipe.dev/',
+
+            // Startups that raised funds in 2025-2026, or in the French Tech Next40 / 120 2026 - AI, robotics, quantum, photonics, space
+            'https://jobs.ashbyhq.com/ami',
+            'https://gradium.ai/about/careers',
+            'https://jobs.lever.co/alice-bob',
+            'https://pasqal.teamtailor.com/jobs',
+            'https://www.quobly.io/careers/',
+            'https://job-boards.greenhouse.io/ncodin',
+            'https://sipearl.teamtailor.com/jobs',
+            'https://hummink.com/electronics-manufacturing-innovators/',
+            'https://jobs.ashbyhq.com/alta-ares',
+            'https://jobs.ashbyhq.com/comand-ai',
+            'https://www.bioptimus.com/careers',
+            'https://skillcorner.welcomekit.co/',
+            'https://veesionvf.teamtailor.com/jobs',
+            'https://tihive.welcomekit.co/',
+            'https://www.viziosense.com/careers',
+            'https://www.diagnoly.com/careers/',
+            'https://jobs.ashbyhq.com/bleu-robotics',
+            'https://quantumsurgical.teamtailor.com/jobs',
+            'https://inbolt.welcomekit.co/',
+            'https://easymile.welcomekit.co/',
+            'https://enchanted.tools/jobs',
+            'https://jobs.lever.co/outsight',
+            'https://exotrail.teamtailor.com/jobs',
+            'https://www.latitude.eu/careers/',
+            'https://leanspace.io/careers',
+            'https://app.rift.aero/career',
+            'https://jobs.ashbyhq.com/2501',
+            'https://aive.welcomekit.co/',
+            'https://zama.welcomekit.co/',
+            'https://lighton.welcomekit.co/',
+            'https://implicity.welcomekit.co/',
+            'https://donecle.taleez.com/',
+            'https://delair.teamtailor.com/jobs',
+            'https://tissium.teamtailor.com/jobs',
+            'https://careers.spore.bio',
+            'https://www.flying-whales.com/',
+            'https://xxii-group.welcomekit.co/',
+            'https://cosmotech.com/join-us/',
+            'https://www.kalrayinc.com/careers',
+
+            // Scale-ups of the Next40 / French Tech 120 hiring engineers and data scientists
+            'https://jobs.ashbyhq.com/akur8',
+            'https://jobs.lever.co/ekimetrics',
+            'https://gitguardian.teamtailor.com/jobs',
+            'https://jobs.lever.co/pigment',
+            'https://jobs.ashbyhq.com/alan',
+            'https://jobs.lever.co/verkor',
+            'https://jobs.ashbyhq.com/voodoo',
+            'https://apply.workable.com/homa-games/',
+            'https://payfit.teamtailor.com/jobs',
+            'https://jobs.ashbyhq.com/pennylane',
+            'https://career.spendesk.com/fr/',
+            'https://jobs.lever.co/agicap',
+            'https://akeneo.teamtailor.com/jobs',
+            'https://jobs.lever.co/swile',
+            'https://jobs.lever.co/brevo',
+            'https://careers.go-electra.com',
+            'https://stoik.teamtailor.com/jobs',
+            'https://descartesunderwriting.teamtailor.com/jobs',
+            'https://jobs.ashbyhq.com/alma',
+            'https://animaj.welcomekit.co/',
+
+            // Mid-size and small tech companies
+            'https://jobs.lever.co/scality',
+            'https://job-boards.greenhouse.io/artefact',
+            'https://wiremind.welcomekit.co/',
+            'https://kineis.com/recrutement/',
+            'https://bertintechnologies.taleez.com/nos-offres-d-emplois',
+            'https://lynred-career.talent-soft.com/accueil.aspx?LCID=1036',
+
+            // Large groups and multinationals with R&D in France
+            'https://europe.naverlabs.com/careers/',
+            'https://careers.gehealthcare.com/global/en/search-results',
+            'https://airliquidehr.wd3.myworkdayjobs.com/AirLiquideExternalCareer',
+            'https://arianegroup.wd3.myworkdayjobs.com/fr-FR/EXTERNALALL',
+            'https://murex.wd3.myworkdayjobs.com/MurexCareerPage1',
+            'https://amadeus.wd502.myworkdayjobs.com/jobs',
+            'https://ipsen.wd103.myworkdayjobs.com/en-EN/Ipsen_Careers',
+            'https://cadence.wd1.myworkdayjobs.com/External_Careers',
+            'https://analogdevices.wd1.myworkdayjobs.com/External',
+            'https://careers.axa.com/careers-home/?lang=fr-FR',
+            'https://www.assystem.com/fr/carriere/nos-offres/'
+        ];
+
+        // Open each URL in a new tab
+        urls.forEach(url => {
+            window.open(url, '_blank');
+        });
+
+        // Close the original blank tab (optional)
+        window.close();
+    </script>
+</body>
+</html>

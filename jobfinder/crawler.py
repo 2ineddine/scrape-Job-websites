@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, unquote, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from .adapters import (ADAPTERS, FT_HOSTS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
+from .adapters import (ADAPTERS, FT_HOSTS, JP_HOSTS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
                        detect_one_hop, embedded_jobs, find_board, guess_board, jobs_from_json, raw_verdict, worth_opening)
 from .classify import classify_location, is_boilerplate_title, location_from_text
 from .sitefilters import filtered_url, with_own_filters
@@ -26,7 +26,7 @@ from .urlclean import JOB_BOARDS, is_job_board
 from .web import PARSER, UA, AccessError, RobotsRefused, browser_guard, check_url, norm, normalize_url, syntactic_ok
 
 _ATS_HOSTS = ("greenhouse", "lever.co", "ashby", "smartrecruiters", "myworkdayjobs", "breezy.hr", "recruitee", "teamtailor",
-              "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters")
+              "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters", "personio")
 
 
 _GENDER = re.compile(r"[(\[]?\b(?:h\s*/\s*f|f\s*/\s*h|m\s*/\s*f|f\s*/\s*m|h\s*/\s*f\s*/\s*[xn]|f\s*/\s*h\s*/\s*[xn]|"
@@ -981,7 +981,7 @@ def crawl_pdfs(f, url, cfg, known, st):
 # job platforms that host the career site itself: a refusal of their API is a refusal of the site
 _PLATFORM_HOSTS = re.compile(r"(?:^|\.)(?:myworkdayjobs\.com|myworkdaysite\.com|smartrecruiters\.com|workable\.com|"
                              r"recruitee\.com|teamtailor\.com|greenhouse\.io|lever\.co|ashbyhq\.com|eightfold\.ai|"
-                             r"talent-soft\.com|breezy\.hr)$")
+                             r"talent-soft\.com|breezy\.hr|jobs\.personio\.(?:de|com))$")
 
 
 def crawl_source(f, url, cfg, known, st):
@@ -998,6 +998,10 @@ def crawl_source(f, url, cfg, known, st):
     if FT_HOSTS.search(host):  # France Travail: its official API only (with your access), never its pages
         st.platform = "francetravail (official API)"
         yield from ADAPTERS["francetravail"](f, url, cfg, known, st)
+        return
+    if JP_HOSTS.search(host):  # JobsPipe: its API with your key (offers of many companies in France)
+        st.platform = "jobspipe (API, your key)"
+        yield from ADAPTERS["jobspipe"](f, url, cfg, known, st)
         return
     own = with_own_filters(url, cfg)
     if own != url:

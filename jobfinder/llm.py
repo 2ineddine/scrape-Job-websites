@@ -81,15 +81,19 @@ def _wait_time(r, default):
 _OUT_CAP: dict = {}  # (provider, model) -> answer length the provider accepts (learned from its 'output tokens' limit)
 
 
-def _post(url, headers, payload, timeout=90, retries=5, cap_key=None, max_wait=120):
+_LAST = threading.local()  # rate-limit headers of the last answer of this thread (Groq: requests left today)
+
+
+def _post(url, headers, payload, timeout=90, retries=5, cap_key=None, max_wait=120, max_timeouts=2):
     delay, timeouts = 2, 0
+    _LAST.headers = {}
     for i in range(retries + 1):
         wait = delay
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except (requests.Timeout, requests.ConnectionError) as e:
             timeouts += 1
-            if i == retries or timeouts >= 2:  # a model that is too slow once is retried once, not five times
+            if i == retries or timeouts >= max_timeouts:  # a model that is too slow once is retried once, not five times
                 raise AIError(f"Provider unreachable ({type(e).__name__}). Is the service running / reachable?")
         else:
             out = re.search(r"output tokens[^.]*?Limit (\d+)", r.text, re.I) if r.status_code in (413, 429) else None
@@ -118,9 +122,13 @@ def _post(url, headers, payload, timeout=90, retries=5, cap_key=None, max_wait=1
                 raise AIError("Authentication failed - check the API key for this provider")
             elif r.status_code == 402:
                 raise AIError("Quota / billing problem reported by provider (HTTP 402)")
+            elif r.status_code == 400 and re.search(r"failed to generate json|json_validate_failed|failed_generation", r.text, re.I):
+                # one answer the model could not shape as JSON (Groq): this request only, the key and the model are fine
+                raise MalformedOutput(f"the model could not produce valid JSON for this offer: {r.text[:120]}")
             elif r.status_code >= 400:
                 raise AIError(f"HTTP {r.status_code}: {r.text[:300]}")
             else:
+                _LAST.headers = {k.lower(): v for k, v in r.headers.items() if "ratelimit" in k.lower()}
                 return r.json()
         time.sleep(min(wait, 120))  # bounded backoff
         delay = min(delay * 2, 30)
@@ -133,7 +141,9 @@ def chat(provider, model, system, user, cfg, keys=None):
     if provider in PAID and not key:
         raise AIError(f"No API key for {provider}: set {ENV_KEYS[provider]} or add it in Settings > API keys")
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    post = partial(_post, retries=1, max_wait=5) if cfg.get("auto_models") else _post  # another model is ready: no long wait
+    # automatic switching: another model is ready, so a busy or slow one is not waited for (a slow model timed out twice on
+    # long CV-match prompts, 90 s each, then was asked again a minute later)
+    post = partial(_post, retries=1, max_wait=5, timeout=60, max_timeouts=1) if cfg.get("auto_models") else _post
     if provider == "ollama":
         d = post(f"{base}/api/chat", {}, {"model": model, "messages": msgs, "stream": False, "format": "json"})
         return d["message"]["content"], d.get("prompt_eval_count", 0), d.get("eval_count", 0)
@@ -260,9 +270,11 @@ def _soften(schema, data):
 # (no valid JSON answer), NVIDIA's gpt-oss-120b (retired); SambaNova and Ollama Cloud need credits.
 LADDER = [("gemini", "gemini-3.6-flash"), ("gemini", "gemini-3.5-flash"),
           ("groq", "openai/gpt-oss-120b"),
-          ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"), ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-          ("cohere", "command-a-reasoning-08-2025"),
+          # Nemotron 3.5 Super before 3 Ultra: as accurate on the offers (85 vs 75) and fast, where Ultra timed out on
+          # long CV-match prompts (11 times in one check run, November 2026)
           ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"), ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
+          ("cohere", "command-a-reasoning-08-2025"),
+          ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"), ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
           ("gemini", "gemini-2.5-flash"), ("cohere", "command-a-03-2025"), ("groq", "qwen/qwen3.8-27b"),
           ("openrouter", "dots-studio/dots-3-note-preview:free"), ("gemini", "gemini-3.5-flash-lite"),
           ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"), ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
@@ -301,10 +313,68 @@ def model_chain(cfg, keys=None) -> list:
     if not cfg.get("auto_models"):
         return [own]
     gone = _gone()
-    chain = [(p, m, slot) for p, m in LADDER for slot in (p, f"{p}#2") if get_key(slot, keys) and f"{slot}|{m}" not in gone]
+    chain = [(p, m, slot) for p, m in LADDER for slot in (p, f"{p}#2", f"{p}#3", f"{p}#4") if get_key(slot, keys) and f"{slot}|{m}" not in gone]
     if own not in chain and (t["provider"] not in PAID or get_key(t["provider"], keys)):
         chain.append(own)
     return chain or [own]
+
+
+# ---------------------------------------------------------------------------- what each key has used (AI quota page)
+QUOTA_KEY = "ai_quota"
+_QUOTA_LOCK = threading.Lock()
+
+
+def update_quota(q, step, day, until=None, error=None, headers=None, now=None):
+    """One AI call (or one refusal) into the quota record {"slot|model": {...}}. Pure: the caller stores it.
+    calls / month_calls: counted by the app; limit / remaining: reported by the provider (Groq: requests per day);
+    until: when an exhausted quota frees up; learned: calls made on the day the limit was reached (an estimate of it)."""
+    now = now or time.time()
+    e = q.setdefault(f"{step[2]}|{step[1]}", {})
+    if e.get("day") != day:
+        e.update(day=day, calls=0)
+    if e.get("month") != day[:7]:
+        e.update(month=day[:7], month_calls=0)
+    if until:
+        e["until"] = until
+        if until - now > 3600:  # a DAILY quota (a per-minute limit frees up in seconds and says nothing about the day)
+            e["learned"] = max(e.get("learned", 0), e["calls"])
+    elif error:
+        e["error"], e["error_at"] = str(error)[:140], now
+    else:
+        e["calls"], e["month_calls"], e["last_ok"] = e["calls"] + 1, e["month_calls"] + 1, now
+        e.pop("error", None)
+        h = headers or {}
+        if str(h.get("x-ratelimit-limit-requests", "")).isdigit() and str(h.get("x-ratelimit-remaining-requests", "")).isdigit():
+            e["limit"], e["remaining"], e["seen"] = int(h["x-ratelimit-limit-requests"]), int(h["x-ratelimit-remaining-requests"]), now
+    return q
+
+
+def note_quota(step, until=None, error=None):
+    """Store one call / refusal of a model on a key (never blocks the analysis)."""
+    try:
+        with _QUOTA_LOCK, SessionLocal() as s:
+            q = update_quota(get_setting(s, QUOTA_KEY, {}), step, time.strftime("%Y-%m-%d"), until, error,
+                             getattr(_LAST, "headers", None))
+            set_setting(s, QUOTA_KEY, q)
+    except Exception:  # pragma: no cover - no database (tests)
+        pass
+
+
+def quota_record() -> dict:
+    try:
+        with SessionLocal() as s:
+            return get_setting(s, QUOTA_KEY, {})
+    except Exception:  # pragma: no cover
+        return {}
+
+
+def openrouter_key_info(key):
+    """OpenRouter's own figures for a key (free: no model is called) -> its 'data' dict, or {}."""
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/key", headers={"Authorization": f"Bearer {key}"}, timeout=10)
+        return (r.json() or {}).get("data") or {} if r.ok else {}
+    except (requests.RequestException, ValueError):
+        return {}
 
 
 def _cache_key(step, system, user, schema) -> str:
@@ -325,7 +395,13 @@ def _ask(step, user, schema, cfg, s, keys, system):
             text, i, o = chat(prov, model, system, prompt, cfg, {**(keys or {}), prov: get_key(slot, keys)})
         except QuotaExhausted as e:
             _EXHAUSTED[step] = time.time() + getattr(e, "wait", 3600)
+            note_quota(step, until=_EXHAUSTED[step])
             raise
+        except AIError as e:
+            if not isinstance(e, MalformedOutput) and re.search(r"Authentication|no credits|HTTP 40[0-9]", str(e)):
+                note_quota(step, error=e)
+            raise
+        note_quota(step)
         with _USAGE_LOCK:
             USAGE["in"] += i
             USAGE["out"] += o
@@ -373,7 +449,9 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
                 if len(chain) == 1:
                     raise
                 # a key refused or a model gone stays out of this run; an outage or a busy model only for a moment
-                _EXHAUSTED[step] = time.time() + (3600 if re.search(r"Authentication|HTTP 40[0-9]|month", str(e)) else 60)
+                pause = (3600 if re.search(r"Authentication|HTTP 40[0-9]|month", str(e))
+                         else 600 if "unreachable" in str(e) else 60)  # too slow / down: not asked again for 10 minutes
+                _EXHAUSTED[step] = time.time() + pause
                 if re.search(r"HTTP 40[34]", str(e)) and _GONE.search(str(e)):
                     mark_gone(step, e)
             LOG.info("AI: %s / %s not available (%s), next model", step[0], step[1], str(last)[:100])

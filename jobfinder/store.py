@@ -50,6 +50,30 @@ class SeenOffer(Base):  # kept between sessions: an offer cannot be younger than
     first_seen = Column(DateTime, default=utcnow)
 
 
+class MarketOffer(Base):  # kept between sessions (6 months): facts of each analysed offer, for the statistics page
+    __tablename__ = "market_offers"
+    uid = Column(String, primary_key=True)
+    seen = Column(DateTime)       # first time the AI analysed it
+    pub_date = Column(DateTime)
+    title = Column(String, default="")
+    company = Column(String, default="")
+    city = Column(String, default="")
+    contract = Column(String, default="")
+    relevant = Column(Boolean, default=False)
+    score = Column(Float)
+    match = Column(Float)
+    data = Column(JSON, default=dict)  # skills, degree, seniority, languages, remote, salary, CV gaps, website
+
+
+class MarketStats(Base):  # one snapshot every 15 days, kept between sessions
+    __tablename__ = "market_stats"
+    id = Column(Integer, primary_key=True)
+    created = Column(DateTime)
+    period_start = Column(DateTime)
+    period_end = Column(DateTime)
+    data = Column(JSON, default=dict)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(Integer, primary_key=True)
@@ -136,7 +160,7 @@ engine = create_engine(f"sqlite:///{DATA_DIR / 'jobs.db'}", connect_args={"check
 def _pragmas(conn, _):
     cur = conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA busy_timeout=10000")
+    cur.execute("PRAGMA busy_timeout=30000")  # websites are stored in parallel
     cur.close()
 
 
@@ -161,8 +185,9 @@ def init_db():
 
 # --------------------------------------------------------------------------- API key file (local, chmod 600)
 ENV_KEYS = {"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
-            "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "gemini#2": "GEMINI_API_KEY_2", "groq#2": "GROQ_API_KEY_2",
-            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY", "nvidia": "NVIDIA_API_KEY",  # '#2': a second key, its own quota
+            "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY", "gemini#2": "GEMINI_API_KEY_2", "gemini#3": "GEMINI_API_KEY_3", "gemini#4": "GEMINI_API_KEY_4", "groq#2": "GROQ_API_KEY_2", "groq#3": "GROQ_API_KEY_3", "groq#4": "GROQ_API_KEY_4", "openrouter#2": "OPENROUTER_API_KEY_2", "openrouter#3": "OPENROUTER_API_KEY_3",
+            "xai": "XAI_API_KEY", "cohere": "COHERE_API_KEY", "cohere#2": "COHERE_API_KEY_2", "cohere#3": "COHERE_API_KEY_3", "nvidia": "NVIDIA_API_KEY",  # '#2': a second key, its own quota
+            "jobspipe": "JOBSPIPE_API_KEY",  # not AI: the JobsPipe job-data API (offers of many companies)
             # kept in the file but not used: SambaNova and Ollama Cloud need credits, GitHub Models closed in July 2026
             "sambanova": "SAMBANOVA_API_KEY", "ollama_cloud": "OLLAMA_API_KEY", "github_models": "GITHUB_MODELS_API_KEY",
             "kaggle": "KAGGLE_API_TOKEN", "kaggle#2": "KAGGLE_API_TOKEN_2",  # Kaggle: datasets and notebooks, no AI chat API
@@ -237,8 +262,9 @@ def set_setting(s, key, value):
 
 _ATS_DOMAINS = ("myworkdayjobs.com", "smartrecruiters.com", "breezy.hr", "teamtailor.com", "icims.com", "recruitee.com",
                 "lever.co", "greenhouse.io", "ashbyhq.com", "myworkdaysite.com", "eightfold.ai", "talentview.io",
-                "welcomekit.co", "talent-soft.com")
+                "welcomekit.co", "talent-soft.com", "taleez.com", "jobs.personio.de", "jobs.personio.com")
 _ATS_PATH = {"careers.smartrecruiters.com": 0, "jobs.smartrecruiters.com": 0, "jobs.lever.co": 0, "jobs.ashbyhq.com": 0,
+             "job-boards.greenhouse.io": 0, "boards.greenhouse.io": 0, "job-boards.eu.greenhouse.io": 0,
              "apply.workable.com": 0, "careers.werecruit.io": 1}  # host -> position of the company in the path
 _COMPANY_PAGES = ("jobs.stationf.co", "www.welcometothejungle.com", "welcometothejungle.com")  # '/companies/<company>'
 _HOST_PREFIX = {"www", "jobs", "job", "careers", "career", "carrieres", "carriere", "carrieresfrance", "recrutement", "emploi",
@@ -254,9 +280,10 @@ def company_from_url(url: str) -> str:
         # '/companies/joko-1' -> 'joko', Hellowork '/fr-fr/entreprises/-proxiad--86909.html' -> 'proxiad'
         name = re.sub(r"(?:-+\d+)?(?:\.html?)?$", "", seg[seg.index(board) + 1]).strip("-") or seg[seg.index(board) + 1]
     elif host in _ATS_PATH and len(seg) > _ATS_PATH[host]:
-        name = seg[_ATS_PATH[host]]
+        name = re.sub(r"-\d+$", "", seg[_ATS_PATH[host]]) or seg[_ATS_PATH[host]]  # workable 'corwave-1' -> 'corwave'
     elif any(host.endswith(d) for d in _ATS_DOMAINS) and len(parts) > 2:
-        words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external")]
+        words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external", "group")
+                 and not w.isdigit()]  # 'planity-1651249729.teamtailor.com' -> 'planity'
         name = max(words, key=len) if words else parts[0]  # 'careers-fr-soitec' -> 'soitec', 'expleo-jobs-fr-fr' -> 'expleo'
     else:
         rest = [x for x in parts[:-1] if x not in _HOST_PREFIX and x not in ("gouv", "co", "com", "ac", "org")] or parts[:1]
@@ -318,6 +345,12 @@ def wipe_session_data() -> bool:
         return False
     try:
         with SessionLocal() as s:
+            try:  # the analysed offers' facts go to the market history (statistics) before they are deleted
+                from .market import archive_offers
+                archive_offers(s)
+            except Exception as e:  # pragma: no cover - statistics never block a wipe
+                s.rollback()
+                LOG.warning("market history not updated: %s", e)
             for m in (Job, Source, CoverLetter):
                 s.query(m).delete()
             # the AI's reading of a public lab page is kept 30 days: an unchanged page is not sent to the AI again.

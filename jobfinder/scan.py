@@ -345,7 +345,12 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                 n_in, n_unk, n_out, last = pg.seen, 0, pg.out, None  # last: verdict of the page's last dated offer
                 prog.inc("date_x", pg.out)
                 listed += len(pg.jobs) + pg.out + pg.seen
-                for raw in distrust_shared_dates(pg.jobs):
+                for k, raw in enumerate(distrust_shared_dates(pg.jobs), 1):
+                    if k % 50 == 0:
+                        # websites are read in parallel and share one database: a platform page can hold every offer at
+                        # once (OpenAI: 813), and writing them in one transaction kept the other websites waiting past the
+                        # database's lock timeout ('database is locked' inside an autoflush)
+                        s.commit()
                     if not raw.get("title"):
                         continue
                     raw = refine_raw_date(dict(raw))

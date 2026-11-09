@@ -901,6 +901,26 @@ def crawl_recruitee(f, origin, cfg, known, st):
     yield Page("api", r.url, jobs, total=1, ordered=False)
 
 
+def crawl_personio(f, origin, cfg, known, st):
+    """Personio career sites ('acme.jobs.personio.de'): the public XML feed lists every offer with its offices, contract,
+    full text and creation date; each offer's page is '<origin>/job/<id>'."""
+    r = f.get(f"{origin}/xml")
+    root = ET.fromstring(getattr(r, "content", None) or r.text.encode("utf-8"))
+    jobs = []
+    for p in root.iter("position"):
+        get = lambda tag: (p.findtext(tag) or "").strip()
+        pid, title = get("id"), get("name")
+        if not (pid and title):
+            continue
+        offices = list(dict.fromkeys((o.text or "").strip() for o in p.iter("office") if (o.text or "").strip()))
+        text = " ".join(f"{d.findtext('name') or ''}: {html_to_text(d.findtext('value') or '')}" for d in p.iter("jobDescription"))
+        kind = ", ".join(x for x in (get("employmentType"), get("schedule"), get("recruitingCategory")) if x)
+        jobs.append(_raw(title, f"{origin}/job/{pid}", employer=get("subcompany"), location=" ; ".join(offices),
+                         description=text, department=get("department"), employment_type=kind, platform_id=pid, conf=0.9,
+                         provenance="personio-feed", **_date(get("createdAt"), "Personio createdAt")))
+    yield Page("feed", r.url, jobs, total=1, ordered=False)
+
+
 def crawl_breezy(f, origin, cfg, known, st):
     r = f.get(f"{origin}/json")
     budget, jobs = _Budget(cfg, st), []
@@ -1663,6 +1683,100 @@ def crawl_francetravail(f, url, cfg, known, st):
                 break
 
 
+# ---------------------------------------------------------------------------- JobsPipe: a paid job-data API, with your key
+# jobspipe.dev collects offers from company career sites, ATS platforms (Workday, Greenhouse, Lever, Teamtailor...), public
+# employment services (France Travail, EURES) and job boards. Indeed and LinkedIn are left out: their terms forbid automated
+# reading, also through a vendor (JobsPipe says so itself). Its API host's robots.txt ('Disallow: /') addresses crawlers;
+# the API is sold and documented for this use with a customer's key, so the calls made with your key do not check it.
+_JP_SEARCH = "https://api.jobspipe.dev/v1/jobs/search"
+JP_HOSTS = re.compile(r"(?:^|\.)jobspipe\.dev$")
+_JP_EXCLUDED = ["indeed", "linkedin"]
+_JP_PAGE, _JP_MAX_JOBS, _JP_MAX_WORDS = 25, 250, 60  # 1 credit per new offer per month; the free plan has 1,000 for good
+JP_NO_ACCESS = "access_restricted: JobsPipe needs your API key: add JOBSPIPE_API_KEY=jp_live_... to api_keys.txt"
+
+
+def _jp_words(cfg):
+    """The profile's titles and topics, as title words ('machine learning' matches 'Machine Learning Engineer'); short
+    ones ('ia', 'nlp') would match inside other words ('maintenance')."""
+    kws = (cfg.get("_profile") or PROFILE_DEFAULT).get("keywords", [])
+    return list(dict.fromkeys(k.strip() for k in kws if len(k.strip()) >= 4))[:_JP_MAX_WORDS]
+
+
+def _jp_days(cfg, now=None):
+    preset = cfg.get("date_preset")
+    if preset == "All dates":
+        return None
+    if preset == "Custom date range":
+        start = _cfg_day(cfg.get("date_from"))
+        return min(365, ((now or utcnow()).date() - start).days + 1) if start else None
+    return PRESET_DAYS.get(preset)
+
+
+def _jp_offer(o):
+    place = o.get("location") or ", ".join(o.get("cities") or [])
+    remote = o.get("remote") is True or str(o.get("work_arrangement") or "").lower() == "remote"
+    return _raw(o.get("job_title") or "", o.get("url") or o.get("source_url") or "", employer=o.get("company") or "",
+                location=place, description=o.get("description") or "", country_hint=o.get("country_code") or None,
+                remote_hint=remote, employment_type=", ".join(o.get("employment_statuses") or []),
+                platform_id=str(o.get("id") or ""), apply_url=o.get("url") or o.get("source_url") or "", conf=0.85,
+                provenance="jobspipe-api", **_date(o.get("date_posted"), "JobsPipe date_posted", cap=0.85))
+
+
+def save_jobspipe_credits(meta):
+    """JobsPipe's credit balance as its last answer gave it (AI quota page)."""
+    if "credits_remaining" not in (meta or {}):
+        return
+    try:
+        from .store import SessionLocal, set_setting
+        with SessionLocal() as s:
+            set_setting(s, "jobspipe_credits", {"remaining": meta["credits_remaining"],
+                                                "allowance": meta.get("credits_allowance"), "at": time.time()})
+    except Exception:  # pragma: no cover
+        pass
+
+
+def crawl_jobspipe(f, url, cfg, known, st):
+    """Offers in France whose title matches the profile, inside the date range, newest first, up to _JP_MAX_JOBS per scan."""
+    keys = {**load_keys(), **(cfg.get("_keys") or {})}
+    key = keys.get("jobspipe") or os.environ.get("JOBSPIPE_API_KEY", "")
+    if not key:
+        raise AccessError(JP_NO_ACCESS)
+    body = {"job_title_or": _jp_words(cfg), "job_country_code_or": ["FR"], "source_not": _JP_EXCLUDED, "limit": _JP_PAGE}
+    days = _jp_days(cfg)
+    if days:
+        body["posted_at_max_age_days"] = days
+    head = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    got, n, meta = 0, 0, {}
+    while got < _JP_MAX_JOBS:
+        if st.deadline and time.time() > st.deadline:
+            st.truncated = True
+            return
+        try:
+            r = f.request("POST", _JP_SEARCH, _robots=True, json=body, headers=head)
+        except AccessError as e:
+            raise AccessError("access_restricted: JobsPipe refused the API key (check JOBSPIPE_API_KEY)") from e
+        except ConnectionError as e:
+            if "402" not in str(e):
+                raise
+            if not got:
+                raise AccessError("access_restricted: JobsPipe credits used up (HTTP 402): buy credits or wait for the "
+                                  "next month of your plan") from e
+            f.note("JobsPipe credits used up: the offers read so far are kept")
+            return
+        d = r.json() or {}
+        meta, found = d.get("metadata") or {}, d.get("data") or []
+        jobs = [_jp_offer(o) for o in found if o.get("job_title") and (o.get("url") or o.get("source_url"))]
+        got, n = got + len(found), n + 1
+        yield Page(f"jobspipe:{n}", url, jobs, ordered=False)
+        body["cursor"] = meta.get("next_cursor")
+        if not found or not body["cursor"]:
+            break
+    if got >= _JP_MAX_JOBS:
+        st.truncated = True
+    f.note(f"JobsPipe: {got} offers read in {n} requests; credits left: {meta.get('credits_remaining', '?')}")
+    save_jobspipe_credits(meta)
+
+
 def detect_from_url(url):
     p = urlparse(url)
     host, seg = (p.hostname or "").lower(), [x for x in p.path.split("/") if x]
@@ -1685,6 +1799,8 @@ def detect_from_url(url):
         return "breezy", _origin(url)
     if host.endswith(".recruitee.com") and host.split(".")[0] not in _VENDOR_SUB:
         return "recruitee", _origin(url)
+    if re.search(r"\.jobs\.personio\.(?:de|com)$", host):
+        return "personio", f"https://{host}"
     if host.endswith(".teamtailor.com") and host.split(".")[0] not in _VENDOR_SUB:
         return "teamtailor", (_origin(url) + "/jobs.rss", "teamtailor")
     if host.endswith(".eightfold.ai") and host.split(".")[0] not in _VENDOR_SUB:
@@ -1720,7 +1836,7 @@ def detect_from_page(f, url, html):
     for a in soup.find_all(["a", "iframe", "script"], href=True) + soup.find_all(["iframe", "script"], src=True):
         found = detect_from_url(urljoin(url, a.get("href") or a.get("src")))
         if found and found[0] in ("greenhouse", "lever", "ashby", "workday", "breezy", "recruitee", "teamtailor",
-                                  "talentview", "workable", "eightfold", "softy"):
+                                  "talentview", "workable", "eightfold", "softy", "personio"):
             return found
     gh = list(dict.fromkeys(re.findall(r"(?:boards-api\.greenhouse\.io/v1/boards|(?:job-)?boards\.greenhouse\.io)/([\w-]+)", html)))
     gh = [t for t in gh if t not in ("embed", "v1")]
@@ -1848,6 +1964,17 @@ def _same_company(name, brand) -> bool:
     return bool(n) and (n == brand or (len(brand) >= 5 and (n.startswith(brand) or brand.startswith(n) and len(n) >= 5)))
 
 
+_FR_OFFER = re.compile(r"\bFrance\b|\bParis\b|\bLyon\b|\bToulouse\b|\bGrenoble\b|\bSophia[- ]Antipolis\b|\bNantes\b|"
+                       r"\bBordeaux\b|\bLille\b|\bRennes\b|\bMarseille\b|\bMontpellier\b|\"FR\"")
+
+
+def _offers_in_france(posts) -> bool:
+    """At least one offer of a job board placed in France (its location fields only, not its text)."""
+    keys = ("location", "locationName", "secondaryLocations", "address", "categories", "country", "workplaceType")
+    return any(_FR_OFFER.search(json.dumps({k: p.get(k) for k in keys}, ensure_ascii=False))
+               for p in (posts or []) if isinstance(p, dict))
+
+
 def find_board(f, url):
     """The company's offers on an open job platform, found from its domain name: used when its own career site blocks
     the app or shows no offer (ALTEN, Devoteam, EPSA on SmartRecruiters; Deezer, Aqemia on Teamtailor). A board is taken only
@@ -1865,7 +1992,13 @@ def find_board(f, url):
              lambda r: (re.search(r"<title>([^<]*)", r.text) or ["", ""])[1] if "<item>" in r.text else "",
              (f"https://{brand}.teamtailor.com/jobs.rss", "teamtailor")),
             ("greenhouse", f"https://boards-api.greenhouse.io/v1/boards/{brand}",
-             lambda r: r.json().get("name", ""), brand))
+             lambda r: r.json().get("name", ""), brand),
+            # Ashby and Lever do not name the company of a board: a board with the company's exact name is taken only
+            # when it lists offers in France (US 'Latitude' or 'Manifest' boards never pass)
+            ("ashby", f"https://api.ashbyhq.com/posting-api/job-board/{brand}",
+             lambda r: brand if len(brand) >= 4 and _offers_in_france(r.json().get("jobs")) else "", brand),
+            ("lever", f"https://api.lever.co/v0/postings/{brand}?mode=json",
+             lambda r: brand if len(brand) >= 4 and _offers_in_france(r.json()) else "", brand))
         for platform, probe, name_of, arg in tries:
             try:
                 r = f.get(probe)
@@ -1895,5 +2028,5 @@ ADAPTERS = {"greenhouse": crawl_greenhouse, "lever": crawl_lever, "ashby": crawl
             "teamtailor": crawl_feed, "talentsoft": crawl_talentsoft, "rss": crawl_feed,
             "successfactors": crawl_successfactors, "icims": crawl_icims, "wordpress": crawl_wordpress,
             "phenom": crawl_phenom, "eightfold": crawl_eightfold, "jibe": crawl_jibe, "workable": crawl_workable,
-            "talentview": crawl_talentview, "softy": crawl_softy,
-            "francetravail": crawl_francetravail}
+            "talentview": crawl_talentview, "softy": crawl_softy, "personio": crawl_personio,
+            "francetravail": crawl_francetravail, "jobspipe": crawl_jobspipe}

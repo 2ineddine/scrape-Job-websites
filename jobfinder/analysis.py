@@ -41,6 +41,13 @@ class JobAnalysis(BaseModel):
     reasoning_summary: str = ""
     analysis_confidence: float = Field(ge=0, le=1)
     needs_review: bool = False
+    # market facts for the statistics page (same call, no extra request)
+    skills: list[str] = []  # tools, languages, methods the offer asks for
+    degree: Literal["phd", "master", "engineer", "bachelor", "none", "unknown"] = "unknown"
+    seniority: Literal["intern", "junior", "mid", "senior", "lead", "unknown"] = "unknown"
+    languages: list[str] = []
+    remote: Literal["onsite", "hybrid", "remote", "unknown"] = "unknown"
+    salary_text: str = ""  # verbatim, when the offer states one
 
     @model_validator(mode="before")
     @classmethod
@@ -63,6 +70,13 @@ class JobAnalysis(BaseModel):
                 d[k] = ""
         if d.get("research_topics") is None:
             d["research_topics"] = []
+        for k in ("skills", "languages"):  # market facts: never fatal
+            v = d.get(k)
+            d[k] = [str(x)[:40] for x in v][:15] if isinstance(v, list) else []
+        for k in ("degree", "seniority", "remote"):
+            if d.get(k) not in get_args(cls.model_fields[k].annotation):
+                d[k] = "unknown"
+        d["salary_text"] = str(d.get("salary_text") or "")[:120]
         return d
 
 
@@ -99,10 +113,16 @@ def build_prompt(job, profile, text, cands, ti):
         f"published='{job.pub_date}'.\n<untrusted>\n{text or '(page text missing)'}\n</untrusted>\n"
         "contract_kind: job (CDI, CDD, permanent, fixed-term, freelance), internship (stage, internship, master project), "
         "apprenticeship (alternance, apprentissage), phd_postdoc (thesis, PhD, doctoral contract, post-doc), unknown.\n"
+        "MARKET FACTS (from the text only): skills = up to 12 short names of the tools, programming languages, frameworks and "
+        "methods the offer asks for (e.g. 'Python', 'PyTorch', 'C++', 'ROS', 'computer vision', 'Kubernetes'); degree = the "
+        "required degree (phd|master|engineer|bachelor|none|unknown); seniority (intern|junior|mid|senior|lead|unknown); "
+        "languages = spoken languages required (e.g. 'French', 'English'); remote (onsite|hybrid|remote|unknown); "
+        "salary_text = the salary as written in the offer, else empty.\n"
         "JSON keys: title, offer_kind(job|research_topic), contract_kind(job|internship|apprenticeship|phd_postdoc|unknown), "
         "role_type(research_ml|engineering_software|data|sales_business|admin_support|other), research_topics[], location_text, country_code, "
         "france_eligible(true|false|null), location_evidence, publication_date_choice(number|null), date_evidence, "
-        "is_relevant, relevance_score(0-100), reasoning_summary, analysis_confidence(0-1), needs_review")
+        "is_relevant, relevance_score(0-100), reasoning_summary, analysis_confidence(0-1), needs_review, "
+        "skills[], degree, seniority, languages[], remote, salary_text")
 
 
 def _ai_date(res, cands, text):
@@ -246,6 +266,9 @@ def analyze_pipeline(cfg, profile, keys, prog):
         _pipeline(cfg, profile, keys, prog, fetcher, rend)
     finally:
         rend.close()
+        from .market import run_if_due
+        with SessionLocal() as s:
+            run_if_due(s, force=bool(cfg.get("stats_with_scan")))  # market history; statistics every 15 days or on request
 
 
 def _by_priority(jobs):

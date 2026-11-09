@@ -1685,4 +1685,257 @@ def test_nvidia_models_answer_without_thinking(monkeypatch):
     assert sent["url"] == "https://integrate.api.nvidia.com/v1/chat/completions" and sent["auth"] == "Bearer nvapi-x"
     assert sent["payload"]["chat_template_kwargs"] == {"enable_thinking": False}  # else the answer length goes to thinking
     chain = llm.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"nvidia": "k"})
-    assert chain[0] == ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b", "nvidia")
+    assert chain[0] == ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b", "nvidia")
+
+
+def test_names_of_websites_hosted_on_job_platforms():
+    from jobfinder.store import company_from_url
+    assert company_from_url("https://job-boards.greenhouse.io/dataiku") == "Dataiku"  # not 'Boards'
+    assert company_from_url("https://donecle.taleez.com/") == "Donecle"  # not 'Taleez'
+    assert company_from_url("https://xxii-group.welcomekit.co/") == "Xxii"  # not 'Group'
+    assert company_from_url("https://careers-fr-soitec.icims.com/jobs/search") == "Soitec"
+
+
+def test_jobspipe_reads_offers_in_france_without_indeed_or_linkedin(monkeypatch):
+    from jobfinder import adapters
+    from jobfinder.adapters import crawl_jobspipe
+    from jobfinder.crawler import crawl_source
+    from jobfinder.web import AccessError
+    from test_adapters import R
+    monkeypatch.setattr(adapters, "load_keys", lambda: {})  # never the real api_keys.txt
+    monkeypatch.delenv("JOBSPIPE_API_KEY", raising=False)
+
+    def offer(i, title):
+        return {"id": f"j{i}", "job_title": title, "company": "Modjo", "location": "Paris", "country_code": "FR",
+                "date_posted": f"{TODAY}T15:41:12+00:00", "url": f"https://modjo.teamtailor.com/jobs/{i}-ml",
+                "description": "Machine learning for speech. " * 20, "employment_statuses": ["full_time"],
+                "sources": [{"provider": "teamtailor"}]}
+
+    class F:
+        def __init__(self, pages, fail=None):
+            self.pages, self.fail, self.bodies, self.notes = list(pages), fail, [], []
+
+        def note(self, m):
+            self.notes.append(m)
+
+        def request(self, method, url, _robots=False, json=None, headers=None):
+            assert method == "POST" and url == "https://api.jobspipe.dev/v1/jobs/search" and _robots is True
+            assert headers["Authorization"] == "Bearer jp_test"
+            self.bodies.append(dict(json))
+            if self.fail:
+                raise self.fail
+            return R(url, js=self.pages.pop(0))
+
+    cfg = {**CFG(), "_keys": {"jobspipe": "jp_test"}}
+    f = F([{"data": [offer(1, "Machine Learning Engineer"), offer(2, "Speech Scientist")], "metadata": {"next_cursor": "c2"}},
+           {"data": [offer(3, "Computer Vision Engineer")], "metadata": {"next_cursor": None, "credits_remaining": 994}}])
+    jobs = [j for pg in crawl_jobspipe(f, "https://jobspipe.dev/", cfg, set(), ScanState()) for j in pg.jobs]
+    assert [j["title"] for j in jobs] == ["Machine Learning Engineer", "Speech Scientist", "Computer Vision Engineer"]
+    body = f.bodies[0]
+    assert body["job_country_code_or"] == ["FR"] and body["source_not"] == ["indeed", "linkedin"]
+    assert body["posted_at_max_age_days"] == 30 and "machine learning" in body["job_title_or"] and "ia" not in body["job_title_or"]
+    assert f.bodies[1]["cursor"] == "c2"  # the next page
+    j = jobs[0]
+    assert j["url"] == "https://modjo.teamtailor.com/jobs/1-ml" and j["employer"] == "Modjo" and j["country_hint"] == "FR"
+    assert str(j["date"])[:10] == TODAY and "credits left: 994" in f.notes[-1]
+    import pytest
+    with pytest.raises(AccessError, match="JOBSPIPE_API_KEY"):  # no key: reported, nothing sent
+        list(crawl_jobspipe(F([]), "https://jobspipe.dev/", CFG(), set(), ScanState()))
+    with pytest.raises(AccessError, match="credits used up"):
+        list(crawl_jobspipe(F([], ConnectionError("HTTP 402")), "https://jobspipe.dev/", cfg, set(), ScanState()))
+    with pytest.raises(AccessError, match="refused the API key"):
+        list(crawl_jobspipe(F([], AccessError("access_restricted: HTTP 401")), "https://jobspipe.dev/", cfg, set(), ScanState()))
+    st = ScanState()  # a jobspipe.dev address in the website list is read through the API
+    f2 = F([{"data": [offer(4, "ML Engineer")], "metadata": {}}])
+    assert [j["title"] for pg in crawl_source(f2, "https://jobspipe.dev/", cfg, set(), st) for j in pg.jobs] == ["ML Engineer"]
+    assert st.platform.startswith("jobspipe")
+
+
+def test_personio_boards_are_read_from_their_public_feed():
+    from jobfinder.adapters import crawl_personio, detect_from_url
+    feed = (f"<workzag-jobs><position><id>193006</id><subcompany>Free2Move</subcompany><office>Paris</office>"
+            f"<additionalOffices><office>Lyon</office></additionalOffices><name>Data Scientist - Pricing</name>"
+            f"<jobDescriptions><jobDescription><name>Your mission</name><value><![CDATA[<p>Build ML pricing models.</p>]]></value>"
+            f"</jobDescription></jobDescriptions><employmentType>permanent</employmentType><schedule>full-time</schedule>"
+            f"<createdAt>{TODAY}T07:50:24+00:00</createdAt></position>"
+            f"<position><id></id><name>broken</name></position></workzag-jobs>")
+    f = FakeFetcher({"free2move.jobs.personio.de/xml": feed})
+    jobs = [j for pg in crawl_personio(f, "https://free2move.jobs.personio.de", CFG(), set(), ScanState()) for j in pg.jobs]
+    assert len(jobs) == 1
+    j = jobs[0]
+    assert j["title"] == "Data Scientist - Pricing" and j["url"] == "https://free2move.jobs.personio.de/job/193006"
+    assert j["location"] == "Paris ; Lyon" and "ML pricing models" in j["description"] and str(j["date"])[:10] == TODAY
+    assert detect_from_url("https://free2move.jobs.personio.de/job/193006?language=fr") == ("personio", "https://free2move.jobs.personio.de")
+
+
+def test_ashby_or_lever_board_found_by_name_only_with_offers_in_france():
+    from jobfinder.adapters import find_board
+    from test_adapters import R
+
+    class F(FakeFetcher):
+        def get(self, url, **kw):
+            if "api.ashbyhq.com" in url or "api.lever.co" in url:
+                self.calls.append(url)
+                return R(url, js=self.routes.get(url.split("/")[-1].split("?")[0], {"jobs": []} if "ashby" in url else []))
+            raise ConnectionError("HTTP 404")
+    us = F({"latitude": {"jobs": [{"title": "Accounts Payable", "location": "Pittsburgh, PA"}]}})
+    assert find_board(us, "https://www.latitude.eu/careers/") is None  # a US company with the same name
+    fr = F({"elevenlabs": {"jobs": [{"title": "Research Engineer", "location": "Remote",
+                                     "secondaryLocations": [{"location": "Paris, France"}]}]}})
+    assert find_board(fr, "https://elevenlabs.io/careers") == ("ashby", "elevenlabs", "elevenlabs")
+    lev = F({"doctrine": [{"text": "ML Engineer", "categories": {"location": "Paris"}}]})
+    assert find_board(lev, "https://www.doctrine.fr/") == ("lever", "doctrine", "doctrine")
+
+
+def test_board_names_without_their_platform_numbers():
+    from jobfinder.store import company_from_url
+    assert company_from_url("https://planity-1651249729.teamtailor.com/jobs") == "Planity"
+    assert company_from_url("https://apply.workable.com/corwave-1/") == "Corwave"
+
+
+def test_quota_record_per_key_and_model():
+    from jobfinder.llm import update_quota
+    step = ("groq", "openai/gpt-oss-120b", "groq#2")
+    q = {}
+    update_quota(q, step, "2026-11-09", headers={"x-ratelimit-limit-requests": "1000", "x-ratelimit-remaining-requests": "998"})
+    update_quota(q, step, "2026-11-09")
+    e = q["groq#2|openai/gpt-oss-120b"]
+    assert e["calls"] == 2 and e["month_calls"] == 2 and (e["limit"], e["remaining"]) == (1000, 998)
+    update_quota(q, step, "2026-11-09", until=1000 + 20, now=1000)  # a per-minute limit: not a daily one
+    assert e["until"] == 1020 and "learned" not in e
+    update_quota(q, step, "2026-11-09", until=1e12)  # the daily limit is reached after 2 calls
+    assert e["until"] == 1e12 and e["learned"] == 2
+    update_quota(q, step, "2026-11-09", error="Authentication failed")
+    assert "Authentication" in e["error"]
+    update_quota(q, step, "2026-11-10")  # a new day: the count starts again, the month goes on, the error is gone
+    assert e["calls"] == 1 and e["month_calls"] == 3 and "error" not in e and e["learned"] == 2
+
+
+def test_a_third_groq_key_comes_right_after_the_second():
+    from jobfinder import llm
+    chain = llm.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"groq": "a", "groq#2": "b", "groq#3": "c"})
+    assert chain[:3] == [("groq", "openai/gpt-oss-120b", "groq"), ("groq", "openai/gpt-oss-120b", "groq#2"),
+                         ("groq", "openai/gpt-oss-120b", "groq#3")]
+
+
+def test_a_second_openrouter_key_is_used_after_the_first():
+    from jobfinder import llm
+    chain = llm.model_chain({"auto_models": True, "model": {"provider": "ollama", "model": "x"}}, {"openrouter": "a", "openrouter#2": "b"})
+    assert chain[1] == (chain[0][0], chain[0][1], "openrouter#2") and chain[0][2] == "openrouter"
+
+
+def test_market_statistics_from_the_analysed_offers_every_15_days():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store, market
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    now = datetime(2026, 11, 9, 12)
+    with sessionmaker(bind=engine)() as s:
+        src = store.Source(url="https://jobs.lever.co/doctrine", label="Doctrine"); s.add(src)
+        s.add(store.CVDocument(name="cv.pdf", text="Data scientist: Python, SQL, statistics.", status="ok", enabled=True)); s.commit()
+        ai = lambda skills, **k: {"skills": skills, "degree": "master", "seniority": "junior", "languages": ["anglais", "French"],
+                                  "remote": "hybrid", "salary_text": "45-55 k€", "contract_kind": "job", **k}
+        mk = lambda i, status, score, rel, cvm=None: store.Job(
+            uid=f"u{i}", source_id=src.id, title=f"ML Engineer {i} (H/F)", employer="Doctrine", city="Paris", status=status,
+            description="You will build models in Python with PyTorch, write C++ services and connect Salesforce.",
+            relevance_score=score, relevance_json=rel, pub_date=now - timedelta(days=2), best_cv="cv.pdf" if cvm else None,
+            match_score=70 if cvm else None, match_json={"cv.pdf": cvm} if cvm else None)
+        s.add_all([mk(1, "relevant", 90, ai(["pytorch", "Python", "PyTorch"]), {"missing_requirements": ["Kubernetes"], "not_evidenced": ["ROS"]}),
+                   mk(2, "relevant", 85, ai(["PyTorch", "C++"])),
+                   mk(3, "excluded", 20, ai(["Salesforce"])),
+                   mk(4, "out_of_range", 80, ai(["PyTorch"]))])  # outside the range: never in the statistics
+        s.commit()
+        assert market.archive_offers(s, now) == 3
+        snap = market.compute_snapshot(s, now)
+        d = snap.data
+        assert d["relevant"] == 2 and d["analysed"] == 3 and d["base"] == "relevant"
+        assert d["top_skills"][0] == ["PyTorch", 2] and ["Python", 1] in d["top_skills"]  # once per offer, one spelling
+        assert ["Salesforce", 1] not in d["top_skills"]  # only the relevant offers describe the market of the field
+        # skills the offers name that the CV does not mention (the CV knows Python): PyTorch twice, C++ once
+        assert d["skill_gaps"] == [["PyTorch", 2], ["C++", 1]] and d["avg_match"] == 70.0
+        assert d["languages"][0][0] in ("English", "French") and d["contracts"] == [["job", 2]]
+        assert d["salaries"][0][2] == "45-55 k€" and d["top_companies"] == [["Doctrine", 2]]
+        # the history outlives the session's offers; the next snapshot comes 15 days later
+        s.query(store.Job).delete(); s.commit()
+        assert s.query(store.MarketOffer).count() == 3
+        assert not market.due(s, now + timedelta(days=14)) and market.due(s, now + timedelta(days=15))
+
+
+def test_company_names_and_cities_of_the_statistics():
+    from jobfinder.market import company_name
+    assert company_name("mistral.ai") == "Mistral AI" and company_name("GE HEALTHCARE") == "GE HealthCare"
+    assert company_name("Airliquidehr") == "Air Liquide" and company_name("EasyMile") == "EasyMile" and company_name("IBM") == "IBM"
+
+
+def test_one_unusable_json_answer_does_not_set_the_model_aside(monkeypatch):
+    import pytest
+    from jobfinder import llm as L
+
+    class R:
+        status_code, headers = 400, {}
+        text = '{"error":{"message":"Failed to generate JSON. Please adjust your prompt. See \'failed_generation\'","type":"invalid_request_error","code":"json_validate_failed"}}'
+    monkeypatch.setattr(L.requests, "post", lambda *a, **k: R())
+    with pytest.raises(L.MalformedOutput):  # not a refused key
+        L._post("https://api.groq.com/openai/v1/chat/completions", {}, {"max_tokens": 10})
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.6-flash", "g1"): L.MalformedOutput("bad json")})
+    assert llm.call_json("u", A, cfg, s, keys).ok  # the next model answered...
+    assert ("gemini", "gemini-3.6-flash", "gemini") not in llm._EXHAUSTED  # ...and the first one stays available
+
+
+def test_statistics_on_request_at_the_end_of_a_scan():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store, market
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    now = datetime(2026, 11, 9, 12)
+    with sessionmaker(bind=engine)() as s:
+        src = store.Source(url="https://jobs.lever.co/x", label="X"); s.add(src); s.commit()
+        s.add(store.Job(uid="a", source_id=src.id, title="ML Engineer", employer="X", status="relevant", relevance_score=90,
+                        relevance_json={"skills": ["Python"]})); s.commit()
+        assert market.run_if_due(s, now) is not None  # the first snapshot
+        s.add(store.Job(uid="b", source_id=src.id, title="CV Engineer", employer="X", status="relevant", relevance_score=88,
+                        relevance_json={"skills": ["OpenCV"]})); s.commit()
+        assert market.run_if_due(s, now + timedelta(days=2)) is None  # not due: the 15-day schedule waits
+        snap = market.run_if_due(s, now + timedelta(days=2), force=True)  # 'Update the statistics' ticked for this scan
+        assert snap is not None and snap.data["relevant"] == 2
+
+
+def test_a_model_that_times_out_is_left_for_ten_minutes(monkeypatch):
+    import time
+    from jobfinder import llm as L
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {("gemini", "gemini-3.6-flash", "g1"):
+                                                        L.AIError("Provider unreachable (ReadTimeout). Is the service running / reachable?")})
+    assert llm.call_json("u", A, cfg, s, keys).ok  # the next model answered
+    assert llm._EXHAUSTED[("gemini", "gemini-3.6-flash", "gemini")] > time.time() + 500
+
+
+def test_with_automatic_switching_a_slow_model_is_not_waited_for(monkeypatch):
+    import pytest
+    from jobfinder import llm as L
+    tries = []
+
+    def slow(*a, **k):
+        tries.append(k.get("timeout"))
+        raise L.requests.Timeout("read timed out")
+    monkeypatch.setattr(L.requests, "post", slow)
+    cfg = {"auto_models": True, "providers": {"groq": {"base_url": "https://api.groq.com/openai/v1"}}}
+    with pytest.raises(L.AIError, match="unreachable"):
+        L.chat("groq", "openai/gpt-oss-120b", "s", "u", cfg, {"groq": "k"})
+    assert tries == [60]  # one try of 60 s, not two of 90 s
+
+
+def test_only_the_skills_an_offer_really_names_are_counted():
+    from jobfinder.market import grounded
+    text = ("Train time-series foundation models on clusters with thousands of GPUs, fine-tune LLMs, and follow the latest "
+            "advancements in natural language processing. Optimisation des modèles, robotique, Vision Transformers.")
+    sk = ["GPU", "LLM", "time-series modeling", "NLP", "optimization", "robotics", "Python", "PyTorch", "Git", "computer vision"]
+    assert grounded(sk, text) == ["GPU", "LLM", "time-series modeling", "NLP", "optimization", "robotics"]
+
+
+def test_cities_and_salaries_of_the_statistics():
+    from jobfinder.market import _cities
+    assert _cities("Paris & Aubervilliers") == ["Paris", "Aubervilliers"] and _cities("France") == [] and _cities("Lyon; Remote") == ["Lyon"]

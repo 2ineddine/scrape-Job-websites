@@ -22,8 +22,8 @@ from jobfinder.analysis import analyze_pipeline
 from jobfinder.classify import OFFER_TYPES
 from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config, upgrade_profile
 from jobfinder.scan import Progress, run_scan
-from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, get_setting,
-                             init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
+from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, file_coverage,
+                             get_setting, init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
                              wipe_session_data)
 from jobfinder.web import extract_urls, offer_link
 
@@ -119,11 +119,14 @@ def step_websites(running, n):
             for f in files:
                 if f.size > 2_000_000:
                     st.toast(f"{f.name} is over 2 MB: skipped", icon=":material/warning:")
-            urls = list(dict.fromkeys(u for f in files if f.size <= 2_000_000
-                                      for u in extract_urls(f.getvalue().decode("utf-8", errors="replace"))))
+            origins = {}  # url -> the files that list it: the scan shows how much of each file it searched
+            for f in files:
+                if f.size <= 2_000_000:
+                    for u in extract_urls(f.getvalue().decode("utf-8", errors="replace")):
+                        origins.setdefault(u, []).append(f.name)
             try:
                 with SessionLocal() as s:
-                    load_new_sources(s, urls)
+                    load_new_sources(s, list(origins), origins)
             except RuntimeError as e:
                 st.error(str(e))
                 return
@@ -135,7 +138,7 @@ def step_websites(running, n):
             if st.button("Use these URLs", disabled=running or not extract_urls(pasted)):
                 try:
                     with SessionLocal() as s:
-                        load_new_sources(s, extract_urls(pasted))
+                        load_new_sources(s, extract_urls(pasted), {u: ["pasted URLs"] for u in extract_urls(pasted)})
                 except RuntimeError as e:
                     st.error(str(e))
                     return
@@ -153,7 +156,7 @@ def step_websites(running, n):
                            + "; ".join(f"{x.label}: {x.health}" for x in worse[:5]) + (" …" if len(worse) > 5 else ""),
                            icon=":material/monitor_heart:")
             with st.expander("Websites and how each one was read"):
-                st.dataframe(pd.DataFrame([dict(website=x.label, host=urlparse(x.url).hostname, read_by=x.platform or "—",
+                st.dataframe(pd.DataFrame([dict(website=x.label, file=(x.origin or "").replace("\n", ", "), host=urlparse(x.url).hostname, read_by=x.platform or "—",
                                                 status=READ_OUTCOME.get(x.outcome, x.status), offers=x.jobs_found,
                                                 on_lists=x.listed, since_last_scan=x.health, note=x.last_error, url=x.url)
                                            for x in srcs]),
@@ -204,6 +207,40 @@ def step_cv(running, n):
             ap["linkedin"], ap["website"] = x.text_input("LinkedIn URL", ap["linkedin"]), y.text_input("Website", ap["website"])
 
 
+COVERAGE = (("read", "read", "green"), ("partial", "partly read", "amber"), ("failed", "blocked or failed", "red"),
+            ("waiting", "not searched yet", "grey"))
+
+
+def coverage_bars(running):
+    """One bar per input file: how many of its websites were searched, and how each one ended."""
+    with SessionLocal() as s:
+        rows = file_coverage(s)
+    if not rows:
+        return
+    out = []
+    for r in rows:
+        done, tot = r["total"] - r["waiting"], r["total"] or 1
+        segs = "".join(f'<span class="jf-cov-seg {cls}" style="width:{100 * r[k] / tot:.2f}%" title="{r[k]} {lab}"></span>'
+                       for k, lab, cls in COVERAGE if r[k])
+        if not r["waiting"]:
+            head = f"✓ all {r['total']} websites searched"
+        else:
+            head = f"{done} / {r['total']} websites searched" + ("" if running else f" — {r['waiting']} not reached")
+        legend = " · ".join(f'<span class="jf-cov-key {cls}"></span>{r[k]} {lab if k != "waiting" or running else "not reached"}'
+                            for k, lab, cls in COVERAGE if r[k])
+        out.append(f'<div class="jf-cov"><div class="jf-cov-head"><b>{html.escape(r["file"])}</b><span>{head}</span></div>'
+                   f'<div class="jf-cov-bar" role="img" aria-label="{html.escape(r["file"])}: {head}">{segs}</div>'
+                   f'<div class="jf-cov-legend">{legend}</div></div>')
+    st.html('<div class="jf-covs">' + "".join(out) + "</div>")
+    missed = [(r["file"], m) for r in rows for m in r["missed"]]
+    if missed and not running:
+        with st.expander(f"Websites not searched, or blocked ({len(missed)})"):
+            st.caption("Not reached: the scan stopped first (90-minute limit or Stop): start it again, or load a smaller file. "
+                       "Blocked or failed: the reason is in 'Websites and how each one was read' (step 1).")
+            st.dataframe(pd.DataFrame([dict(file=f, website=m) for f, m in missed]), hide_index=True, width="stretch",
+                         height=min(38 + 35 * len(missed), 320))
+
+
 def _monitor():
     d, log = prog.snap()
     if d["running"]:
@@ -214,6 +251,7 @@ def _monitor():
         return
     st.progress(min(d["sources_done"] / (d["sources_total"] or 1), 1.0),
                 text=f"{d['task'].capitalize()} — websites {d['sources_done']} / {d['sources_total']}")
+    coverage_bars(d["running"])
     if d["ai_total"]:
         st.progress(min(d["ai_done"] / d["ai_total"], 1.0), text=f"AI reading offers {d['ai_done']} / {d['ai_total']}")
         if llm.USAGE["model"]:

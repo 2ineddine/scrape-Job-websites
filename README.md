@@ -17,11 +17,14 @@ Optional: a LaTeX distribution (`latexmk`), to compile cover letters to PDF.
 
 ## Use
 
-1. **Websites**: upload one or more HTML files listing career-page URLs (`websites.html` to `websites6.html`;
+1. **Websites**: upload one or more HTML files listing career-page URLs (`websites.html` to `websites8.html`;
    `websites5.html` holds STATION F startups, `websites6.html` startups funded in 2025–2026, Next40 / French Tech 120
-   scale-ups and large groups; `websites7.html` AI labs with Paris teams, deep-tech, scale-ups and more large groups), or paste URLs.
+   scale-ups and large groups; `websites7.html` AI labs with Paris teams, deep-tech, scale-ups and more large groups;
+   `websites8.html` ESN, large to very small), or paste URLs. Addresses written without quotes, in comments, are not read.
 2. **CV**: upload PDF CVs. A CV is sent to a hosted AI only after you tick the consent box.
-3. **Analysis**: choose the offer types and the date range (24 h to 30 days), then press **Start**.
+3. **Analysis**: choose the offer types and the date range (24 h to 30 days), then press **Start**. One bar per
+   uploaded file shows how many of its websites were searched: read, partly read, blocked or failed, and not reached
+   (the scan stopped first). The websites not searched are listed under the bars at the end.
 
 The **Statistics** page shows the job market of the field, computed every 15 days from the offers the AI analysed: most requested skills, skills missing from the CV, companies hiring, cities, offers per week, contract, degree, seniority, languages, remote work, salaries stated and best CV matches. Each figure is compared with the previous 15 days. A skill counts only when the offer names it, so a model's guess is dropped; "skills missing from the CV" are the skills the offers name that the CV does not mention. The offers' facts are kept 6 months for it, even though each scan starts fresh. Tick "Update the statistics at the end of this scan" in step 3 to recompute them after a scan. The **AI quota** page shows what each AI key has left.
 
@@ -95,6 +98,7 @@ docker run -d -p 127.0.0.1:8501:8501 --env-file api_keys.txt -v job-finder-data:
     instead);
   - JobTeaser and Glassdoor: anti-bot protection.
 - Workday may refuse requests for a few hours after several full scans in a row.
+- Hellowork company pages: only the first page (about the 30 newest offers) is read; robots.txt closes the next ones.
 
 ## Project
 

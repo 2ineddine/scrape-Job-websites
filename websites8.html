@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Open Multiple Tabs</title>
+</head>
+<body>
+    <script>
+        // Add your URLs here
+        // ESN (IT services and engineering consulting) in France, checked 10 Nov 2026: each address below was read
+        // with the app's reader and gave offers. The big ESNs already in websites.html to websites3.html (Capgemini,
+        // Sopra Steria, CGI, Accenture, Alten, Atos / Eviden, Inetum, Devoteam, SII, Expleo, Onepoint, Talan, Aubay,
+        // Wavestone, Scalian, Zenika, OCTO, SQLI, Viveris, Keyrus, Hardis, Smile, Elsys, Proxiad...) are not repeated.
+        const urls = [
+            // Large and mid-size ESN and engineering consultancies
+            'https://www.hellowork.com/fr-fr/entreprises/segula-technologies-3006.html',  // Segula: own site has a broken HTTPS certificate; Hellowork's first page (newest ~30 offers)
+            'https://www.hellowork.com/fr-fr/entreprises/astek-519.html',  // Astek: own site has a broken HTTPS certificate; Hellowork's first page
+            'https://www.hellowork.com/fr-fr/entreprises/infotel-4303.html',  // Infotel: own career page lists no offers; Hellowork's first page
+            'https://www.hellowork.com/fr-fr/entreprises/avisto-136576.html',  // Avisto (Vallauris): Hellowork's first page
+            'https://akka-cand.talent-soft.com/job/list-of-jobs.aspx?lcid=2057',  // Akkodis: every country (the app keeps France)
+            'https://open.wd103.myworkdayjobs.com/fr-FR/OPEN',  // Groupe Open
+            'https://neosoft.wd3.myworkdayjobs.com/fr-FR/neo-soft',  // Néosoft
+            'https://www.davidson.fr/nos-offres',  // Davidson Consulting
+            'https://www.sia-partners.com/fr/nous-rejoindre',  // Sia Partners (and Heka, its AI lab)
+            'https://www.viseo.com/fr/offres-demploi/',  // Viseo
+            'https://medianesysteme.com/carrieres/',  // Médiane Système: embedded systems and electronics
+            'https://www.extia-group.com/join-us',  // Extia
+            'https://jobs.lever.co/margo-group',  // Margo
+            'https://jobs.lever.co/theodo',  // Theodo group: Theodo, Padok, Sicara
+            'https://jobs.lever.co/sfeir',  // SFEIR
+            'https://ingeniance.fr/carrieres/',  // Ingeniance: finance, data, quant
+            'https://www.alteca.fr/offres/',  // Alteca
+            'https://www.squadgroup.com/fr/nous-rejoindre/nos-offres-demploi/',  // Squad: cybersecurity
+            'https://www.hellowork.com/fr-fr/entreprises/adentis-116378.html',  // Adentis: embedded, robotics, vision (its own page links Hellowork)
+
+            // Small and very small ESN, data / AI and digital studios
+            'https://jobs.lever.co/ippon',  // Ippon Technologies
+            'https://converteo.teamtailor.com/jobs',  // Converteo: data and AI
+            'https://apply.workable.com/fifty-five/',  // fifty-five: data
+            'https://saegus.welcomekit.co/',  // Saegus: data and AI
+            'https://www.smartpoint.fr/a-propos/nous-rejoindre/',  // Smartpoint: data and AI
+            'https://www.clever-age.com/offres-emploi/',  // Clever Age
+            'https://www.hymaia.com/nous-recrutons/',  // Hymaïa: data and AI
+            'https://aneo.recruitee.com/',  // Aneo: HPC, GPU and AI
+            'https://coexya.cvcatcher.io/',  // Coexya
+            'https://amoddex.teamtailor.com/jobs',  // Amoddex: data
+            'https://kaliop.recruitee.com/',  // Kaliop
+            'https://aqsone.recruitee.com/',  // Aqsone: data science (Toulouse)
+            'https://eleven-labs.welcomekit.co/',  // Eleven Labs
+            'https://marmelab.com/jobs',  // Marmelab
+            'https://www.bewizyu.com/fr/carriere'  // Bewizyu
+        ];
+
+        // not screened (checked 10 Nov 2026), so not in the list above (addresses without quotes are not read):
+        //   Pentalog https://www.pentalog.com, Infeeny https://www.infeeny.com: broken HTTPS certificate, no job platform found
+        //   Apside https://www.apside.com: website unreachable, its Hellowork page is gone (Apside is now part of CGI)
+        //   Klanik https://www.klanik.com/en/jobs: the website answers HTTP 503 to automated visits
+        //   Amaris https://careers.amaris.com: SAP SuccessFactors page, only a few offers outside France readable
+        //   Randstad Digital https://www.randstaddigital.fr, Avanade https://www.avanade.com/fr-fr/career, Orange Business
+        //   https://www.orange-business.com, Klee Group https://www.kleegroup.com, Koïno https://www.koino.fr, Arolla
+        //   https://www.arolla.fr, Agaetis https://www.agaetis.fr, Eulidia https://www.eulidia.com, Rheso https://www.rheso.tech:
+        //   no offers on the career page, or offers loaded by a script the app cannot read
+        //   Sword Group https://apply.workable.com/sword-group: no offer in France; Aquila Data https://www.aquiladata.fr: offers from 2014
+        //   Lunatech https://lunatech.fr, Modeo, Kaizen Solutions: no open roles; Openium, Publicis Sapient: robots.txt closes the site
+        //   Same name, other company: 'lincoln' (Greenhouse), 'squad' (Greenhouse), 'wescale' (Ashby)
+
+        // Open each URL in a new tab
+        urls.forEach(url => {
+            window.open(url, '_blank');
+        });
+
+        // Close the original blank tab (optional)
+        window.close();
+    </script>
+</body>
+</html>

@@ -59,6 +59,8 @@ _LOC_LABEL = re.compile(r"(?:\b(?:Localisation|LOCALISATION|Lieu|LIEU|Location|L
                         r"\s*[•\-–]?\s*([^\n|;•]{2,120})")
 # a search form's prompt after its label ('Localisation ▼ Veuillez sélectionner une valeur'), not a place
 _FORM_PROMPT = re.compile(r"(?i)^\W*(?:veuillez|s[ée]lectionne|select|choisi|choose|tou(?:te)?s?\b|all\b|any\b|rechercher|search)")
+# a sentence after the words of a label ('un lieu de travail où équité F/H, inclusion et diversité sont la norme'), not a place
+_SENTENCE = re.compile(r"(?i)^\W*(?:où|qui|que|dont|et|dans|pour|avec|o[uù] |where|which|that|and|with|for|is|are)\b")
 # where a label's value ends: two spaces, a separator, the next label ('Contrat :'), 'Ville'
 _LABEL_END = re.compile(r"\s{2,}|\s*[|;•\n]|\s+[A-Z][a-zé]+(?:\s+[A-Za-zé]+)?\s*:|\s+Ville\b")
 
@@ -140,7 +142,8 @@ def location_from_text(text, title="") -> str:
     a place written after a cue ('location_on Lyon', 'notre agence de Lille', '(H/F) à Lyon') counts only when it is a real
     French place of the official list (or a known foreign place), in the first lines of the text (not in 'other offers')."""
     t = str(text or "")[:8000]
-    found = [v for v in (_label_value(m.group(1)) for m in _LOC_LABEL.finditer(t)) if not _FORM_PROMPT.search(v)]
+    found = [v for v in (_label_value(m.group(1)) for m in _LOC_LABEL.finditer(t))
+             if not _FORM_PROMPT.search(v) and not _SENTENCE.search(v)]
     verified = next((x for x in found if classify_location(x)["location_verified"]), "")
     if verified:
         return verified

@@ -32,6 +32,7 @@ class Source(Base):
     listed = Column(Integer, default=0)  # offers on the website's lists, inside the date range or not
     outcome = Column(String, default="")  # offers_found | nothing_in_range | no_offers_detected | partial
     health = Column(String, default="")  # what changed since the previous scan ('read on 2026-11-01, now blocked')
+    origin = Column(String, default="")  # the input file(s) that list it, one name per line ('pasted URLs' when pasted)
 
 
 class SiteMemory(Base):  # kept between sessions: what is normal for a website
@@ -171,7 +172,8 @@ def init_db():
     Base.metadata.create_all(engine)
     with engine.begin() as conn:  # a database made by an older version gets the new columns
         have = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(sources)")}
-        for name, kind in (("listed", "INTEGER DEFAULT 0"), ("outcome", "VARCHAR DEFAULT ''"), ("health", "VARCHAR DEFAULT ''")):
+        for name, kind in (("listed", "INTEGER DEFAULT 0"), ("outcome", "VARCHAR DEFAULT ''"), ("health", "VARCHAR DEFAULT ''"),
+                           ("origin", "VARCHAR DEFAULT ''")):
             if name not in have:
                 conn.exec_driver_sql(f"ALTER TABLE sources ADD COLUMN {name} {kind}")
         if "kind" not in {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(ai_cache)")}:
@@ -262,13 +264,16 @@ def set_setting(s, key, value):
 
 _ATS_DOMAINS = ("myworkdayjobs.com", "smartrecruiters.com", "breezy.hr", "teamtailor.com", "icims.com", "recruitee.com",
                 "lever.co", "greenhouse.io", "ashbyhq.com", "myworkdaysite.com", "eightfold.ai", "talentview.io",
-                "welcomekit.co", "talent-soft.com", "taleez.com", "jobs.personio.de", "jobs.personio.com")
+                "welcomekit.co", "talent-soft.com", "taleez.com", "jobs.personio.de", "jobs.personio.com", "cvcatcher.io")
 _ATS_PATH = {"careers.smartrecruiters.com": 0, "jobs.smartrecruiters.com": 0, "jobs.lever.co": 0, "jobs.ashbyhq.com": 0,
              "job-boards.greenhouse.io": 0, "boards.greenhouse.io": 0, "job-boards.eu.greenhouse.io": 0,
              "apply.workable.com": 0, "careers.werecruit.io": 1}  # host -> position of the company in the path
 _COMPANY_PAGES = ("jobs.stationf.co", "www.welcometothejungle.com", "welcometothejungle.com")  # '/companies/<company>'
 _HOST_PREFIX = {"www", "jobs", "job", "careers", "career", "carrieres", "carriere", "carrieresfrance", "recrutement", "emploi",
                 "emplois", "join", "apply", "talents", "talent", "work", "hiring"}
+
+
+_RENAMED = {"akka": "akkodis"}  # 'akka-cand.talent-soft.com': Akka is now Akkodis
 
 
 def company_from_url(url: str) -> str:
@@ -282,9 +287,10 @@ def company_from_url(url: str) -> str:
     elif host in _ATS_PATH and len(seg) > _ATS_PATH[host]:
         name = re.sub(r"-\d+$", "", seg[_ATS_PATH[host]]) or seg[_ATS_PATH[host]]  # workable 'corwave-1' -> 'corwave'
     elif any(host.endswith(d) for d in _ATS_DOMAINS) and len(parts) > 2:
-        words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external", "group")
-                 and not w.isdigit()]  # 'planity-1651249729.teamtailor.com' -> 'planity'
-        name = max(words, key=len) if words else parts[0]  # 'careers-fr-soitec' -> 'soitec', 'expleo-jobs-fr-fr' -> 'expleo'
+        words = [w for w in parts[0].split("-") if w not in _HOST_PREFIX and w not in ("fr", "en", "global", "external", "group",
+                 "cand") and not w.isdigit()]  # 'planity-1651249729.teamtailor.com' -> 'planity'
+        # 'careers-fr-soitec' -> 'soitec', 'expleo-jobs-fr-fr' -> 'expleo', 'eleven-labs.welcomekit.co' -> 'eleven labs'
+        name = _RENAMED.get("-".join(words), "-".join(words)) if words else parts[0]
     else:
         rest = [x for x in parts[:-1] if x not in _HOST_PREFIX and x not in ("gouv", "co", "com", "ac", "org")] or parts[:1]
         name = rest[-1] if len(rest[-1]) > 3 or len(rest) == 1 else rest[0]
@@ -292,9 +298,10 @@ def company_from_url(url: str) -> str:
     return name.upper() if len(name) <= 3 else name.title()
 
 
-def add_sources(s, urls: list[str]):
+def add_sources(s, urls: list[str], origins: dict | None = None):
     """Each URL is put in one uniform form first (urlclean): search words, page numbers and tracking codes of a past
-    search are removed, so every website is read whole and filtered the same way. Duplicates collapse."""
+    search are removed, so every website is read whole and filtered the same way. Duplicates collapse.
+    origins: {url: [file names]}, the input files that list each URL; a website listed by several files keeps them all."""
     from .urlclean import clean_source_url
     added = 0
     for u in urls:
@@ -302,10 +309,14 @@ def add_sources(s, urls: list[str]):
             continue
         clean, removed = clean_source_url(u)
         nu = normalize_url(clean)
-        if not s.query(Source).filter_by(url=nu).first():
-            s.add(Source(url=nu, label=company_from_url(nu), platform="",
+        names = list((origins or {}).get(u) or [])
+        src = s.query(Source).filter_by(url=nu).first()
+        if not src:
+            s.add(Source(url=nu, label=company_from_url(nu), platform="", origin="\n".join(dict.fromkeys(names)),
                          last_error=("URL simplified: " + ", ".join(removed)) if removed else ""))
             added += 1
+        elif names:
+            src.origin = "\n".join(x for x in dict.fromkeys([*(src.origin or "").split("\n"), *names]) if x)
     s.commit()
     return added
 
@@ -363,9 +374,26 @@ def wipe_session_data() -> bool:
     return True
 
 
-def load_new_sources(s, urls: list[str]) -> int:
+def load_new_sources(s, urls: list[str], origins: dict | None = None) -> int:
     """A new file REPLACES the previous websites and every job found before."""
     if not wipe_session_data():
         raise RuntimeError("a scan is running in another window or process: load new websites when it has finished")
-    return add_sources(s, urls)
+    return add_sources(s, urls, origins)
+
+
+def file_coverage(s) -> list[dict]:
+    """Per input file: how many of its websites the last scan searched, and how each one ended.
+    'not reached': the scan stopped (time limit, Stop button) before this website."""
+    out = {}
+    for src in s.query(Source).all():
+        kind = ("read" if src.status == "completed" else "partial" if src.status == "partially_completed"
+                else "failed" if src.status in ("blocked", "failed") else "waiting")
+        for name in (src.origin or "").split("\n") or [""]:
+            row = out.setdefault(name or "other URLs", dict(file=name or "other URLs", total=0, read=0, partial=0,
+                                                           failed=0, waiting=0, missed=[]))
+            row["total"] += 1
+            row[kind] += 1
+            if kind in ("failed", "waiting"):
+                row["missed"].append(src.label or src.url)
+    return sorted(out.values(), key=lambda r: r["file"])
 

@@ -1939,3 +1939,91 @@ def test_only_the_skills_an_offer_really_names_are_counted():
 def test_cities_and_salaries_of_the_statistics():
     from jobfinder.market import _cities
     assert _cities("Paris & Aubervilliers") == ["Paris", "Aubervilliers"] and _cities("France") == [] and _cities("Lyon; Remote") == ["Lyon"]
+
+
+def test_each_input_file_shows_how_many_of_its_websites_were_searched():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as s:
+        store.add_sources(s, ["https://a.fr/jobs", "https://b.fr/careers", "https://c.fr/jobs"],
+                          {"https://a.fr/jobs": ["one.html"], "https://b.fr/careers": ["one.html", "two.html"],
+                           "https://c.fr/jobs": ["two.html"]})
+        store.add_sources(s, ["https://a.fr/jobs?page=2"], {"https://a.fr/jobs?page=2": ["two.html"]})  # same website
+        a, b, c = (s.query(store.Source).filter(store.Source.url.like(f"https://{x}.fr%")).one() for x in "abc")
+        assert a.origin == "one.html\ntwo.html" and b.origin == "one.html\ntwo.html"
+        a.status, b.status = "completed", "blocked"
+        s.commit()
+        one, two = store.file_coverage(s)
+        assert (one["file"], one["total"], one["read"], one["failed"], one["waiting"]) == ("one.html", 2, 1, 1, 0)
+        assert (two["total"], two["read"], two["failed"], two["waiting"]) == (3, 1, 1, 1)
+        assert sorted(two["missed"]) == sorted([b.label, c.label])
+
+
+def _site(pages):
+    """A fake website: {url ending: html}; any other address is an offer page."""
+    body = "<h1>Offre</h1><main>" + "<p>Missions du poste, profil, compétences, candidature, contrat CDI, télétravail.</p>" * 12 + "</main>"
+
+    class F(FakeFetcher):
+        def get(self, url, **kw):
+            text = next((h for k, h in pages.items() if url.endswith(k)), body)
+            return type("R", (), {"text": text, "url": url, "status_code": 200})()
+
+        def robots_ok(self, url):
+            return True
+
+        def note(self, m):
+            pass
+    return F({})
+
+
+def _read(f, url):
+    from jobfinder.crawler import crawl_generic
+    cfg = {**CFG(), "_profile": {**CFG()["_profile"], "offer_types": ["job", "internship", "phd_postdoc", "apprenticeship"]}}
+    return [j for pg in crawl_generic(f, url, cfg, set(), ScanState()) for j in pg.jobs]
+
+
+def test_offer_links_with_a_prefixed_job_id_and_a_read_more_button():
+    # the card's fields are headings too ('Date', 'URL'): the offer's title is the heading that reads like one
+    cards = "".join(f'<div class="eolia-job"><div class="eolia-job-param"><h3>Date</h3><p>09/11/2026</p></div>'
+                    f'<div class="eolia-job-param"><h3>Localisation</h3><p>Paris</p></div><h2>Ingénieur data {k} (H/F)</h2>'
+                    f'<div class="eolia-job-param eolia-job-url"><h3>URL</h3>'
+                    f'<a href="/carrieres-offre/?ingeniance_job_id={k}&ingeniance_job_ref=ING-{k}&"><p>En savoir plus</p></a></div></div>'
+                    for k in (1076, 1225, 1239))
+    jobs = _read(_site({"/carrieres/": cards}), "https://ingeniance.fr/carrieres/")
+    assert sorted(j["title"] for j in jobs) == ["Ingénieur data 1076 (H/F)", "Ingénieur data 1225 (H/F)", "Ingénieur data 1239 (H/F)"]
+
+
+def test_offer_links_win_over_page_data_that_holds_other_items():
+    import json
+    data = {"props": {"pageProps": {"items": [{"title": t, "slug": s, "url": f"https://x-group.com/{s}", "id": i,
+                                               "jobTitle": t, "datePosted": "2026-11-01"}
+                                              for i, (t, s) in enumerate([("Quel Extien es-tu ?", "extien"), ("Moving Motivators", "mm")])]}}}
+    links = "".join(f'<a href="/join-us/ingenieur-devops-{k}-h-f">Ingénieur DevOps {k} (H/F) CDI Lille</a>' for k in range(6))
+    page = f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script>{links}'
+    jobs = _read(_site({"/join-us": page}), "https://x-group.com/join-us")
+    titles = {j["title"] for j in jobs}
+    assert "Quel Extien es-tu ?" not in titles and len([t for t in titles if t.startswith("Ingénieur DevOps")]) == 6
+
+
+def test_the_full_list_is_read_when_the_page_shows_a_preview():
+    short = '<a href="/nos-offres/a-h-f">Ingénieur A (H/F)</a><a href="/nos-offres?expertise=all&search=all">Voir toutes nos offres</a>'
+    full = "".join(f'<a href="/nos-offres/poste-{k}-h-f">Ingénieur logiciel {k} (H/F)</a>' for k in range(8))
+    jobs = _read(_site({"/nos-offres?expertise=all&search=all": full, "/nos-offres": short}), "https://davidson.fr/nos-offres")
+    assert len(jobs) == 8 and all(j["title"].startswith("Ingénieur logiciel") for j in jobs)
+
+
+def test_a_sentence_after_a_place_label_is_not_a_place():
+    from jobfinder.classify import location_from_text
+    text = "Nous croyons en un lieu de travail où équité F/H, inclusion et diversité sont la norme.\nLieu de travail : Metz"
+    assert location_from_text(text) == "Metz"
+    assert location_from_text("Nous croyons en un lieu de travail où équité F/H, inclusion et diversité sont la norme.") == ""
+
+
+def test_company_names_from_platform_subdomains():
+    from jobfinder.store import company_from_url as c
+    assert c("https://eleven-labs.welcomekit.co/") == "Eleven Labs" and c("https://coexya.cvcatcher.io/") == "Coexya"
+    assert c("https://akka-cand.talent-soft.com/job/list-of-jobs.aspx") == "Akkodis"
+    assert c("https://careers-fr-soitec.icims.com/") == "Soitec" and c("https://planity-1651249729.teamtailor.com/jobs") == "Planity"

@@ -85,3 +85,10 @@ def test_startup_business_roles_with_an_ai_word_are_not_research_offers():
               "AI Engineer - Stage - Janvier 2027", "Machine Learning & Computer Vision Platform Engineer"):
         assert analyze_title(t, "", p, "").verdict == "pass", t
     assert analyze_title("Ingénieur Cyber Sécurité Manager (CSM)", "", p, "").verdict != "reject"
+
+
+def test_a_remote_offer_keeps_its_city():
+    # Hellowork marks telework offers remote: 'Paris, Île-de-France, FR' still counts in the statistics' cities
+    loc = classify_location("Paris, Île-de-France, FR", remote_hint=True)
+    assert loc["france_eligible"] and loc["remote_status"] == "remote" and loc["city"] == "Paris"
+    assert classify_location("Remote - France")["city"] is None and classify_location("Télétravail, France")["city"] is None

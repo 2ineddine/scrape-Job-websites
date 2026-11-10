@@ -379,10 +379,11 @@ def build_filter_prompt(url, title, items, text, loc, days, state):
             "reasoning (one short sentence)")
 
 
-def apply_site_filters(pg, cfg, s, note) -> bool:
+def apply_site_filters(pg, cfg, s, note, applied=None) -> bool:
     """Use the filters of the career website (location + 'posted within' / newest first) before the list is read.
-    Returns True when at least one action changed the page. Never raises for AI / click problems: filtering is a
-    speed-up, the app's own date and location checks still run on every job afterwards."""
+    Returns True when at least one action changed the page; `applied` (a list) receives 'newest first' when the website's
+    sort by date was chosen. Never raises for AI / click problems: filtering is a speed-up, the app's own date and
+    location checks still run on every job afterwards."""
     loc = (cfg.get("site_filter_location") or "").strip()
     days = _window_days(cfg)
     if not loc and not days:
@@ -420,6 +421,8 @@ def apply_site_filters(pg, cfg, s, note) -> bool:
             note("site filter: the element could not be used")
             break
         did = True
+        if v.purpose == "sort" and applied is not None and "newest first" not in applied:
+            applied.append("newest first")  # the list is now sorted by date: its first old offers end it
         state["location_done"] = state["location_done"] or v.location_done
         state["date_done"] = state["date_done"] or v.date_done
     if did:
@@ -492,6 +495,7 @@ def crawl_ai(f, url, cfg, known, st):
     seen, steps, pages, details, stalls, dismissed, hops, refused = set(known), 0, 0, 0, 0, 0, 0, 0
     probes = 0
     filters_done = False  # the website's own filters are used once per website
+    site_sorted = False  # the AI chose the website's newest-first sort: the scan ends the list at its first old offers
     unfiltered = None  # (url, jobs seen) before the filters: the way back if the filters hide every job
     carry = []  # jobs found in JSON the page downloaded, waiting for the next harvest
     with sync_playwright() as pw, SessionLocal() as s:
@@ -537,7 +541,7 @@ def crawl_ai(f, url, cfg, known, st):
                 heur_idx = _heuristic_jobs(items) if no_jobs and view.page_kind != "landing" else []
                 if unfiltered and no_jobs and not heur_idx:  # the filters hid the list (a panel of 150 checkboxes...)
                     back, carry = unfiltered
-                    unfiltered = None
+                    unfiltered, site_sorted = None, False
                     f.note("the website's filters left no job on the page: back to the unfiltered list")
                     _goto(pg, back, f, cfg)
                     capture.take()
@@ -552,9 +556,11 @@ def crawl_ai(f, url, cfg, known, st):
                     filters_done = True
                     backup, carry = carry, []  # jobs seen BEFORE filtering are dropped if the filters change the list
                     unfiltered = (pg.url, backup)
-                    if apply_site_filters(pg, cfg, s, f.note):
+                    applied = []
+                    if apply_site_filters(pg, cfg, s, f.note, applied):
                         capture.take()
-                        f.note("website filters applied: reading the filtered list")
+                        site_sorted = "newest first" in applied
+                        f.note("website filters applied: reading the filtered list" + (", newest first" if site_sorted else ""))
                         continue
                     carry, unfiltered = backup, None
 
@@ -639,7 +645,7 @@ def crawl_ai(f, url, cfg, known, st):
                     items = snap["items"]
 
                 pages += 1
-                yield Page(f"ai-{pages}", pg.url, raws)
+                yield Page(f"ai-{pages}", pg.url, raws, sorted=site_sorted)
                 stalls = 0 if raws else stalls + 1
                 if stalls >= 2 or details >= cap:
                     return  # same content twice in a row: end of the list

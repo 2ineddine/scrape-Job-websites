@@ -24,7 +24,7 @@ from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PRO
 from jobfinder.scan import Progress, run_scan
 from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, file_coverage,
                              get_setting, init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
-                             wipe_session_data)
+                             wipe_session_data, recent_count, forget_recent_offers)
 from jobfinder.web import extract_urls, offer_link
 
 ASSETS = Path(__file__).parent / "assets"
@@ -264,7 +264,7 @@ def _monitor():
     if d["ai_msg"]:
         st.warning(d["ai_msg"])
     if d["type_x"] and not d["running"]:
-        st.warning(f"{d['type_x']} offers were set aside only because of their type (internship, PhD, apprenticeship...). "
+        st.warning(f"{d['type_x']} {'offer was' if d['type_x'] == 1 else 'offers were'} set aside only because of their type (internship, PhD, apprenticeship...). "
                    "If you want them too, select these types in 'I am looking for' and analyse again.")
     if not d["running"] and d["finished"]:
         st.page_link(RESULTS, label="See the results", icon=":material/arrow_forward:")
@@ -291,6 +291,22 @@ def step_analysis(running, n):
             "Update the statistics at the end of this scan", value=bool(c.get("stats_with_scan")), disabled=running,
             help="Computes the Statistics page from the offers analysed in the last 15 days as soon as this scan's AI analysis "
                  "ends. Unticked, the statistics are updated every 15 days" + (" (due now)." if due else "."))
+        with SessionLocal() as s:
+            kept = recent_count(s)
+        k1, k2 = st.columns([4, 1], vertical_alignment="center")
+        k1.caption(f"**{kept:,}** offers read in the last 24 h are kept: the next scan does not open their pages again, and the "
+                   "AI does not analyse them again (same search profile and CVs)." if kept else
+                   "No offer kept from the last 24 h: the next scan reads and analyses every offer.")
+        if k2.button("Delete them", disabled=running or not kept, icon=":material/delete:", width="stretch",
+                     help="Deletes the kept offers and the current results: the next scan reads every page and the AI "
+                          "analyses every offer again. The websites, settings, CVs and statistics stay."):
+            try:
+                st.session_state["kept_msg"] = f"{forget_recent_offers():,} kept offers deleted, and the current results"
+            except RuntimeError as e:
+                st.session_state["kept_msg"] = str(e)
+            st.rerun()
+        if st.session_state.get("kept_msg"):
+            st.toast(st.session_state.pop("kept_msg"))
         x, y, _ = st.columns([1, 1, 3])
         if x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:", width="stretch"):
             with SessionLocal() as s:

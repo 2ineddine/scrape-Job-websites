@@ -1,8 +1,9 @@
 """store.py - SQLite models, settings, the local API-key file and the list of career websites."""
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 import os
 import re
 from urllib.parse import urlparse
@@ -152,6 +153,14 @@ class AICache(Base):
     value = Column(Text)
     created = Column(DateTime, default=utcnow)
     kind = Column(String, default="")  # the answer's schema: 'PageOffers' (a lab page read by the AI) is kept between sessions
+
+
+class RecentOffer(Base):  # kept between sessions for 24 hours: an offer read by a scan, with its AI analysis
+    __tablename__ = "recent_offers"
+    uid = Column(String, primary_key=True)
+    source_url = Column(String, index=True)  # the website it was found on (normalised), to give it back to that website
+    seen = Column(DateTime, index=True)  # when the offer was really read (not when it was given back)
+    data = Column(JSON)  # the job's columns, dates as ISO text
 
 
 engine = create_engine(f"sqlite:///{DATA_DIR / 'jobs.db'}", connect_args={"check_same_thread": False})
@@ -372,6 +381,97 @@ def wipe_session_data() -> bool:
     except Exception as e:  # pragma: no cover
         LOG.warning("wipe failed: %s", e)
     return True
+
+
+# --------------------------------------------------------------------------- offers kept 24 hours between scans
+RECENT_HOURS = 24
+_DATES = ("pub_date", "discovered", "last_seen")
+
+
+def profile_key(profile) -> str:
+    """The search profile an analysis was made for: another profile -> the offer is analysed again."""
+    return hashlib.sha1(json.dumps(profile or {}, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def cv_key(s) -> str:
+    """The CVs a match was made with: another CV set -> the offer is matched again."""
+    cvs = sorted((c.name, hashlib.sha1((c.text or "").encode()).hexdigest()) for c in s.query(CVDocument).filter_by(enabled=True)
+                 if c.status == "ok")
+    return hashlib.sha1(json.dumps(cvs).encode()).hexdigest()[:12]
+
+
+def keep_recent_offers(s) -> int:
+    """Save the offers of the current session read in the last 24 hours (with their analysis) for the next scans; offers
+    older than that are forgotten. Called at the end of every scan."""
+    cut = utcnow() - timedelta(hours=RECENT_HOURS)
+    s.query(RecentOffer).filter(RecentOffer.seen < cut).delete(synchronize_session=False)
+    urls, n = {x.id: normalize_url(x.url) for x in s.query(Source).all()}, 0
+    cols = [c.name for c in Job.__table__.columns if c.name not in ("id", "source_id")]
+    for j in s.query(Job).filter(Job.last_seen >= cut):
+        if j.source_id not in urls or not j.title:
+            continue
+        d = {c: getattr(j, c) for c in cols}
+        d.update({k: d[k].isoformat() if d[k] else None for k in _DATES})
+        s.merge(RecentOffer(uid=j.uid, source_url=urls[j.source_id], seen=j.last_seen, data=d))
+        n += 1
+    s.commit()
+    return n
+
+
+def restore_recent_offers(s, src, prof_key, cvs_key) -> list:
+    """Give a website back its offers read in the last 24 hours, so that their pages are not opened again and the AI does
+    not analyse them again. An analysis made for another search profile, or a CV match made with other CVs, is dropped:
+    those offers go through the filters and the AI again. -> the restored jobs."""
+    cut = utcnow() - timedelta(hours=RECENT_HOURS)
+    have = {u for (u,) in s.query(Job.uid)}
+    out = []
+    for r in s.query(RecentOffer).filter(RecentOffer.source_url == normalize_url(src.url), RecentOffer.seen >= cut):
+        if r.uid in have:
+            continue
+        d = dict(r.data or {})
+        d.update({k: datetime.fromisoformat(d[k]) if d.get(k) else None for k in _DATES})
+        ex = dict(d.get("extra") or {})
+        if d.get("status") != "out_of_range":
+            if ex.get("profile_key") != prof_key or d.get("relevance_score") is None:
+                # not analysed, or analysed for another profile: the filters (and the AI) run again on the saved text
+                d.update(status="new", reason="", review_flags="", relevance_score=None, relevance_json=None)
+                ex.pop("profile_key", None)
+            if ex.get("cv_key") != cvs_key or d.get("relevance_score") is None:
+                d.update(best_cv=None, match_score=None, match_json=None)
+                ex.pop("cv_key", None)
+        d["extra"] = {**ex, "kept_from": r.seen.strftime("%Y-%m-%d %H:%M")}
+        job = Job(**{k: v for k, v in d.items() if k in Job.__table__.columns.keys()}, source_id=src.id)
+        s.add(job)
+        out.append(job)
+    s.commit()
+    return out
+
+
+def recent_count(s) -> int:
+    """Offers kept from the last 24 hours (the saved ones, and this session's offers that the next save will keep)."""
+    cut = utcnow() - timedelta(hours=RECENT_HOURS)
+    saved = {u for (u,) in s.query(RecentOffer.uid).filter(RecentOffer.seen >= cut)}
+    return len(saved | {u for (u,) in s.query(Job.uid).filter(Job.last_seen >= cut)})
+
+
+def forget_recent_offers() -> int:
+    """The 'Delete' button: the offers kept from the last 24 hours AND the current results are deleted, so that the next
+    scan reads every page and analyses every offer again (the loaded websites, settings, CVs and statistics stay)."""
+    if scan_running_elsewhere():
+        raise RuntimeError("a scan is running in another window or process: delete the kept offers when it has finished")
+    with SessionLocal() as s:
+        try:  # the analysed offers' facts go to the market history (statistics) before they are deleted
+            from .market import archive_offers
+            archive_offers(s)
+        except Exception as e:  # pragma: no cover - statistics never block a deletion
+            s.rollback()
+            LOG.warning("market history not updated: %s", e)
+        n = s.query(RecentOffer).delete()
+        s.query(Job).delete()
+        s.query(CoverLetter).delete()
+        s.query(Source).update({Source.status: "not_started", Source.jobs_found: 0, Source.last_error: ""})
+        s.commit()
+    return n
 
 
 def load_new_sources(s, urls: list[str], origins: dict | None = None) -> int:

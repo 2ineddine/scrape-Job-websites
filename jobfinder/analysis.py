@@ -18,7 +18,7 @@ from .cv import _ws, match_job
 from .dates import NO_DATE, date_candidates, date_decision, describe_candidates, parse_date, refine_job_date, text_publication_date
 from .llm import AIError, MalformedOutput, call_json, require_cv_consent, reset_usage
 from .scan import hide_out_of_range
-from .store import CVDocument, Job, SessionLocal
+from .store import CVDocument, Job, SessionLocal, cv_key, profile_key
 from .web import Fetcher
 
 
@@ -290,13 +290,17 @@ def _pipeline(cfg, profile, keys, prog, fetcher, rend):
         prog.set(ai_total=len(jobs), ai_done=0)
         if left:
             prog.say(f"{left} offers beyond the limit of {cfg['max_ai_jobs_per_run']} per run stay 'Not analysed'")
-        relevant = lambda: s.query(Job).filter(Job.status.in_(["relevant", "review"]), Job.relevance_score.isnot(None)).count()
-        failed = 0
+        # the 'Relevant' tile: the same count as the header and the Results view ('To check' offers are not relevant yet)
+        relevant = lambda: s.query(Job).filter(Job.status == "relevant").count()
+        failed, pkey = 0, profile_key(profile)
         for j in jobs:
             if prog.cancel.is_set():
                 return
             try:
                 _analyze_deep(s, j, profile, cfg, keys, fetcher, rend, prog.say)
+                if j.relevance_score is not None:  # the profile it was analysed for: the next scans reuse it only for this one
+                    j.extra = {**(j.extra or {}), "profile_key": pkey}
+                    s.commit()
                 failed = 0
             except MalformedOutput as e:  # this offer only: it stays 'Not analysed', the others go on
                 s.rollback()
@@ -323,6 +327,7 @@ def _pipeline(cfg, profile, keys, prog, fetcher, rend):
             prog.set(ai_msg=str(e))
             return
         prog.set(task="CV matching")
+        ckey = cv_key(s)
         for j in todo:
             if prog.cancel.is_set():
                 return
@@ -335,6 +340,9 @@ def _pipeline(cfg, profile, keys, prog, fetcher, rend):
             except AIError as e:
                 prog.set(ai_msg=f"CV matching stopped: {e}")
                 return
+            if j.match_score is not None:  # the CVs it was matched with: the next scans reuse it only for these
+                j.extra = {**(j.extra or {}), "cv_key": ckey}
+                s.commit()
             if j.match_score is not None and j.match_score < cfg.get("min_match", 0):
                 j.status, j.reason = "excluded", f"CV match {j.match_score:.0f} is below your minimum ({cfg['min_match']})"
                 s.commit()

@@ -17,7 +17,8 @@ from .classify import (analyze_title, classify_location, clean_title, is_boilerp
 from .config import LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
 from .dates import date_decision, refine_job_date, refine_raw_date
-from .store import Job, SeenOffer, SessionLocal, SiteMemory, Source, lock_scan, unlock_scan
+from .store import (RECENT_HOURS, Job, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers, lock_scan,
+                    profile_key, restore_recent_offers, unlock_scan)
 from .web import AccessError, Fetcher, norm, normalize_url
 
 
@@ -321,6 +322,15 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         label = src.label or src.url
         gate = cfg["_gate"]
         known, st = set(), ScanState()
+        kept = restore_recent_offers(s, src, cfg.get("_profile_key"), cfg.get("_cv_key"))
+        if kept:  # offers this website showed in the last 24 hours: not read again, not analysed again
+            for job in kept:
+                if job.relevance_score is not None and gate(job.pub_date, job.date_conf or 0.0, job.pub_date_text or "") is False:
+                    hide_out_of_range(s, job, "outside the new date range")  # analysed before, now too old for the range
+            shown = sum(1 for j in kept if j.status != "out_of_range")
+            prog.inc("jobs", shown)
+            prog.say(f"{label}: {len(kept)} offers kept from the last {RECENT_HOURS} h ({shown} in range): their pages are not "
+                     "read again" + (", nor analysed again" if any(j.relevance_score is not None for j in kept) else ""))
         for url_, status_, d_, c_, t_ in s.query(Job.url, Job.status, Job.pub_date, Job.date_conf, Job.pub_date_text).filter(Job.source_id == sid):
             if status_ == "out_of_range":
                 if gate(d_, c_ or 0.0, t_ or "") is False:  # still outside the (possibly changed) range: never re-opened
@@ -401,7 +411,10 @@ def scan_source(sid, cfg, fetcher, prog, t0):
             err = f"{cfg['max_details_per_source']} job pages opened (limit): the other offers keep their list data"
         s.rollback()
         src = s.get(Source, sid)
-        listed += st.skipped
+        listed += st.skipped + st.abroad
+        prog.inc("loc_x", st.abroad)  # the 'Not France / not wanted' tile counts them, though their page was never opened
+        if st.abroad:
+            prog.say(f"{label}: {st.abroad} offers placed outside France on the list: not opened")
         src.status, src.last_scan, src.pages_visited, src.jobs_found = status, utcnow(), pages, found
         src.last_error, src.platform, src.listed = err, st.platform, listed
         src.outcome, note = read_outcome(s, src.url, status, found, listed, st)
@@ -420,6 +433,8 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     lock_scan()
     prog.set(running=True, started=datetime.now(), sources_total=len(source_ids), task="crawling")
     t0 = time.time()
+    with SessionLocal() as s:  # an analysis / a CV match kept from an earlier scan is reused only for the same profile / CVs
+        cfg["_profile_key"], cfg["_cv_key"] = profile_key(profile), cv_key(s)
 
     def one(sid):  # websites are read in parallel (the polite delay is per host); each one has its own HTTP session
         if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
@@ -469,5 +484,11 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     except Exception as e:  # never crash silently
         prog.say(f"FATAL {e}")
     finally:
+        try:  # the offers read in the last 24 hours, with their analysis, are kept for the next scans (even a stopped one)
+            with SessionLocal() as s:
+                n = keep_recent_offers(s)
+            prog.say(f"{n} offers of the last {RECENT_HOURS} h kept for the next scans")
+        except Exception as e:  # pragma: no cover - keeping them never fails a scan
+            LOG.warning("offers not kept: %s", e)
         unlock_scan()
         prog.set(running=False, finished=datetime.now(), task="done")

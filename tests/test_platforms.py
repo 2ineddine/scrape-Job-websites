@@ -2027,3 +2027,94 @@ def test_company_names_from_platform_subdomains():
     assert c("https://eleven-labs.welcomekit.co/") == "Eleven Labs" and c("https://coexya.cvcatcher.io/") == "Coexya"
     assert c("https://akka-cand.talent-soft.com/job/list-of-jobs.aspx") == "Akkodis"
     assert c("https://careers-fr-soitec.icims.com/") == "Soitec" and c("https://planity-1651249729.teamtailor.com/jobs") == "Planity"
+
+
+def _dated_offer(i, recent):
+    return (f'<html><head><script type="application/ld+json">{{"@type": "JobPosting", "title": "Data Scientist {i}",'
+            f'"datePosted": "{TODAY if i < recent else OLD}", "description": "missions profil candidature"}}</script></head></html>')
+
+
+def _undated_list(n):
+    return "<ul>" + "".join(f'<li><a href="/jobs/data-scientist-machine-learning-{i}">Data Scientist {i}</a></li>' for i in range(n)) + "</ul>"
+
+
+def test_a_newest_first_list_ends_at_its_first_old_offers():
+    # the cards have no date; the website's own sort is newest first: once 2 opened offers in a row are older than the
+    # range, the next offers are not opened, and the scan ends the website after this page
+    from jobfinder.crawler import crawl_generic
+    page = lambda u: _dated_offer(int(u.rsplit("-", 1)[1]), 3)
+    f = SiteFetcher({"offres?sort=date": _undated_list(10), "/jobs/data-scientist-machine-learning-": page})
+    pgs = list(crawl_generic(f, "https://co.fr/offres?sort=date", CFG(), set(), ScanState()))
+    opened = [u for u in f.calls if "/jobs/" in u]
+    assert len(opened) == 5 and pgs[-1].sorted and pgs[-1].out == 5  # 3 recent + 2 old opened; 5 never opened
+    # the same list without a date sort: no order is known, every offer is opened
+    f = SiteFetcher({"/offres": _undated_list(10), "/jobs/data-scientist-machine-learning-": page})
+    list(crawl_generic(f, "https://co.fr/offres", CFG(), set(), ScanState()))
+    assert len([u for u in f.calls if "/jobs/" in u]) == 10
+
+
+def test_a_posted_within_filter_alone_is_not_a_date_order():
+    # 'posted within 7 days' with a 24-hour range: the list is not sorted, so an old offer does not end it
+    from jobfinder.crawler import crawl_generic
+    form = ('<form method="get" action="/offres"><select name="posted"><option value="">Toutes</option>'
+            '<option value="7">Moins de 7 jours</option></select></form>')
+    old_first = lambda u: _dated_offer(9 - int(u.rsplit("-", 1)[1]), 8)  # offers 0 and 1 old, 2..9 recent
+    f = SiteFetcher({"offres?posted=7": _undated_list(10), "/offres": form + _undated_list(10),
+                     "/jobs/data-scientist-machine-learning-": old_first})
+    jobs = [j for pg in crawl_generic(f, "https://co.fr/offres", CFG(date_preset="Last 24 hours"), set(), ScanState())
+            for j in pg.jobs]
+    assert len(jobs) == 10
+
+
+def test_offers_placed_abroad_on_the_list_are_not_opened():
+    from jobfinder.crawler import _card_abroad, crawl_generic
+    cards = [("Bruxelles, Belgique",), ("Londres", "Paris"), ("Lyon",), ()]  # one short list: every card in one <ul>
+    html = "<ul>" + "".join(f'<li><a href="/jobs/data-scientist-machine-learning-{i}">Data Scientist {i}</a>'
+                            + "".join(f"<span>{p}</span>" for p in places) + "</li>" for i, places in enumerate(cards)) + "</ul>"
+    soup, base = BeautifulSoup(html, "html.parser"), "https://co.fr/offres"
+    abroad = [_card_abroad(soup, base, f"https://co.fr/jobs/data-scientist-machine-learning-{i}") for i in range(4)]
+    assert abroad == ["Bruxelles, Belgique", "", "", ""]
+    f = SiteFetcher({"/offres": html, "/jobs/data-scientist-machine-learning-": lambda u: _dated_offer(1, 9)})
+    st = ScanState()
+    list(crawl_generic(f, base, CFG(), set(), st))
+    assert st.abroad == 1 and not any(u.endswith("-0") for u in f.calls) and sum("/jobs/" in u for u in f.calls) == 3
+
+
+def test_offers_of_the_last_24_hours_are_kept_with_their_analysis():
+    from datetime import timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.config import utcnow
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    now = utcnow()
+    with sessionmaker(bind=engine)() as s:
+        store.add_sources(s, ["https://co.fr/jobs"])
+        src = s.query(store.Source).one()
+        job = lambda uid, **k: store.Job(uid=uid, source_id=src.id, title=f"Ingénieur {uid}", url=f"https://co.fr/jobs/{uid}",
+                                         description="missions", last_seen=k.pop("seen", now), discovered=now, **k)
+        s.add_all([job("rel", status="relevant", relevance_score=82.0, relevance_json={"skills": ["Python"]},
+                       best_cv="cv", match_score=70.0, match_json={"cv": {}}, extra={"profile_key": "P", "cv_key": "C"}),
+                   job("cand", status="candidate"),
+                   job("old", status="relevant", relevance_score=90.0, seen=now - timedelta(hours=30))])  # read 30 h ago
+        s.commit()
+        assert store.keep_recent_offers(s) == 2  # the offer read 30 hours ago is not kept
+        assert store.recent_count(s) == 2
+
+        def next_session(prof, cvs):  # the app is restarted: the session's offers and websites are deleted
+            s.query(store.Job).delete()
+            s.query(store.Source).delete()
+            s.commit()
+            s.expunge_all()
+            store.add_sources(s, ["https://co.fr/jobs"])
+            return {j.uid: j for j in store.restore_recent_offers(s, s.query(store.Source).one(), prof, cvs)}
+
+        kept = next_session("P", "C")  # same profile and CVs: nothing to read or analyse again
+        assert set(kept) == {"rel", "cand"} and kept["rel"].status == "relevant" and kept["rel"].relevance_score == 82.0
+        assert kept["rel"].match_score == 70.0 and kept["rel"].source_id == s.query(store.Source).one().id
+        assert kept["cand"].status == "new"  # never analysed: the filters run again on its saved text (no page opened)
+        kept = next_session("P", "C2")  # other CVs: the analysis stays, the match is made again
+        assert kept["rel"].relevance_score == 82.0 and kept["rel"].match_score is None
+        kept = next_session("P2", "C")  # another search profile: the filters and the AI run again
+        assert kept["rel"].status == "new" and kept["rel"].relevance_score is None and kept["rel"].description == "missions"

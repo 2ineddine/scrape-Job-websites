@@ -32,6 +32,12 @@ The **Results** page has five views: Relevant, To check, Not analysed, Excluded 
 for its date and place, its relevance and its CV match; the list exports to CSV. Every launch starts a fresh session.
 Settings, keys and CVs are kept.
 
+Offers read in the last 24 hours are kept with their AI analysis, even after a restart or a new file: a new scan does not
+open their pages again, and the AI does not analyse them again, which saves the AI quota. An analysis is reused only for
+the same search profile, and a CV match only for the same CVs; an offer outside the new date range is hidden. Step 3
+shows how many offers are kept; **Delete them** deletes them and the current results, so the next scan reads and
+analyses everything again.
+
 ## AI keys
 
 Put the keys in `api_keys.txt`, next to `app.py`. The file is git-ignored. You can also enter them in Settings, or set
@@ -67,6 +73,10 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   Jungle career sites, Personio, France Travail API…). Other websites go to a generic crawler that reads structured data, links,
   sitemaps and pages rendered with JavaScript once. Lab pages go to an AI page reader, and sites that need clicking go
   to an AI browser.
+- **Website filters**: the app uses the website's own France filter and its "newest first" sort when it has them (the AI
+  browser clicks them on sites that need it). On a newest-first list, reading stops at the first offers older than the
+  date range (two in a row, in case one old offer is pinned at the top). Offers whose list card places them only outside
+  France are not opened.
 - **Filters, in order**:
   1. **Date**: from evidence only. Refresh, deadline and start dates are never used. An undated offer is kept and
      marked "date not stated".

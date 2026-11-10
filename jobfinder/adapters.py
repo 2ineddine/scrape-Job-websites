@@ -75,6 +75,7 @@ class ScanState:
     more_pages: bool = False  # the list has more pages the crawler may not open (script links, robots.txt): use the sitemap
     announced: int | None = None  # the number of results the website's own page announces ('154 results')
     skipped: int = 0  # offers on the list that were not opened because their title is clearly not wanted
+    abroad: int = 0  # offers on the list that were not opened because their card places them outside France only
     page_titles: list = field(default_factory=list)  # offer titles on the website's own page, when its reader was found there
 
 

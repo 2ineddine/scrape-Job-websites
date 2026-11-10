@@ -374,8 +374,10 @@ def classify_location(loc, country_hint=None, remote_hint=None, applicant_countr
     if "FR" in kinds:
         r.update(country_code="FR", location_verified=True, france_eligible=True,
                  location_evidence=f"Listing location '{original}' includes France")
-        if not remote:
-            r["city"] = re.sub(r"^fr-\w+-", "", original.split(",")[0].strip(), flags=re.I).title()
+        # a remote offer attached to a city ('Paris, Île-de-France' with telework) keeps its city; 'Remote - France' has none
+        city = re.sub(r"^fr-\w+-", "", original.split(",")[0].strip(), flags=re.I).title()
+        if not re.search(r"remote|teletravail|telework|work from home|distanciel", norm(city)):
+            r["city"] = city
     elif ch in ("fr", "france", "fra"):
         r.update(country_code="FR", location_verified=True, france_eligible=True,
                  location_evidence="Structured country field = France")

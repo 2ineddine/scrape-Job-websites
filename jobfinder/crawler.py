@@ -226,8 +226,8 @@ def _card_dates(soup, base, now=None, dayfirst=None):
     return out
 
 
-def _card_location(soup, base, url, title=""):
-    """The place written on the job's card in the list ('CDI | Gard (30) | Bagnols Sur Cèze'), for job pages without one."""
+def _card_places(soup, base, url, title=""):
+    """Every place written on the job's card in the list ('CDI | Gard (30) | Bagnols Sur Cèze' -> ['Gard (30)', ...])."""
     for a in soup.find_all("a", href=True):
         if normalize_url(urljoin(base, a["href"])) != url:
             continue
@@ -235,13 +235,25 @@ def _card_location(soup, base, url, title=""):
         for _ in range(3):
             if box.parent is None or len(box.parent.get_text(" ", strip=True)) > 600:
                 break
+            other = lambda x: (normalize_url(urljoin(base, x["href"])) != url and is_job_path(urlparse(urljoin(base, x["href"])).path))
+            if any(other(x) for x in box.parent.find_all("a", href=True)):
+                break  # the parent holds another offer's card too: this card ends here
             box = box.parent
-        for part in box.get_text("|", strip=True).split("|"):
-            part = part.strip()
-            if part and part != title.strip() and len(part) <= 60 and classify_location(part)["location_verified"]:
-                return part
-        return ""
-    return ""
+        return [p for p in (x.strip() for x in box.get_text("|", strip=True).split("|"))
+                if p and p != title.strip() and len(p) <= 60 and classify_location(p)["location_verified"]]
+    return []
+
+
+def _card_location(soup, base, url, title=""):
+    """The place written on the job's card in the list, for job pages without one."""
+    return next(iter(_card_places(soup, base, url, title)), "")
+
+
+def _card_abroad(soup, base, url, title=""):
+    """The card's place when the card places the offer outside France only ('Bruxelles, Belgique'), else ''. A card that
+    also names a French place ('Londres | Paris'), or no place at all, is opened as before."""
+    places = _card_places(soup, base, url, title)
+    return places[0] if places and not any(classify_location(p)["france_eligible"] for p in places) else ""
 
 
 _FIELD_LABEL = re.compile(r"\s*(?:url|date|lieu|localisation|location|ville|city|type de contrat|contrat|contract(?: type)?|"
@@ -349,6 +361,7 @@ def _parent_list(url):
     return urlunparse(p._replace(path="/" + "/".join(seg[:-1]), query="")) if len(seg) >= 2 else None
 
 
+_OLD_RUN = 2  # offers in a row older than the range that end a newest-first list (one may be pinned at the top)
 _DATE_SORT = re.compile(r"[?&](?:sort|sortby|sort_by|order|orderby|tri)=(?:[^&]*date|[^&]*recent|[^&]*newest|[^&]*publi)", re.I)
 
 
@@ -397,6 +410,7 @@ def crawl_generic(f, url, cfg, known, st):
     posts = {}  # next pages sent as a form (POST), by their address
     budget, filtered, retry, hopped = _Budget(cfg, st), False, False, False
     by_date = bool(_DATE_SORT.search(url))  # the URL already asks the website for its newest offers first
+    wants_fr = norm(cfg.get("site_filter_location") or "") in ("france", "fr")
     while page_url:
         guessed, guessed_next = guessed_next, False
         if n >= cfg["max_pages"]:
@@ -436,7 +450,9 @@ def crawl_generic(f, url, cfg, known, st):
                             f.note(f"website filters used: {', '.join(used)} ({fu[:100]})")
                             soup, page_url, key = s2, fu, normalize_url(fu)
                             st.announced = None  # the page's total counted the offers before these filters
-                            by_date = by_date or any(x == "newest first" or x.startswith("posted within") for x in used)
+                            # only a newest-first SORT orders the list: 'posted within 7 days' keeps its own order, and
+                            # can hold offers older than a shorter range of the user's (24 hours)
+                            by_date = by_date or "newest first" in used
                             seen_pages.add(key)
                     except AccessError:
                         raise
@@ -496,7 +512,7 @@ def crawl_generic(f, url, cfg, known, st):
             page_seen = sum(1 for u in links if u in known and u not in st.out_known)
             cards = _card_dates(soup, page_url, dayfirst=_dayfirst(soup)) if not jobs else {}
             if not jobs:
-                older = False
+                older, old_run = False, 0
                 for lk in new_links:
                     if st.deadline and time.time() > st.deadline:
                         st.details_capped = True  # this website's time is up
@@ -512,6 +528,9 @@ def crawl_generic(f, url, cfg, known, st):
                     if title and not worth_opening(cfg, {"title": title, "date": None}):
                         st.skipped += 1
                         continue  # clearly irrelevant title on the list: not opened
+                    if wants_fr and _card_abroad(soup, page_url, lk, title or ""):
+                        st.abroad += 1
+                        continue  # the list places it outside France only ('Bruxelles, Belgique'): not opened
                     details += 1
                     try:
                         dhtml = f.get(lk).text
@@ -526,6 +545,15 @@ def crawl_generic(f, url, cfg, known, st):
                         if job["provenance"] == "html-fallback" and len(_job_links(BeautifulSoup(dhtml, PARSER), lk, set(), False)) >= 8:
                             continue  # the link opened another list ('Account Executive jobs', '170 jobs found'), not a job
                         jobs.append(job)
+                        if by_date and gate and job.get("date"):  # the list's cards have no date: the offer's page has one
+                            if raw_verdict(cfg, dict(job)) is False:
+                                old_run += 1
+                                if old_run >= _OLD_RUN and not older:  # one old offer may be pinned at the top: two in a row
+                                    older = True  # newest-first list: every next offer is older too -> not opened
+                                    f.note(f"newest-first list: {_OLD_RUN} offers in a row older than the range -> "
+                                           "the next offers of the list are not opened")
+                            else:
+                                old_run = 0
                     except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
                         f.note(f"detail failed {lk}: {e}")
                     except AccessError:

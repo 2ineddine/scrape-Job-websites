@@ -45,12 +45,92 @@ class RequestTooLarge(AIError):
 
 
 PAID = {"openai", "openrouter", "anthropic", "gemini", "groq", "xai", "cohere", "nvidia"}  # hosted: need a key, have quotas / may bill
-USAGE = {"calls": 0, "cache_hits": 0, "in": 0, "out": 0, "model": ""}
+USAGE = {"calls": 0, "cache_hits": 0, "in": 0, "out": 0, "model": "", "billed": 0}
+BILLED = {"xai"}  # paid per request: used last, and at most cfg['max_billed_calls'] times per scan
 _USAGE_LOCK = threading.Lock()  # websites are read in parallel
 
 
 def reset_usage():
-    USAGE.update(calls=0, cache_hits=0, model="", **{"in": 0, "out": 0})
+    USAGE.update(calls=0, cache_hits=0, model="", billed=0, **{"in": 0, "out": 0})
+    with _HEALTH_LOCK:  # a new run judges every model afresh (a pause already given keeps running until its end)
+        for h in _HEALTH.values():
+            h.update(bad=0, slow=0, ok=0, fail=0, secs=0.0)
+
+
+# ---------------------------------------------------------------------------- automatic switching: the models' health
+# The models are tried best first (LADDER). During a run each one is watched, so that the scan never waits on a model that
+# misbehaves while a good one is free:
+#   - BAD_IN_A_ROW unusable answers in a row (not JSON, wrong shape, empty): the model is paused 10 min, then 30, then 60.
+#     Before, such a model was asked again for every offer, at two wasted calls each time;
+#   - SLOW_CALL seconds or more, twice in a row: paused 10 min (the next models answer in a few seconds);
+#   - analyses run in parallel (config 'ai_workers'): a model serves at most 'ai_per_model' requests at once and the next
+#     request goes to the next model IN RANK, so the best models do most of the work without hitting their per-minute
+#     limits, and the scan is not held by one model.
+BAD_IN_A_ROW, BAD_PAUSES = 3, (600, 1800, 3600)
+SLOW_CALL, SLOW_PAUSE = 45, 600
+_HEALTH: dict = {}  # (provider, model, key) -> {"bad", "strikes", "slow", "busy", "ok", "fail", "secs"}
+_HEALTH_LOCK = threading.Lock()
+
+
+def _health(step) -> dict:
+    return _HEALTH.setdefault(step, {"bad": 0, "strikes": 0, "slow": 0, "busy": 0, "ok": 0, "fail": 0, "secs": 0.0})
+
+
+def _take(step, cap) -> bool:
+    """A free place on this model (False: it already serves `cap` requests)."""
+    with _HEALTH_LOCK:
+        h = _health(step)
+        if h["busy"] >= cap:
+            return False
+        h["busy"] += 1
+        return True
+
+
+def _give(step):
+    with _HEALTH_LOCK:
+        h = _health(step)
+        h["busy"] = max(0, h["busy"] - 1)
+
+
+def _went_well(step, secs):
+    with _HEALTH_LOCK:
+        h = _health(step)
+        h["bad"], h["ok"], h["secs"] = 0, h["ok"] + 1, h["secs"] + secs
+        h["slow"] = h["slow"] + 1 if secs >= SLOW_CALL else 0
+        paused = h["slow"] >= 2
+        if paused:
+            h["slow"] = 0
+            _EXHAUSTED[step] = max(_EXHAUSTED.get(step, 0), time.time() + SLOW_PAUSE)
+    if paused:
+        LOG.info("AI: %s / %s paused %d min: two answers over %d s in a row", step[0], step[1], SLOW_PAUSE // 60, SLOW_CALL)
+
+
+def _went_bad(step):
+    with _HEALTH_LOCK:
+        h = _health(step)
+        h["bad"], h["fail"] = h["bad"] + 1, h["fail"] + 1
+        pause = 0
+        if h["bad"] >= BAD_IN_A_ROW:
+            pause = BAD_PAUSES[min(h["strikes"], len(BAD_PAUSES) - 1)]
+            h["strikes"], h["bad"] = h["strikes"] + 1, 0
+            _EXHAUSTED[step] = max(_EXHAUSTED.get(step, 0), time.time() + pause)
+    if pause:
+        LOG.info("AI: %s / %s paused %d min: %d unusable answers in a row", step[0], step[1], pause // 60, BAD_IN_A_ROW)
+        note_quota(step, error=f"paused {pause // 60} min: {BAD_IN_A_ROW} unusable answers in a row")
+
+
+def health_report() -> list:
+    """The models used in this run, best first, all keys of a model together:
+    [(provider, model, answers, unusable, average seconds)]."""
+    tot: dict = {}
+    with _HEALTH_LOCK:
+        for st, h in _HEALTH.items():
+            if h["ok"] or h["fail"]:
+                t = tot.setdefault((st[0], st[1]), [0, 0, 0.0])
+                t[0], t[1], t[2] = t[0] + h["ok"], t[1] + h["fail"], t[2] + h["secs"]
+    rank = {m: i for i, m in enumerate(LADDER)}
+    return sorted(((p, m, ok, bad, secs / ok if ok else 0.0) for (p, m), (ok, bad, secs) in tot.items()),
+                  key=lambda r: rank.get((r[0], r[1]), len(rank)))
 
 
 def get_key(provider, session_keys=None):
@@ -388,11 +468,16 @@ def _ask(step, user, schema, cfg, s, keys, system):
     prompt, last = user, None
     for _ in range(2):
         with _USAGE_LOCK:
-            if USAGE["calls"] >= cfg["max_ai_calls"]:
+            if cfg.get("max_ai_calls") and USAGE["calls"] >= cfg["max_ai_calls"]:  # 0: no limit
                 raise BudgetExceeded(f"AI call budget reached ({cfg['max_ai_calls']})")
             USAGE["calls"] += 1
+            USAGE["billed"] += prov in BILLED
+        t0 = time.time()
         try:
             text, i, o = chat(prov, model, system, prompt, cfg, {**(keys or {}), prov: get_key(slot, keys)})
+        except MalformedOutput:
+            _went_bad(step)
+            raise
         except QuotaExhausted as e:
             _EXHAUSTED[step] = time.time() + getattr(e, "wait", 3600)
             note_quota(step, until=_EXHAUSTED[step])
@@ -413,9 +498,13 @@ def _ask(step, user, schema, cfg, s, keys, system):
                 obj = schema.model_validate(_soften(schema, data))  # an invalid choice / a null: the field's default
             s.merge(AICache(key=ck, value=obj.model_dump_json(), kind=schema.__name__))
             s.commit()
+            _went_well(step, time.time() - t0)
             return obj
         except (ValueError, ValidationError) as e:
             last = e
+            _went_bad(step)
+            if _EXHAUSTED.get(step, 0) > time.time():
+                break  # paused for its unusable answers: the next model, not a retry
             prompt = user + f"\n\nYour previous output was invalid ({str(e)[:200]}). Return only valid JSON."
     raise MalformedOutput(f"Malformed AI output after retry: {last}")
 
@@ -425,12 +514,20 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
     for step in chain:
         row = s.get(AICache, _cache_key(step, system, user, schema))
         if row:
-            USAGE["cache_hits"] += 1
+            with _USAGE_LOCK:
+                USAGE["cache_hits"] += 1
             return schema.model_validate_json(row.value)
-    last = None
-    for attempt in range(2):
-        for step in chain:
-            if _EXHAUSTED.get(step, 0) > time.time():
+    cap = max(1, int(cfg.get("ai_per_model", 2)))
+    last, tried, attempt, t_start = None, set(), 0, time.time()
+    while True:
+        busy = False
+        for step in chain:  # best first
+            if step in tried or _EXHAUSTED.get(step, 0) > time.time():
+                continue
+            if step[0] in BILLED and USAGE["billed"] >= int(cfg.get("max_billed_calls", 100)):
+                continue  # the billed model's share of this scan is used: the free models' quotas decide the rest
+            if not _take(step, cap):  # serving other offers: the next model in rank takes this one
+                busy = True
                 continue
             try:
                 obj = _ask(step, user, schema, cfg, s, keys, system)
@@ -442,6 +539,7 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
                 last = e
             except (MalformedOutput, RequestTooLarge) as e:
                 last = e
+                tried.add(step)  # not asked again for THIS request
                 if len(chain) == 1:
                     raise
             except AIError as e:
@@ -454,10 +552,16 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
                 _EXHAUSTED[step] = time.time() + pause
                 if re.search(r"HTTP 40[34]", str(e)) and _GONE.search(str(e)):
                     mark_gone(step, e)
+            finally:
+                _give(step)
             LOG.info("AI: %s / %s not available (%s), next model", step[0], step[1], str(last)[:100])
-        wait = min((_EXHAUSTED.get(x, 0) for x in chain), default=0) - time.time()
+        if busy and time.time() - t_start < 600:
+            time.sleep(0.25)  # every free model is serving other offers: one is free again in a moment
+            continue
+        wait = min((_EXHAUSTED.get(x, 0) for x in chain if x not in tried), default=0) - time.time()
         if attempt or not 0 < wait <= 90:
             break
+        attempt += 1
         time.sleep(wait)  # every model is at its per-minute limit: the first one is free again in a moment
     if isinstance(last, (MalformedOutput, RequestTooLarge)) or last is None:
         raise last or QuotaExhausted("No AI model available: add an API key in Settings")

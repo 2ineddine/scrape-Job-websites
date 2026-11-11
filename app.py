@@ -1,4 +1,4 @@
-"""app.py - Job Finder (navy website look, Telegraf type).   Run:  streamlit run app.py
+"""app.py - Job Finder (dark navy look, Telegraf type only).   Run:  streamlit run app.py
 Flow: 1. career websites  ->  2. your CV  ->  3. analysis  ->  results."""
 import atexit
 import hashlib
@@ -56,19 +56,21 @@ with SessionLocal() as _s:
 c, p, ap = (json.loads(json.dumps(x)) for x in (CFG, PROFILE, APPLICANT))  # working copies, auto-saved at the end
 KEYS = load_keys()
 PRESETS = list(PRESET_DAYS) + ["All dates"]
+FONT = "PP Telegraf"  # the only typeface of the app (static/fonts), also in the charts
 STATUS = {"relevant": ("Relevant", "green"), "review": ("To check", "yellow"), "candidate": ("Not analysed", ""),
           "excluded": ("Excluded", "red")}
 
 
 # =================================================================== shell: navy top bar and page header
-def shell(title, subtitle="", eyebrow="Job Finder"):
-    """The page's navy header: its title, one line about it, and the live counters."""
+def shell(title, subtitle="", eyebrow="Job Finder", wide=False):
+    """The page's navy header: its title, one line about it, and the live counters. wide: the page uses the screen's width."""
     n, d = counts(), prog.snap()[0]
-    stats = [(n["sites"], "websites", ""), (n["cvs"], "CVs", ""), (n["relevant"], "relevant offers", ""),
-             (n["review"], "to check", ""), ("running" if d["running"] else "idle", "analysis", "live" if d["running"] else "")]
-    st.html(f'<div class="jf-hero"><div class="jf-eyebrow">{html.escape(eyebrow)}</div><h1>{html.escape(title)}</h1>'
+    stats = [(n["sites"], "websites"), (n["cvs"], "CVs"), (n["relevant"], "relevant offers"), (n["review"], "to check")]
+    state = ("live", "Analysis running") if d["running"] else ("", "Idle")
+    st.html(f'<div class="jf-hero{" jf-wide" if wide else ""}"><div class="jf-top"><span class="jf-eyebrow">{html.escape(eyebrow)}</span>'
+            f'<span class="jf-state {state[0]}">{state[1]}</span></div><h1>{html.escape(title)}</h1>'
             f'<p class="jf-lead">{html.escape(subtitle)}</p><div class="jf-stats">'
-            + "".join(f'<div class="jf-stat {cls}"><b>{v}</b><span>{k}</span></div>' for v, k, cls in stats) + "</div></div>")
+            + "".join(f'<div class="jf-stat"><b>{v:,}</b><span>{k}</span></div>' for v, k in stats) + "</div></div>")
 
 
 def counts():
@@ -93,7 +95,7 @@ def web_link(u):
 
 
 def step(n, title, done):
-    st.html(f'<div class="jf-step"><span class="jf-stepnum {"done" if done else ""}">{"✓" if done else n}</span>{title}</div>')
+    st.html(f'<div class="jf-step"><span class="jf-stepnum {"done" if done else ""}">{n}</span>{title}</div>')
 
 
 def autosave(name, new, old):
@@ -223,7 +225,7 @@ def coverage_bars(running):
         segs = "".join(f'<span class="jf-cov-seg {cls}" style="width:{100 * r[k] / tot:.2f}%" title="{r[k]} {lab}"></span>'
                        for k, lab, cls in COVERAGE if r[k])
         if not r["waiting"]:
-            head = f"✓ all {r['total']} websites searched"
+            head = f"All {r['total']} websites searched"
         else:
             head = f"{done} / {r['total']} websites searched" + ("" if running else f" — {r['waiting']} not reached")
         legend = " · ".join(f'<span class="jf-cov-key {cls}"></span>{r[k]} {lab if k != "waiting" or running else "not reached"}'
@@ -336,6 +338,19 @@ def page_search():
 
 
 # =================================================================== page 2: results
+CONTRACT_LABEL = {"cdi": "CDI", "cdd": "CDD", "vie": "VIE", "phd": "PhD", "postdoc": "Post-doc", "interim": "Interim",
+                  "freelance": "Freelance", "alternance": "Apprenticeship", "internship": "Internship"}
+
+
+def online_for(since):
+    """'2026-10-12' -> '2026-10-12 (30 days)': how long the app has seen the offer online."""
+    try:
+        n = (datetime.now().date() - datetime.strptime(since, "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        return ""
+    return f"{since} ({'today' if n <= 0 else '1 day' if n == 1 else f'{n} days'})"
+
+
 def _rows():
     with SessionLocal() as s:
         out = []
@@ -344,8 +359,10 @@ def _rows():
             r = j.relevance_json or {}
             kind = r.get("contract_kind") if r.get("contract_kind") not in (None, "unknown") else (ti.get("training") or ti.get("contract") or "")
             out.append(dict(uid=j.uid, title=j.title, company=j.employer, location=j.location_original or "",
-                            # ISO text: sorts by date, and an offer without a stated date shows an empty cell, not 'None'
-                            published=f"{j.pub_date:%Y-%m-%d}" if j.pub_date else "", first_seen=(j.extra or {}).get("first_seen") or "", type=kind,
+                            # ISO text: sorts by date ('not stated' is written in after sorting)
+                            published=f"{j.pub_date:%Y-%m-%d}" if j.pub_date else "",
+                            online_since=online_for((j.extra or {}).get("first_seen")),
+                            type=CONTRACT_LABEL.get(kind) or OFFER_TYPES.get(kind, kind).split(" (")[0] if kind else "not stated",
                             topics=", ".join(r.get("research_topics") or ti.get("topics", [])),
                             relevance=j.relevance_score, match=j.match_score, link=web_link(offer_link(j.url, j.title, j.apply_url)),
                             status=j.status))
@@ -353,7 +370,7 @@ def _rows():
 
 
 def page_results():
-    shell("Results", "Every offer found, with its exact link, its publication date and why it was kept.", "Offers")
+    shell("Results", "Every offer found, with its exact link, its publication date and why it was kept.", "Offers", wide=True)
     df = _rows()
     if df.empty:
         st.html('<div class="jf-empty"><div class="jf-big">No offers yet</div>Follow the three steps on the Search page.</div>')
@@ -367,14 +384,17 @@ def page_results():
     if q:
         v = v[(v.title + " " + v.company.fillna("") + " " + v.topics + " " + v.type).str.lower().str.contains(q.lower(), regex=False)]
     v = v.sort_values(["match", "relevance", "published"], ascending=False, na_position="last")
-    sel = st.dataframe(v.drop(columns=["uid", "status"]), width="stretch", hide_index=True, height=min(38 + 35 * max(len(v), 1), 420),
+    v = v.assign(published=v.published.where(v.published != "", "not stated"))
+    # up to 20 rows on screen at once; the table scrolls beyond
+    sel = st.dataframe(v.drop(columns=["uid", "status"]), width="stretch", hide_index=True, height=38 + 35 * min(max(len(v), 1), 20),
                        on_select="rerun", selection_mode="single-row", key="grid",
-                       column_config={"title": st.column_config.TextColumn(width="medium"),
-                                      "location": st.column_config.TextColumn(width="small"),
-                                      "company": st.column_config.TextColumn(width="small"),
+                       column_config={"title": st.column_config.TextColumn(width="large"),  # the others fit their text
                                       "published": st.column_config.TextColumn(
-                                          help="Empty: the website does not state it (see 'first seen')"),
-                                      "first_seen": st.column_config.TextColumn("first seen", help="The day the app first found the offer"),
+                                          help="'not stated': the website gives no publication date (see 'online since')"),
+                                      "online_since": st.column_config.TextColumn(
+                                          "online since", help="The first day the app saw the offer, in this or an earlier scan: "
+                                                               "an offer without a date was published that day or before"),
+                                      "type": st.column_config.TextColumn("contract", help="'not stated': the offer does not say it"),
                                       "relevance": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
                                       "match": st.column_config.ProgressColumn("CV match", min_value=0, max_value=100, format="%d"),
                                       "link": st.column_config.LinkColumn("offer", display_text="open")})
@@ -395,6 +415,7 @@ def job_detail(uid):
             st.subheader(j.title, anchor=False)
             kind = r.get("contract_kind") if r.get("contract_kind") not in (None, "unknown") else ti.get("training")
             st.html(chips([(j.employer, "navy"), (label, cls), (OFFER_TYPES.get(kind or "", ""), "blue"),
+                           ("" if kind else "contract not stated", ""), ("" if j.pub_date else "no publication date", "yellow"),
                            ("research subject" if ti.get("kind") == "research_topic" else "", "blue"),
                            ({"fr": "français", "en": "English"}.get(ti.get("lang"), ""), "")]
                           + [(t, "") for t in (r.get("research_topics") or ti.get("topics") or [])[:6]]))
@@ -406,16 +427,19 @@ def job_detail(uid):
                 l2.link_button("Apply page", j.apply_url, icon=":material/send:", width="stretch")
             a, b = st.columns(2)
             seen = (j.extra or {}).get("first_seen")
-            when = f"{j.pub_date:%d %b %Y}" if j.pub_date else "not stated by the website" + (f" — first seen by the app on {seen}" if seen else "")
+            when = (f"{j.pub_date:%d %b %Y}" if j.pub_date else "not stated by the website" +
+                    (f" — online since at least {online_for(seen)}: published that day or before" if seen else ""))
             a.html(f'<div class="jf-kv"><b>Published</b> {when}</div>')
-            a.caption(f"{j.date_source or '—'} · “{(j.pub_date_text or '')[:80]}”")
+            if j.date_source or j.pub_date_text:
+                a.caption(f"{j.date_source or '—'}" + (f" · “{j.pub_date_text[:80]}”" if j.pub_date_text else ""))
             b.html(f'<div class="jf-kv"><b>Location</b> {html.escape(j.location_original or "unknown")}</div>')
             b.caption(j.location_evidence or "")
             if r:
                 st.markdown(f"**Relevance {r.get('relevance_score', 0):.0f}/100** · {r.get('reasoning_summary', '')}")
             if j.status == "review":
-                st.info("To check: " + (j.review_flags or "").replace("_", " ").replace(",", " · "))
-                if st.button("I checked it: keep this offer", icon=":material/check:"):
+                flags = [f.replace("_", " ") for f in (j.review_flags or "").split(",") if f and f != "publication_date_unknown"]
+                st.info("To check: " + " · ".join(flags) if flags else "To check.")
+                if st.button("Keep this offer"):
                     j.status, j.review_flags = ("relevant" if j.relevance_score is not None else "candidate"), ""
                     s.commit()
                     st.rerun()
@@ -529,7 +553,7 @@ def page_settings():
 
 
 # =================================================================== page: market statistics (every 15 days)
-NAVY, INK_DIM = "#1B3A6B", "#5B6B82"
+NAVY, INK, INK_DIM, GRID = "#4A78C8", "#C9D3E3", "#8C9BB4", "#1F2E4A"  # chart colours on the dark cards
 LABELS = {"job": "Job (CDI / CDD)", "internship": "Internship", "apprenticeship": "Apprenticeship", "phd_postdoc": "PhD / post-doc",
           "phd": "PhD", "master": "Master", "engineer": "Engineering degree", "bachelor": "Bachelor", "none": "None stated",
           "intern": "Intern", "junior": "Junior", "mid": "Mid-level", "senior": "Senior", "lead": "Lead / principal",
@@ -547,12 +571,13 @@ def hbar(rows, label, value="offers", prev=None):
         df["previous period"] = [dict(prev).get(k, 0) for k, _ in rows]
         tip.append(alt.Tooltip("previous period:Q"))
     base = alt.Chart(df).encode(
-        y=alt.Y(f"{label}:N", sort="-x", title=None, axis=alt.Axis(ticks=False, domain=False, labelLimit=260, labelColor="#0E1C33",
+        y=alt.Y(f"{label}:N", sort="-x", title=None, axis=alt.Axis(ticks=False, domain=False, labelLimit=260, labelColor=INK,
                                                                     labelOverlap=False, labelPadding=6)),
         x=alt.X(f"{value}:Q", title=None, axis=alt.Axis(grid=False, labels=False, ticks=False, domain=False)))
     bars = base.mark_bar(color=NAVY, cornerRadiusEnd=4, height=14).encode(tooltip=tip)
     text = base.mark_text(align="left", dx=5, color=INK_DIM, fontSize=12).encode(text=f"{value}:Q")
-    st.altair_chart((bars + text).properties(height=28 * len(df) + 8, background="transparent").configure_view(stroke=None),
+    st.altair_chart((bars + text).properties(height=28 * len(df) + 8, background="transparent").configure_view(stroke=None)
+                    .configure(font=FONT),
                     width="stretch")
 
 
@@ -616,9 +641,9 @@ def page_stats():
         if len(wk):
             st.altair_chart(alt.Chart(wk).mark_bar(color=NAVY, cornerRadiusEnd=4, size=26)
                             .encode(x=alt.X("week:N", title=None, axis=alt.Axis(labelAngle=0, ticks=False, domain=False)),
-                                    y=alt.Y("offers:Q", title=None, axis=alt.Axis(grid=True, gridColor="#E9EEF6", domain=False, ticks=False)),
+                                    y=alt.Y("offers:Q", title=None, axis=alt.Axis(grid=True, gridColor=GRID, domain=False, ticks=False, format="d", tickMinStep=1)),
                                     tooltip=["week", "offers"]).properties(height=180, background="transparent")
-                            .configure_view(stroke=None), width="stretch")
+                            .configure_view(stroke=None).configure(font=FONT), width="stretch")
     st.markdown('<div class="jf-section">Profile of the offers</div>', unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3)
     for col, key, title in ((p1, "contracts", "Contract"), (p2, "degree", "Degree required"), (p3, "seniority", "Seniority")):

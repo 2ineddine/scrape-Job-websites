@@ -12,22 +12,30 @@ from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlparse
 
 from .adapters import ScanState, distrust_shared_dates, make_gate
-from .classify import (analyze_title, classify_location, clean_title, is_boilerplate_title, location_from_text,
+from .classify import (analyze_title, classify_location, clean_location, clean_title, france_among_places, is_boilerplate_title,
+                       location_from_text,
                        looks_like_date, offer_kinds_heading)
 from .config import LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
 from .dates import date_decision, refine_job_date, refine_raw_date
-from .store import (RECENT_HOURS, Job, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers, lock_scan,
-                    profile_key, restore_recent_offers, unlock_scan)
-from .web import AccessError, Fetcher, norm, normalize_url
+from .store import (RECENT_HOURS, Job, MarketOffer, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers,
+                    lock_scan, profile_key, restore_recent_offers, unlock_scan)
+from .web import AccessError, Fetcher, html_to_text, norm, normalize_url
 
 
 # --------------------------------------------------------------------------- persistence / filters
+_HTML_TAGS = re.compile(r"</?(?:p|span|div|li|ul|ol|br|strong|em|b|i|u|font|h\d|table|tr|td)\b[^>]*>", re.I)
+
+
 def upsert_job(s, src, raw, hidden=False) -> bool:
     """Store a job. hidden=True: the job is OUTSIDE the date range - only a tiny record is kept (never shown, never analysed)
     so that the website is not re-opened for it at the next search."""
-    raw = refine_raw_date(dict(raw))  # an explicit 'Date de publication' in the description beats a feed / refresh date
+    raw = dict(raw)
+    if _HTML_TAGS.search(raw.get("description") or ""):  # Phenom (Thales, Orange, SNCF...), some JSON-LD: the page's markup
+        raw["description"] = html_to_text(raw["description"])  # was stored as text (30% of it), and sent to the AI
+    raw = refine_raw_date(raw)  # an explicit 'Date de publication' in the description beats a feed / refresh date
     original_title, raw["title"] = raw["title"], clean_title(raw["title"])  # 'Ingénieur IA H/F (REQ123)' -> 'Ingénieur IA'
+    raw["location"] = clean_location(raw.get("location"))  # 'Palaiseau Avantages 40-45k€ ...' -> 'Palaiseau'
     if raw["location"] and ((not re.search(r"[^\W\d_]{2}", raw["location"]) and not re.fullmatch(r"\s*\d{5}\s*", raw["location"]))
                             or looks_like_date(raw["location"])):
         raw["location"] = ""  # '1758' (an internal number), 'Jeudi, 5 novembre, 2026' (a date): not a place
@@ -76,6 +84,16 @@ def upsert_job(s, src, raw, hidden=False) -> bool:
     return not hidden
 
 
+def online_since(s, job):
+    """The earliest day the app saw this offer online ('YYYY-MM-DD'): its own memory of the offers (kept between sessions)
+    or the statistics history (6 months), whichever is older. For an undated offer, it was published that day or before."""
+    days = [(job.extra or {}).get("first_seen") or ""]
+    seen = s.get(SeenOffer, job.uid)
+    market = s.get(MarketOffer, job.uid)
+    days += [f"{x:%Y-%m-%d}" for x in (seen and seen.first_seen, market and market.seen) if x]
+    return min((x for x in days if x), default="")
+
+
 def hide_out_of_range(s, job, why):
     """The job's real publication date is outside the range: it leaves every list, is never analysed and never shown
     (relevant or not). A tiny record stays so that the website is not re-opened for it."""
@@ -101,11 +119,10 @@ def apply_filters(s, cfg, profile, now=None):
             hide_out_of_range(s, job, why)
             st["date_x"] += 1
             continue
-        seen = (ex.get("first_seen") or "") if d is None else ""
-        if seen and date_decision(datetime.strptime(seen, "%Y-%m-%d"), 1.0, cfg, now)[0] is False:
-            hide_out_of_range(s, job, f"no date, but already online on {seen}")  # published that day at the latest
-            st["date_x"] += 1
-            continue
+        if d is None:  # no publication date: the offer is RETURNED, with the earliest day the app knows it was online
+            since = online_since(s, job)
+            if since:
+                job.extra = ex = {**ex, "first_seen": since}
         if d is None and cfg["unknown_date_policy"] == "exclude":
             job.status, job.reason = "excluded", "date: " + why
             st["date_x"] += 1
@@ -129,7 +146,11 @@ def apply_filters(s, cfg, profile, now=None):
             job.status, job.reason = "excluded", "location: remote jobs disabled"
             st["loc_x"] += 1
             continue
-        if loc["location_verified"] and not loc["france_eligible"]:
+        said = france_among_places(job.description) if loc["location_verified"] and not loc["france_eligible"] else ""
+        if said:  # listed abroad, but the offer says it can be held in France too: included
+            job.country_code, job.france_eligible = "FR", True
+            job.location_evidence = f"{loc['location_evidence']}; but the offer's text names France among its places: '{said}'"
+        elif loc["location_verified"] and not loc["france_eligible"]:
             job.status, job.reason = "excluded", "location: " + loc["location_evidence"]
             st["loc_x"] += 1
             continue

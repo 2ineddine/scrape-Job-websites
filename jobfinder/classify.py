@@ -136,6 +136,72 @@ _FR_STREET = re.compile(r"(?i)\b(?:rue|avenue|boulevard|bd|all[ée]e|chemin|impa
                         r"parvis)\b[^,;\n]{1,60}[,\s]\s*(?:F-)?(?:0[1-9]|[1-8]\d|9[0-5]|97)\d{3}\b")
 
 
+# the next field of the page, written without a colon ('Palaiseau Avantages 40-45k€ ...', 'Firenze Niveau d'études ...')
+_NEXT_FIELD = re.compile(r"\s+(?:Avantages|Salaire|R[ée]mun[ée]ration|Niveau d['’][ée]tudes|Type de contrat|Exp[ée]rience|"
+                         r"Dur[ée]e du contrat|Dur[ée]e\b|Date d['’]embauche|Date d['’]Embauche|Prise de poste|"
+                         r"Dipl[ôo]me|T[ée]l[ée]travail|Date de|R[ée]f[ée]rence|Ce poste|What you|What will|Description|Profil|"
+                         r"Missions?\b|Salary|Benefits|Contract|Experience)\b|\s+[–-]\s+\d+ jours?\b")
+
+
+def clean_location(loc) -> str:
+    """A location field as the website gave it, without the fields that follow it on the page; '' for a sentence that
+    names no place ('Personal protective equipment will be provided...'): the offer's text is then searched instead."""
+    loc = _NEXT_FIELD.split(str(loc or ""), maxsplit=1)[0].strip(" ,;-–")
+    if len(loc.split()) > 8 and not classify_location(loc)["location_verified"]:
+        return ""
+    return loc
+
+
+# the places an offer says it can be held in, written in its own text: 'Offre disponible : Bruxelles Rennes', 'Locations:
+# Paris, London', 'as long as you're living in either Germany, France, Italy...', 'eligible to work from Belgium or France'
+_PLACES_LABEL = re.compile(r"(?i)(?:offre disponible|available (?:in|at)|other locations?|locations?|lieux?)\s*:\s*([^.\n]{3,160})")
+# said of the person, not of a team ('organization is based in Paris', 'a Legal team based in France and Italy' are not)
+_PLACES_PHRASE = re.compile(r"(?i)(?:living in|work(?:ing)? from|relocate to|remote from|t[ée]l[ée]travail depuis|"
+                            r"eligible to work (?:from|in)|(?:this|the) (?:role|position|job) (?:is|can be|will be) based (?:in|out of)|"
+                            r"you(?:'ll| will| can) be based (?:in|out of)|poste (?:est )?bas[ée] [àa]|vous serez bas[ée]e? [àa])"
+                            r"([^.;\n]{3,160})")
+_OTHER_SET: set = set()  # filled on first use (OTHER_PLACES is defined further down)
+
+
+def _exact_place(item) -> bool:
+    """'France', 'Paris', 'Île-de-France', 'Lyon (69)', 'Germany': a place name and nothing else ('Nice to Have' is not)."""
+    k = _place_key(re.sub(r"\([^)]*\)", " ", item)).strip()
+    if not k or len(k.split()) > 4:
+        return False
+    if not _OTHER_SET:
+        _OTHER_SET.update(OTHER_PLACES)
+    if k in ("france", "ile de france") or norm(item).strip() in _OTHER_SET:
+        return True
+    place = fr_place(item)
+    return bool(place) and _place_key(place) == k
+
+
+def _places_list_names_france(v) -> bool:
+    """'either Germany, France, Italy' / 'Paris or in Barcelona': the words start with a list of place names, one of them
+    in France ('multinational team (France, Poland, India)', 'our offices in Paris...' are sentences, not such lists)."""
+    v = re.sub(r"\([^)]*\)", " ", v)
+    v = re.sub(r"(?i)^\s*(?:either|one of|in|from|à|a|en)\s+", "", v.strip())
+    items = [x.strip(" .!:-") for x in re.split(r"\s*(?:,|;|/|\||•|\bor(?: in)?\b|\band\b|\bou(?: à)?\b|\bet\b)\s*", v)]
+    places = []
+    for it in [x for x in items if x][:8]:
+        if not _exact_place(it):
+            break
+        places.append(it)
+    return any(_part_country(norm(x)) == "FR" for x in places)
+
+
+def france_among_places(text) -> str:
+    """The words of an offer's text that name France among the places it can be held in ('' when none): an offer listed
+    in Milan that can be held from France is open in France too."""
+    t = str(text or "")[:8000]
+    found = [_label_value(m.group(1)) for m in _LOC_LABEL.finditer(t)]
+    found += [m.group(1).strip() for rx in (_PLACES_LABEL, _PLACES_PHRASE) for m in rx.finditer(t)]
+    for v in found:
+        if v and not _FORM_PROMPT.search(v) and _places_list_names_france(v):
+            return v[:120]
+    return ""
+
+
 def location_from_text(text, title="") -> str:
     """'Localisation : Rueil-Malmaison (92)' / 'Localisation du poste France, Occitanie, Gard (30)' written in a job
     text. A search form can also say 'Localisation ...': a value that names a real place is preferred. Without a label,
@@ -358,6 +424,33 @@ def _part_country(p: str):
     return None
 
 
+# countries, states and regions (not cities): 'Woluwe-Saint-Pierre, Belgium' is a city in its country, while 'Paris, Barcelona'
+# is a list of cities
+_AREAS = set(OTHER_PLACES[OTHER_PLACES.index("afghanistan"):OTHER_PLACES.index("new orleans")]) | {
+    "united kingdom", "uk", "gb", "gbr", "great britain", "england", "scotland", "wales", "germany", "deutschland",
+    "united states", "usa", "us", "texas", "canada", "india", "japan", "china", "spain", "italy", "netherlands", "ireland",
+    "switzerland", "poland", "israel", "australia", "brazil", "mexico", "belgium", "sweden", "denmark", "norway",
+    "portugal", "austria", "czech", "romania", "luxembourg", "finland", "korea", "uae", "morocco", "maroc", "tunisia",
+    "tunisie", "algeria", "algerie", "egypt", "turkey", "turquie", "hungary", "slovakia", "philippines", "vietnam",
+    "thailand", "malaysia", "indonesia", "south africa", "argentina", "chile", "colombia", "peru", "greece", "croatia",
+    "serbia", "bulgaria", "ukraine", "qatar", "saudi arabia", "allemagne", "royaume-uni", "royaume uni", "espagne",
+    "italie", "belgique", "suisse", "pays-bas", "pays bas", "etats-unis", "etats unis", "inde", "chine", "pologne",
+    "roumanie", "irlande", "suede", "danemark", "norvege", "autriche", "japon", "bresil", "mexique", "europe", "emea",
+    "eu", "worldwide", "remote", "anywhere"}
+
+
+def _french_cities_of_a_list(part) -> list:
+    """'paris, barcelona' / 'munich - berlin - london - paris': several CITIES, no country or state among them, one or more
+    in France -> the French ones (the offer is open there); otherwise []. ('Paris, Texas, USA' names a state: [].)"""
+    pieces = [x.strip(" .") for x in re.split(r"\s*,\s*|\s+[-–]\s+", part) if x.strip(" .")]
+    if len(pieces) < 2 or any(norm(x) in _AREAS or re.fullmatch(r"[a-z]{2,3}", norm(x)) for x in pieces):
+        return []
+    kinds = [_part_country(norm(x)) for x in pieces]
+    if "OTHER" not in kinds:  # 'Paris, Île-de-France, France': one French place written with its region
+        return []
+    return [x for x, k in zip(pieces, kinds) if k == "FR"]
+
+
 def classify_location(loc, country_hint=None, remote_hint=None, applicant_countries=None):
     """Evidence-based France eligibility. Never infers from company presence; missing data -> unverified."""
     original = (loc or "").strip()
@@ -369,15 +462,25 @@ def classify_location(loc, country_hint=None, remote_hint=None, applicant_countr
              remote_status="hybrid" if hybrid else "remote" if remote else ("onsite" if t else "unknown"))
     parts = [p.strip() for p in re.split(r"[;|/•\n]| or | ou ", t) if p.strip()]
     kinds = [_part_country(p) for p in parts]
+    if "FR" not in kinds:  # 'Paris, Barcelona' (Joko), 'Paris, San Francisco' (Gradium): open in France too
+        kinds = ["FR" if k == "OTHER" and _french_cities_of_a_list(p) else k for p, k in zip(parts, kinds)]
     ch = norm(country_hint or "")
     ac = [norm(x) for x in (applicant_countries or [])]
     if "FR" in kinds:
         r.update(country_code="FR", location_verified=True, france_eligible=True,
                  location_evidence=f"Listing location '{original}' includes France")
         # a remote offer attached to a city ('Paris, Île-de-France' with telework) keeps its city; 'Remote - France' has none
-        city = re.sub(r"^fr-\w+-", "", original.split(",")[0].strip(), flags=re.I).title()
-        if not re.search(r"remote|teletravail|telework|work from home|distanciel", norm(city)):
-            r["city"] = city
+        parts = [x.strip() for x in re.split(r"\s*[;|]\s*", original) if x.strip()]
+        if len(parts) > 1:  # several places ('Bruxelles ; Île-de-France'): the French ones are the offer's cities here
+            parts = [x for x in parts if classify_location(x)["france_eligible"]] or parts
+        cities = []
+        for part in [c for x in parts for c in (_french_cities_of_a_list(x) or [x])]:
+            city = re.sub(r"^fr-\w+-", "", part.split(",")[0].strip(), flags=re.I)
+            city = city.title() if city.islower() or city.isupper() else city  # 'PARIS' -> 'Paris', 'Île-de-France' kept
+            if city and not re.search(r"remote|teletravail|telework|work from home|distanciel", norm(city)):
+                cities.append(city)
+        if cities:
+            r["city"] = " & ".join(dict.fromkeys(cities))
     elif ch in ("fr", "france", "fra"):
         r.update(country_code="FR", location_verified=True, france_eligible=True,
                  location_evidence="Structured country field = France")
@@ -718,13 +821,19 @@ def _topic_verdict(info, t, d, profile):
         info.verdict, info.reason = verdict, reason
         return info
 
+    hit = [k for k in expand_keywords(profile.get("keywords", [])) if _kw(k, t)]
+    # a wanted ROLE named in full ('data scientist', 'ml engineer', 'ingenieur de recherche'), not a topic ('ai agents')
+    specific = [h for h in hit if " " in h and re.search(r"scien|engineer|ingenieur|research|chercheur|develop", h)]
     for x in _NON_RESEARCH:
         if _kw(_clean(x), t):
+            if specific:  # 'Data Scientist Finance - Contrôle de gestion': a data scientist in a finance team
+                return done("maybe", f"title matches {specific[:3]} but also names '{x}': AI decides")
             return done("reject", f"sales / business / admin role ('{x}')")
     for x in profile.get("exclude_titles", []):
         if _kw(_clean(x), t):
+            if specific:  # 'Marketing Data Scientist': a wanted role in a marketing team, not marketing
+                return done("maybe", f"title matches {specific[:3]} but also names '{x}': AI decides")
             return done("reject", f"excluded term '{x}'")
-    hit = [k for k in expand_keywords(profile.get("keywords", [])) if _kw(k, t)]
     if hit and info.role_family != "management":
         return done("pass", f"title matches {hit[:3]}")
     core = [x for x in info.topics if x not in TECH_FIELDS]

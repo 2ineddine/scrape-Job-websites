@@ -46,11 +46,16 @@ CONFIG_DEFAULT = {
 LIMITS = {
     "nav_mode": "auto",  # platform readers -> page reading -> AI page reader -> AI browser
     "ai_site_filters": True, "site_filter_location": "France",
-    "unknown_date_policy": "review",  # an offer without a publication date goes to 'To check'
+    "unknown_date_policy": "review",  # an offer without a publication date is returned, marked 'date not stated'
     "include_remote_fr": True, "min_match": 0,
     "delay": 1.0, "max_duration": 5400, "max_site_duration": 1200, "timeout": 25, "retries": 2, "respect_robots": True,
     "max_pages": 500, "max_details_per_source": 300, "stale_pages": 2, "parallel_sites": 4,
-    "max_ai_calls": 1200, "max_ai_jobs_per_run": 400,
+    # every offer is analysed (0 = no limit); a billed model (xAI) answers at most max_billed_calls requests per scan, the
+    # free models take the rest as their quotas allow
+    "max_ai_calls": 0, "max_ai_jobs_per_run": 0, "max_billed_calls": 100,
+    # offers analysed at the same time (automatic model switching only), and requests one model serves at once: the next
+    # request goes to the next model in rank (llm.call_json)
+    "ai_workers": 4, "ai_per_model": 2,
     "thin_job_chars": 800, "job_text_chars": 9000, "ai_nav_max_steps": 150, "ai_filter_max_steps": 8,
 }
 

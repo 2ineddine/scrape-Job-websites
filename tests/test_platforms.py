@@ -650,6 +650,7 @@ def _ladder(monkeypatch, answers):
 
     monkeypatch.setattr(llm, "chat", chat)
     monkeypatch.setattr(llm, "_EXHAUSTED", {})
+    monkeypatch.setattr(llm, "_HEALTH", {})  # each test judges the models afresh
     llm.reset_usage()
     keys = {"gemini": "g1", "gemini#2": "g2", "groq": "q", "openrouter": "o"}
     cfg = {"auto_models": True, "max_ai_calls": 100, "model": {"provider": "ollama", "model": "llama3.1"}}
@@ -2118,3 +2119,120 @@ def test_offers_of_the_last_24_hours_are_kept_with_their_analysis():
         assert kept["rel"].relevance_score == 82.0 and kept["rel"].match_score is None
         kept = next_session("P2", "C")  # another search profile: the filters and the AI run again
         assert kept["rel"].status == "new" and kept["rel"].relevance_score is None and kept["rel"].description == "missions"
+
+
+def test_an_undated_offer_seen_long_ago_is_returned_with_the_day_it_was_first_seen():
+    """No publication date: the offer is never hidden for its age; it shows the earliest day the app knows it was online
+    (its memory of the offers, or the statistics history), even outside the date range."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import apply_filters
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    now = datetime.utcnow()
+    with sessionmaker(bind=engine)() as s:
+        j = store.Job(uid="u1", title="Ingénieur Machine Learning (H/F)", url="https://a.fr/1", status="new", pub_date=None,
+                      location_original="Paris, France", extra={"first_seen": f"{now - timedelta(days=20):%Y-%m-%d}"})
+        s.add_all([j, store.SeenOffer(uid="u1", first_seen=now - timedelta(days=20)),
+                   store.MarketOffer(uid="u1", seen=now - timedelta(days=45), title=j.title)])
+        s.commit()
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT)
+        assert j.status == "candidate" and "publication_date_unknown" in j.review_flags
+        assert j.extra["first_seen"] == f"{now - timedelta(days=45):%Y-%m-%d}"  # the statistics history knew it earlier
+
+
+def _contract_case(monkeypatch, answer_kind, evidence, text):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import analysis, store
+    from jobfinder.config import CONFIG_DEFAULT, PROFILE_DEFAULT, run_config
+    profile = {**PROFILE_DEFAULT, "offer_types": ["internship"]}
+    answer = analysis.JobAnalysis(contract_kind=answer_kind, contract_evidence=evidence, is_relevant=True, relevance_score=80,
+                                  analysis_confidence=0.9, france_eligible=True, location_evidence="Paris, France")
+    monkeypatch.setattr(analysis, "call_json", lambda *a, **k: answer)
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as s:
+        j = store.Job(uid="c1", title="Machine Learning - Computer Vision", url="https://a.fr/1", status="candidate",
+                      description=text, location_original="Paris, France", location_verified=True, france_eligible=True)
+        s.add(j); s.commit()
+        analysis.analyze_job(s, j, profile, run_config(CONFIG_DEFAULT))
+        return j.status, (j.relevance_json or {}).get("contract_kind")
+
+
+def test_an_offer_whose_contract_is_not_stated_is_kept(monkeypatch):
+    # the model guesses 'job' for an offer that names no contract: an internship search keeps it, contract 'not stated'
+    text = "Vous rejoindrez notre équipe de vision par ordinateur à Paris pour travailler sur la détection d'objets. " * 3
+    status, kind = _contract_case(monkeypatch, "job", "", text)
+    assert status == "relevant" and kind == "unknown"
+
+
+def test_an_offer_stating_an_unwanted_contract_is_still_excluded(monkeypatch):
+    text = "Poste en CDI à Paris dans notre équipe de vision par ordinateur, détection d'objets et suivi. " * 3
+    status, kind = _contract_case(monkeypatch, "job", "CDI", text)
+    assert status == "excluded" and kind == "job"
+
+
+def test_a_card_listing_a_city_abroad_then_a_french_one_is_kept_in_france():
+    """Davidson: 'Chef de projet BESS - Bruxelles | Île-de-France' was excluded as a Brussels offer (its first place)."""
+    from jobfinder.classify import classify_location
+    from jobfinder.crawler import _card_location
+    card = lambda places: ('<div><a href="/nos-offres/chef-de-projet-bess">Chef de projet BESS</a>'
+                           + "".join(f"<span>{p}</span>" for p in places) + "</div>")
+    loc = _card_location(BeautifulSoup(card(["Bruxelles", "Île-de-France"]), "html.parser"), "https://d.fr/",
+                         "https://d.fr/nos-offres/chef-de-projet-bess", "Chef de projet BESS")
+    assert loc == "Bruxelles ; Île-de-France"
+    r = classify_location(loc)
+    assert r["france_eligible"] and r["city"] == "Île-de-France"
+    loc = _card_location(BeautifulSoup(card(["Strasbourg", "Bruxelles"]), "html.parser"), "https://d.fr/",
+                         "https://d.fr/nos-offres/chef-de-projet-bess", "Chef de projet BESS")
+    assert loc == "Strasbourg"  # a French first place: unchanged
+
+
+def test_a_contract_quote_that_contradicts_the_ai_answer_wins(monkeypatch):
+    """'contrat CDD 6 mois' quoted as the evidence of an 'internship': the research engineer's offer was set aside."""
+    status, kind = _contract_case(monkeypatch, "internship", "contrat CDD 6 mois",
+                                  "Ingénieur de recherche en vision par ordinateur à Paris, en contrat CDD 6 mois. " * 3)
+    assert kind == "job"  # an internship-only search: excluded as a job, not as an internship
+    status, kind = _contract_case(monkeypatch, "job", "Ce stage de 4 mois",
+                                  "Ce stage de 4 mois porte sur la vision par ordinateur à Paris. " * 3)
+    assert kind == "internship" and status != "excluded"
+
+
+def test_a_description_given_as_html_is_stored_as_text():
+    """216 offers (Phenom: Thales, Orange, SNCF...) kept the page's markup: 30% of their text, sent to the AI."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.scan import upsert_job
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as s:
+        src = store.Source(url="https://x.fr/", label="x"); s.add(src); s.flush()
+        raw = {"title": "Data Analyst", "url": "https://x.fr/1", "location": "Paris", "date": None, "date_conf": 0.0,
+               "date_text": "", "date_source": "", "conf": 0.9, "provenance": "phenom-api+detail",
+               "description": '<p style="text-align:justify">Nous recherchons <strong>un(e) Data Analyst</strong></p><ul><li>SQL</li></ul>'}
+        upsert_job(s, src, raw)
+        assert s.query(store.Job).one().description == "Nous recherchons un(e) Data Analyst SQL"
+
+
+def test_a_post_doc_quoted_as_a_cdd_stays_a_post_doc(monkeypatch):
+    """A post-doc is a fixed-term contract too: 'CDD 24 mois' must not turn it into a regular job (a PhD/post-doc search
+    would lose it), while 'CDD' quoted for an 'internship' answer does make it a job."""
+    status, kind = _contract_case(monkeypatch, "phd_postdoc", "CDD 24 mois",
+                                  "Post-doctorat en vision par ordinateur à Paris, CDD 24 mois au laboratoire. " * 3)
+    assert kind == "phd_postdoc"
+
+
+def test_a_billed_model_answers_at_most_its_share_of_a_scan(monkeypatch):
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {})
+    cfg = {**cfg, "model": {"provider": "xai", "model": "grok-4.3"}, "max_billed_calls": 2}
+    keys = {"xai": "x"}  # only the billed model has a key
+    assert llm.call_json("u1", A, cfg, s, keys).ok and llm.call_json("u2", A, cfg, s, keys).ok
+    import pytest
+    with pytest.raises(llm.AIError):
+        llm.call_json("u3", A, cfg, s, keys)
+    assert len(calls) == 2

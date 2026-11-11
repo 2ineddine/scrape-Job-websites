@@ -7,6 +7,9 @@ Anything the AI cannot prove stays in 'To check'."""
 from __future__ import annotations
 
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Literal, get_args
 
@@ -16,9 +19,10 @@ from .classify import OFFER_TYPES, analyze_title, wanted_types
 from .config import run_config, utcnow
 from .cv import _ws, match_job
 from .dates import NO_DATE, date_candidates, date_decision, describe_candidates, parse_date, refine_job_date, text_publication_date
-from .llm import AIError, MalformedOutput, call_json, require_cv_consent, reset_usage
+from .llm import AIError, MalformedOutput, call_json, health_report, require_cv_consent, reset_usage
 from .scan import hide_out_of_range
 from .store import CVDocument, Job, SessionLocal, cv_key, profile_key
+from .trim import essential_text
 from .web import Fetcher
 
 
@@ -28,6 +32,7 @@ class JobAnalysis(BaseModel):
     offer_kind: Literal["job", "research_topic"] = "job"
     role_type: Literal["research_ml", "engineering_software", "data", "sales_business", "admin_support", "other"] = "other"
     contract_kind: Literal["job", "internship", "apprenticeship", "phd_postdoc", "unknown"] = "unknown"
+    contract_evidence: str = ""  # the words of the text that state the contract ('CDI', 'Stage de 6 mois')
     research_topics: list[str] = []
     location_text: str = ""
     country_code: str | None = None
@@ -65,7 +70,7 @@ class JobAnalysis(BaseModel):
                                                       ("these", "phd_postdoc"), ("cdi", "job"), ("cdd", "job")) if w in k), "unknown")
         if d.get("role_type") not in get_args(cls.model_fields["role_type"].annotation):
             d["role_type"] = "other"
-        for k in ("title", "location_text", "location_evidence", "date_evidence", "reasoning_summary"):
+        for k in ("title", "location_text", "location_evidence", "date_evidence", "reasoning_summary", "contract_evidence"):
             if d.get(k) is None:
                 d[k] = ""
         if d.get("research_topics") is None:
@@ -87,11 +92,12 @@ def _exclude(s, job, res, reason):
     return res
 
 
-def build_prompt(job, profile, text, cands, ti):
+def build_prompt(job, profile, text, cands, ti, second=False):
     want = wanted_types(profile)
     wanted = ", ".join(OFFER_TYPES[k] for k in OFFER_TYPES if k in want)
     unwanted = ", ".join(OFFER_TYPES[k] for k in OFFER_TYPES if k not in want) or "nothing"
     return (
+        ("INDEPENDENT SECOND READING of this offer: judge the work described from the text alone.\n" if second else "") +
         f"Candidate research profile: {profile['description']}\nTarget topics: {', '.join(profile['keywords'][:150])}\n"
         "The candidate wants: offers located in FRANCE (or remote and explicitly open to France), published recently; "
         "research / applied-science / machine-learning / deep-learning / vision / audio-speech / signal / robotics work. "
@@ -112,13 +118,15 @@ def build_prompt(job, profile, text, cands, ti):
         f"Already extracted by simple rules (may be empty or wrong): title='{job.title}', location='{job.location_original}', "
         f"published='{job.pub_date}'.\n<untrusted>\n{text or '(page text missing)'}\n</untrusted>\n"
         "contract_kind: job (CDI, CDD, permanent, fixed-term, freelance), internship (stage, internship, master project), "
-        "apprenticeship (alternance, apprentissage), phd_postdoc (thesis, PhD, doctoral contract, post-doc), unknown.\n"
+        "apprenticeship (alternance, apprentissage), phd_postdoc (thesis, PhD, doctoral contract, post-doc), unknown. Answer "
+        "the kind the TEXT STATES; when the text names no contract, answer unknown: never guess it from the role or the "
+        "seniority. contract_evidence = the EXACT words of the text that state it (e.g. 'CDI', 'Stage de 6 mois'), else empty.\n"
         "MARKET FACTS (from the text only): skills = up to 12 short names of the tools, programming languages, frameworks and "
         "methods the offer asks for (e.g. 'Python', 'PyTorch', 'C++', 'ROS', 'computer vision', 'Kubernetes'); degree = the "
         "required degree (phd|master|engineer|bachelor|none|unknown); seniority (intern|junior|mid|senior|lead|unknown); "
         "languages = spoken languages required (e.g. 'French', 'English'); remote (onsite|hybrid|remote|unknown); "
         "salary_text = the salary as written in the offer, else empty.\n"
-        "JSON keys: title, offer_kind(job|research_topic), contract_kind(job|internship|apprenticeship|phd_postdoc|unknown), "
+        "JSON keys: title, offer_kind(job|research_topic), contract_kind(job|internship|apprenticeship|phd_postdoc|unknown), contract_evidence, "
         "role_type(research_ml|engineering_software|data|sales_business|admin_support|other), research_topics[], location_text, country_code, "
         "france_eligible(true|false|null), location_evidence, publication_date_choice(number|null), date_evidence, "
         "is_relevant, relevance_score(0-100), reasoning_summary, analysis_confidence(0-1), needs_review, "
@@ -144,24 +152,40 @@ def _ai_date(res, cands, text):
     return None, False
 
 
-def analyze_job(s, job: Job, profile, cfg, keys=None):
+def analyze_job(s, job: Job, profile, cfg, keys=None, second=False):
     """AI reads the job text: publication date, location, role type and relevance in ONE call.
-    Evidence is verified against the text; anything unproven stays in 'To check'."""
-    text = (job.description or "")[:int(cfg.get("job_text_chars", 9000))]
+    Evidence is verified against the text; anything unproven stays in 'To check'.
+    The AI reads the offer WITHOUT its boilerplate (company presentation, benefits, forms: trim.py); the dates it chooses
+    from and every quote it gives are checked against the FULL text."""
+    full = job.description or ""
+    text = essential_text(full, int(cfg.get("job_text_chars", 9000)), job.employer or "", job.location_original or "")
     ex = job.extra or {}
     ti = analyze_title(job.title, ex.get("department"), profile, job.employment_type)
-    cands = date_candidates(text)
-    res = call_json(build_prompt(job, profile, text, cands, ti), JobAnalysis, cfg, s, keys)
+    cands = date_candidates(full)
+    res = call_json(build_prompt(job, profile, text, cands, ti, second), JobAnalysis, cfg, s, keys)
     # the offer type the TITLE states ('Stage - Data Scientist', 'Post-doc', 'CDI') beats the AI's: small models read
     # 'Stage' as a regular job, and an internship-only profile would then lose the offer
     stated = ti.training or ("job" if ti.contract in ("cdi", "cdd", "freelance", "interim") else "")
     if stated and res.contract_kind != stated:
         res.contract_kind = stated
-    proven = lambda ev: bool(ev) and len(_ws(ev)) >= 4 and _ws(ev) in _ws(text)
+    ev = _ws(res.contract_evidence)
+    if not stated and res.contract_kind != "unknown" and not (
+            len(ev) >= 3 and re.search(rf"(?<!\w){re.escape(ev)}(?!\w)", _ws(f"{job.title} {full}"))):
+        # a contract the offer does not state is a guess (free models answer 'job' by default): the offer is kept, its
+        # contract 'not stated', instead of being dropped as a kind of offer the user does not want
+        res.contract_kind = "unknown"
+    elif not stated and res.contract_kind != "unknown":
+        # the quote must say what the AI answers: 'contrat CDD 6 mois' quoted for an 'internship' is a job (a research
+        # engineer's offer was set aside as an internship). The app's own reading of the quote wins.
+        q = analyze_title(res.contract_evidence)
+        said = q.training or ("job" if q.contract in ("cdi", "cdd", "freelance", "interim") else "")
+        if said and said != res.contract_kind and not (said == "job" and res.contract_kind == "phd_postdoc"):
+            res.contract_kind = said  # 'contrat CDD 6 mois' quoted for an internship: a job (a post-doc is a CDD too)
+    proven = lambda ev: bool(ev) and len(_ws(ev)) >= 4 and _ws(ev) in _ws(full)
     flags = []
     # ---- publication date: deterministic text evidence first, then the AI's choice among the dates of the text
     refine_job_date(job)  # an explicit 'Date de publication : ...' in the description beats a feed / refresh date
-    ai_date, explicit = _ai_date(res, cands, text)
+    ai_date, explicit = _ai_date(res, cands, full)
     cur = (job.pub_date, job.date_conf or 0.0, job.date_source or "", job.pub_date_text or "") if job.pub_date else NO_DATE
     if ai_date and (cur[0] is None or cur[1] < 0.5):
         cur = (ai_date, 0.8 if explicit else 0.65, "AI (chosen among the dates of the text)", res.date_evidence or f"{ai_date:%Y-%m-%d}")
@@ -253,17 +277,37 @@ def _analyze_deep(s, j, profile, cfg, keys, fetcher, rend, say):
         if out:
             return None
         res = analyze_job(s, j, profile, cfg, keys)
-    return res
+    return _second_reading(s, j, res, profile, cfg, keys, say)
+
+
+SECOND_READING_FROM = 25  # an AI exclusion scored between this and the minimum relevance is read a second time
+
+
+def _second_reading(s, j, res, profile, cfg, keys, say):
+    """The same model can judge the same offer 35 one time and 85 the next (checked on 30 real offers: 5 verdicts changed
+    between two readings of the same text). An offer excluded with a BORDERLINE score is read a second time; when that
+    reading finds it relevant, the offer goes to 'To check', marked, instead of being lost."""
+    if (res is None or j.status != "excluded" or not (j.reason or "").startswith("AI relevance")
+            or not SECOND_READING_FROM <= res.relevance_score < cfg["min_relevance"]):
+        return res
+    first = res.relevance_score
+    res2 = analyze_job(s, j, profile, cfg, keys, second=True)
+    if j.status in ("relevant", "review"):
+        flags = [x for x in (j.review_flags or "").split(",") if x] + ["AI_readings_disagree"]
+        j.status, j.review_flags = "review", ",".join(dict.fromkeys(flags))
+        j.reason = f"two AI readings disagree ({first:.0f}, then {res2.relevance_score:.0f}): {j.reason}"
+        s.commit()
+        say(f"second AI reading finds it relevant ({first:.0f} -> {res2.relevance_score:.0f}): kept to check: {j.title[:60]}")
+    return res2
 
 
 def analyze_pipeline(cfg, profile, keys, prog):
     """AI relevance on every candidate, then CV matching on relevant jobs. Never switches provider silently."""
-    from .browser import Renderer
+    from .browser import ThreadedRenderer
     cfg = run_config(cfg)
-    fetcher = Fetcher(cfg, prog.say)
-    rend = Renderer(cfg, fetcher)  # a browser is started only if a job page really needs one
+    rend = ThreadedRenderer(cfg, Fetcher(cfg, prog.say))  # a browser is started only if a job page really needs one
     try:
-        _pipeline(cfg, profile, keys, prog, fetcher, rend)
+        _pipeline(cfg, profile, keys, prog, rend)
     finally:
         rend.close()
         from .market import run_if_due
@@ -280,70 +324,142 @@ def _by_priority(jobs):
     return sorted(jobs, key=key)
 
 
-def _pipeline(cfg, profile, keys, prog, fetcher, rend):
+def _workers(cfg) -> int:
+    """Offers analysed at the same time: several with automatic model switching (the requests spread over the ranked
+    models), one with a single chosen model (a local Ollama, one key)."""
+    return max(1, int(cfg.get("ai_workers", 4))) if cfg.get("auto_models") else 1
+
+
+def _in_parallel(ids, work, workers):
+    """work(id) for every id, `workers` at a time, started in the given order (best offers first). Yields (id, result or
+    the exception it raised) as they finish."""
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai") as ex:
+        futs = {ex.submit(work, i): i for i in ids}
+        for f in as_completed(futs):
+            try:
+                yield futs[f], f.result()
+            except Exception as e:  # noqa: BLE001 - handed to the caller, which decides
+                yield futs[f], e
+
+
+def _pipeline(cfg, profile, keys, prog, rend):
     reset_usage()
     prog.set(task="AI analysis", ai_msg="")
     with SessionLocal() as s:
         jobs = s.query(Job).filter(Job.status.in_(["candidate", "review"]), Job.relevance_score.is_(None)).all()
-        jobs, left = _by_priority(jobs), max(0, len(jobs) - cfg["max_ai_jobs_per_run"])
-        jobs = jobs[:cfg["max_ai_jobs_per_run"]]
-        prog.set(ai_total=len(jobs), ai_done=0)
-        if left:
-            prog.say(f"{left} offers beyond the limit of {cfg['max_ai_jobs_per_run']} per run stay 'Not analysed'")
-        # the 'Relevant' tile: the same count as the header and the Results view ('To check' offers are not relevant yet)
-        relevant = lambda: s.query(Job).filter(Job.status == "relevant").count()
-        failed, pkey = 0, profile_key(profile)
-        for j in jobs:
-            if prog.cancel.is_set():
-                return
+        cap = int(cfg.get("max_ai_jobs_per_run") or 0) or len(jobs)  # 0: every offer is analysed
+        jobs, left = _by_priority(jobs), max(0, len(jobs) - cap)
+        jobs = jobs[:cap]
+        order, titles = [j.id for j in jobs], {j.id: j.title or "" for j in jobs}
+    prog.set(ai_total=len(order), ai_done=0)
+    if left:
+        prog.say(f"{left} offers beyond the limit of {cap} per run stay 'Not analysed'")
+    workers, pkey, stop = _workers(cfg), profile_key(profile), threading.Event()
+    fetchers = threading.local()  # one HTTP session per worker thread
+
+    def relevant():  # the 'Relevant' tile: the same count as the header and the Results view
+        with SessionLocal() as c:
+            return c.query(Job).filter(Job.status == "relevant").count()
+
+    def analyse(jid):
+        if stop.is_set() or prog.cancel.is_set():
+            return None
+        if not hasattr(fetchers, "f"):
+            fetchers.f = Fetcher(cfg, prog.say)
+        with SessionLocal() as ws:
+            j = ws.get(Job, jid)
             try:
-                _analyze_deep(s, j, profile, cfg, keys, fetcher, rend, prog.say)
+                _analyze_deep(ws, j, profile, cfg, keys, fetchers.f, rend, prog.say)
                 if j.relevance_score is not None:  # the profile it was analysed for: the next scans reuse it only for this one
                     j.extra = {**(j.extra or {}), "profile_key": pkey}
-                    s.commit()
-                failed = 0
-            except MalformedOutput as e:  # this offer only: it stays 'Not analysed', the others go on
-                s.rollback()
-                failed += 1
-                prog.say(f"AI answer unusable for '{j.title[:60]}': skipped ({str(e)[:120]})")
-                if failed >= 5:
-                    prog.set(ai_msg="AI analysis stopped: the model gave 5 unusable answers in a row - try another model in Settings")
-                    return
-            except AIError as e:  # key, quota, provider down: every next offer would fail too
-                prog.set(ai_msg=f"AI analysis stopped: {e}", relevant=relevant())
-                prog.say(f"AI error: {e}")
-                return
+                    ws.commit()
+            except Exception:
+                ws.rollback()
+                raise
+        return True
+
+    if workers > 1:
+        prog.say(f"AI analysis: {workers} offers at a time, spread over the models in their order")
+    failed, t0 = 0, time.time()
+    for jid, out in _in_parallel(order, analyse, workers):
+        if isinstance(out, MalformedOutput):  # this offer only: it stays 'Not analysed', the others go on
+            failed += 1
+            prog.say(f"AI answer unusable for '{titles[jid][:60]}': skipped ({str(out)[:120]})")
+            if failed >= 5 and not stop.is_set():
+                prog.set(ai_msg="AI analysis stopped: every model gave unusable answers for 5 offers in a row - try again later")
+                stop.set()
+        elif isinstance(out, AIError):  # key, quota, every model down: every next offer would fail too
+            if not stop.is_set():
+                prog.set(ai_msg=f"AI analysis stopped: {out}", relevant=relevant())
+                prog.say(f"AI error: {out}")
+            stop.set()
+        elif isinstance(out, Exception):
+            prog.say(f"analysis failed for '{titles[jid][:60]}': {str(out)[:120]}")
+        elif out:
+            failed = 0
+        if out is not None:
             prog.inc("ai_done")
             prog.set(relevant=relevant())
-        todo = s.query(Job).filter(Job.status == "relevant", Job.match_score.is_(None)).limit(cfg["max_ai_jobs_per_run"]).all()
-        if not todo:
-            return
-        if not [c for c in s.query(CVDocument).filter_by(enabled=True) if c.status == "ok"]:
-            prog.set(ai_msg="No usable CV uploaded (Settings): CV matching skipped.")
-            return
-        try:
-            require_cv_consent(cfg)
-        except AIError as e:
-            prog.set(ai_msg=str(e))
-            return
-        prog.set(task="CV matching")
-        ckey = cv_key(s)
-        for j in todo:
-            if prog.cancel.is_set():
-                return
+    _say_models(prog, t0)
+    if stop.is_set() or prog.cancel.is_set():
+        return
+    _match_cvs(cfg, keys, prog, workers)
+
+
+def _say_models(prog, t0):
+    """Which models did the work, how often they failed and how fast they were (activity log)."""
+    rows = health_report()
+    if rows:
+        prog.say(f"AI analysis done in {(time.time() - t0) / 60:.1f} min - " + "; ".join(
+            f"{m.split('/')[-1]}: {ok} answers" + (f", {bad} unusable" if bad else "") + (f", {secs:.0f} s each" if ok else "")
+            for _, m, ok, bad, secs in rows))
+
+
+def _match_cvs(cfg, keys, prog, workers):
+    with SessionLocal() as s:
+        order = [j.id for j in s.query(Job).filter(Job.status == "relevant", Job.match_score.is_(None))
+                 .limit(int(cfg.get("max_ai_jobs_per_run") or 0) or None)]
+        titles = {j.id: j.title or "" for j in s.query(Job).filter(Job.id.in_(order))}
+        has_cv = bool([c for c in s.query(CVDocument).filter_by(enabled=True) if c.status == "ok"])
+        ckey = cv_key(s) if order and has_cv else ""
+    if not order:
+        return
+    if not has_cv:
+        prog.set(ai_msg="No usable CV uploaded (Settings): CV matching skipped.")
+        return
+    try:
+        require_cv_consent(cfg)
+    except AIError as e:
+        prog.set(ai_msg=str(e))
+        return
+    prog.set(task="CV matching")
+    stop = threading.Event()
+
+    def match(jid):
+        if stop.is_set() or prog.cancel.is_set():
+            return None
+        with SessionLocal() as ws:
+            j = ws.get(Job, jid)
             try:
-                match_job(s, j, cfg, keys)
-            except MalformedOutput as e:
-                s.rollback()
-                prog.say(f"CV match unusable for '{j.title[:60]}': skipped ({str(e)[:120]})")
-                continue
-            except AIError as e:
-                prog.set(ai_msg=f"CV matching stopped: {e}")
-                return
-            if j.match_score is not None:  # the CVs it was matched with: the next scans reuse it only for these
-                j.extra = {**(j.extra or {}), "cv_key": ckey}
-                s.commit()
-            if j.match_score is not None and j.match_score < cfg.get("min_match", 0):
-                j.status, j.reason = "excluded", f"CV match {j.match_score:.0f} is below your minimum ({cfg['min_match']})"
-                s.commit()
+                match_job(ws, j, cfg, keys)
+                if j.match_score is not None:  # the CVs it was matched with: the next scans reuse it only for these
+                    j.extra = {**(j.extra or {}), "cv_key": ckey}
+                    if j.match_score < cfg.get("min_match", 0):
+                        j.status, j.reason = "excluded", f"CV match {j.match_score:.0f} is below your minimum ({cfg['min_match']})"
+                    ws.commit()
+            except Exception:
+                ws.rollback()
+                raise
+        return True
+
+    for jid, out in _in_parallel(order, match, workers):
+        if isinstance(out, MalformedOutput):
+            prog.say(f"CV match unusable for '{titles.get(jid, '')[:60]}': skipped ({str(out)[:120]})")
+        elif isinstance(out, AIError):
+            if not stop.is_set():
+                prog.set(ai_msg=f"CV matching stopped: {out}")
+            stop.set()
+        elif isinstance(out, Exception):
+            prog.say(f"CV match failed for '{titles.get(jid, '')[:60]}': {str(out)[:120]}")
+        elif out:
             prog.inc("matched")

@@ -92,3 +92,67 @@ def test_a_remote_offer_keeps_its_city():
     loc = classify_location("Paris, Île-de-France, FR", remote_hint=True)
     assert loc["france_eligible"] and loc["remote_status"] == "remote" and loc["city"] == "Paris"
     assert classify_location("Remote - France")["city"] is None and classify_location("Télétravail, France")["city"] is None
+
+
+def test_a_wanted_role_with_an_excluded_word_goes_to_the_ai():
+    """'Marketing Data Scientist Consultant' was rejected for 'marketing' although 'data scientist' is a profile keyword."""
+    from jobfinder.classify import title_filter
+    from jobfinder.config import PROFILE_DEFAULT
+    assert title_filter("Marketing Data Scientist Consultant", "", PROFILE_DEFAULT)[0] == "maybe"
+    assert title_filter("Chef de projet marketing", "", PROFILE_DEFAULT)[0] == "reject"
+    assert title_filter("Responsable marketing digital", "", PROFILE_DEFAULT)[0] == "reject"
+
+
+def test_a_location_field_stops_at_the_next_field_of_the_page():
+    """Médiane / Akkodis pages write their fields without a colon: the location ran into the next ones."""
+    from jobfinder.classify import clean_location
+    assert clean_location("Palaiseau Avantages 40-45k€ Ingénieur développement et Validation") == "Palaiseau"
+    assert clean_location("Firenze Niveau d'études minimum requis : 6. Bac +5 / Master") == "Firenze"
+    assert clean_location("Personal protective equipment will be provided for site activities What will you") == ""
+    assert clean_location("Paris, Île-de-France, France") == "Paris, Île-de-France, France"
+    assert clean_location("Bruxelles ; Île-de-France") == "Bruxelles ; Île-de-France"
+    assert clean_location("Annecy – 3 jours présentiel / 2 jours Télétravail") == "Annecy"
+
+
+def test_a_list_of_cities_with_a_french_one_is_open_in_france():
+    """Joko 'Paris, Barcelona' (18 offers), Helsing 'Munich - Berlin - London - Paris', Gradium 'Paris, San Francisco' were
+    excluded as abroad: the comma was read as 'city, region'."""
+    from jobfinder.classify import classify_location as c
+    for loc in ("Paris, Barcelona", "Munich - Berlin - London - Paris", "Paris, San Francisco",
+                "Paris, Berlin, Amsterdam, Brussels, Madrid, Zurich"):
+        r = c(loc)
+        assert r["france_eligible"] and r["city"] == "Paris", loc
+    for loc in ("Woluwe-Saint-Pierre, Belgium", "Paris, Texas, USA", "Paris, TX", "Barcelona, Spain", "Berlin, Munich",
+                "Chalfont St Giles, Buckinghamshire, United Kingdom"):
+        assert not c(loc)["france_eligible"], loc
+    assert c("Paris, Île-de-France, France")["city"] == "Paris"
+
+
+def test_a_data_scientist_in_a_business_team_goes_to_the_ai():
+    from jobfinder.classify import title_filter
+    from jobfinder.config import PROFILE_DEFAULT
+    assert title_filter("Data Scientist Finance - Contrôle de gestion - Freelance", "", PROFILE_DEFAULT)[0] == "maybe"
+    assert title_filter("Contrôleur de gestion", "", PROFILE_DEFAULT)[0] == "reject"
+    assert title_filter("Sales Specialist Data & IA", "", PROFILE_DEFAULT)[0] == "reject"
+    assert title_filter("Account Executive IA", "", PROFILE_DEFAULT)[0] == "reject"
+
+
+def test_a_cnrs_location_stops_before_its_contract_fields():
+    from jobfinder.classify import clean_location
+    assert clean_location("45071 ORLEANS Durée du contrat 3 mois Date d'Embauche 19/01/2027") == "45071 ORLEANS"
+
+
+def test_an_offer_placed_abroad_that_can_be_held_in_france_is_found():
+    """Qonto (listed in Milan), Alan (Belgium), Spendesk (Barcelona) say in their text that the job can be held in France."""
+    from jobfinder.classify import france_among_places as f
+    assert f("Location: You can choose to work in Qonto as long as you're living in (or willing to relocate to) either "
+             "Germany, France, Italy, Serbia, or Spain.")
+    assert f("- Location: You must be legally eligible to work from Belgium or France.")
+    assert f("This role is based in Paris or in Barcelona. Fluency in French.")
+    assert f("Offre disponible : Bruxelles Rennes")  is not None
+    for text in ("Much of our Engineering organization is based in Paris, all work communication happens in English.",
+                 "join a Legal team of four based in France and Italy.",
+                 "an industrial environment in multinational team (France, Poland, India)",
+                 "Agile environments Nice to Have Experience with Rust",
+                 "our offices in Paris, London, New York and Singapore"):
+        assert not f(text), text

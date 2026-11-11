@@ -245,8 +245,14 @@ def _card_places(soup, base, url, title=""):
 
 
 def _card_location(soup, base, url, title=""):
-    """The place written on the job's card in the list, for job pages without one."""
-    return next(iter(_card_places(soup, base, url, title)), "")
+    """The place written on the job's card in the list, for job pages without one: its first place ('Gard (30) | Bagnols'
+    -> 'Gard (30)'). When that first place is abroad and another one is in France ('Bruxelles | Île-de-France', Davidson),
+    every place is kept: the offer is open in France too, and its first place alone excluded it."""
+    places = list(dict.fromkeys(_card_places(soup, base, url, title)))
+    if len(places) > 1 and not classify_location(places[0])["france_eligible"] and any(
+            classify_location(x)["france_eligible"] for x in places[1:]):
+        return " ; ".join(places)
+    return places[0] if places else ""
 
 
 def _card_abroad(soup, base, url, title=""):

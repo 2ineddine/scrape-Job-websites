@@ -1,20 +1,22 @@
 [theme]
-base = "light"
-primaryColor = "#1B3A6B"
-backgroundColor = "#F4F6FA"
-secondaryBackgroundColor = "#E9EEF6"
-textColor = "#0E1C33"
-linkColor = "#1F5FD1"
+base = "dark"
+primaryColor = "#2E5AAC"
+backgroundColor = "#081120"
+secondaryBackgroundColor = "#111D33"
+textColor = "#E4EAF4"
+linkColor = "#8FB3F5"
 linkUnderline = false
-borderColor = "#DCE3EE"
+borderColor = "#1F2E4A"
 showWidgetBorder = true
 baseRadius = "10px"
 buttonRadius = "999px"
-font = "PP Telegraf, 'Helvetica Neue', Arial, sans-serif"
-headingFont = "PP Telegraf, 'Helvetica Neue', Arial, sans-serif"
+# Telegraf only, also for code and the activity log; 'sans-serif' only draws a character Telegraf lacks (a Chinese title...)
+font = "PP Telegraf, sans-serif"
+headingFont = "PP Telegraf, sans-serif"
+codeFont = "PP Telegraf, sans-serif"
 headingFontWeights = [800, 800, 800, 400, 400, 400]
 baseFontSize = 15
-dataframeHeaderBackgroundColor = "#EEF2F8"
+dataframeHeaderBackgroundColor = "#0D1829"
 
 # Telegraf, served by the app itself (static/fonts): no font is downloaded from another website
 [[theme.fontFaces]]

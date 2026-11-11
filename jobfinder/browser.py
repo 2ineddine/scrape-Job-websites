@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import time
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -709,6 +711,56 @@ class Renderer:
         self.br = self.pw = self.pg = None
 
 
+class ThreadedRenderer:
+    """One browser shared by analyses running in parallel. Playwright's objects belong to the thread that created them, so
+    every job page is opened by ONE dedicated thread, one page at a time; the analyses wait for their page there."""
+
+    def __init__(self, cfg, fetcher):
+        from concurrent.futures import ThreadPoolExecutor
+        self._ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="job-pages")
+        self._r = Renderer(cfg, fetcher)
+
+    def get(self, url):
+        return self._ex.submit(self._r.get, url).result()
+
+    def close(self):
+        try:
+            self._ex.submit(self._r.close).result(timeout=60)
+        except Exception:  # pragma: no cover - closing never blocks the end of a run
+            pass
+        finally:
+            self._ex.shutdown(wait=False)
+
+
+# websites whose job pages cannot be reached (candidat.francetravail.fr from some networks: a connection timeout after every
+# retry, then the browser's timeout): after DOWN_AFTER failures in a row their pages are not opened for DOWN_PAUSE seconds,
+# and the offers are analysed with the text already read. Before, 125 such offers cost ~100 s each, one at a time.
+DOWN_AFTER, DOWN_PAUSE = 2, 1800
+_DOWN: dict = {}  # host -> [failures in a row, closed until]
+_DOWN_LOCK = threading.Lock()
+
+
+def host_down(host) -> bool:
+    with _DOWN_LOCK:
+        return _DOWN.get(host, [0, 0])[1] > time.time()
+
+
+def _host_failed(host) -> bool:
+    """One more connection failure for this website. -> True when it is now closed for a while."""
+    with _DOWN_LOCK:
+        f = _DOWN.setdefault(host, [0, 0])
+        f[0] += 1
+        if f[0] >= DOWN_AFTER:
+            f[0], f[1] = 0, time.time() + DOWN_PAUSE
+            return True
+        return False
+
+
+def _host_ok(host):
+    with _DOWN_LOCK:
+        _DOWN.pop(host, None)
+
+
 def deepen_job(s, job, cfg, fetcher, rend=None) -> bool:
     """Read the FULL job page once (plain HTTP first, real browser if the text is still short) and update the stored job.
     -> True when the stored description became clearly longer (so a new analysis is worthwhile)."""
@@ -716,14 +768,26 @@ def deepen_job(s, job, cfg, fetcher, rend=None) -> bool:
     ex = dict(job.extra or {})
     if ex.get("deepened") or not syntactic_ok(url) or any(m in url for m in SYNTHETIC):
         return False
+    host = (urlparse(url).hostname or "").lower()
+    if host_down(host):
+        return False  # unreachable a moment ago: the offer is analysed with the text already read
     ex["deepened"] = True
     new = None
     try:
         new = _parse_detail(fetcher.get(url).text, url)
+        _host_ok(host)
     except AccessError:
         job.extra = ex
         s.commit()
         return False
+    except ConnectionError as e:
+        if "source_unreachable" in str(e):  # the server does not answer: a browser would not reach it either
+            if _host_failed(host):
+                fetcher.note(f"{host} does not answer: its job pages are not opened for {DOWN_PAUSE // 60} min "
+                             "(the offers are analysed with the text already read)")
+            job.extra = ex
+            s.commit()
+            return False
     except Exception:
         pass
     if (new is None or len(new["description"]) < 600) and rend is not None and cfg.get("nav_mode", "auto") != "classic":

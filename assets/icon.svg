@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="46" height="46" viewBox="0 0 46 46">
   <defs>
     <linearGradient id="jf-bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3D7BFF"/><stop offset="1" stop-color="#16346B"/>
+      <stop offset="0" stop-color="#2E5AAC"/><stop offset="1" stop-color="#12284A"/>
     </linearGradient>
   </defs>
   <rect x="1" y="1" width="44" height="44" rx="12" fill="url(#jf-bg)"/>
@@ -9,6 +9,5 @@
   <rect x="9.5" y="15.5" width="26" height="17" rx="3.5" fill="none" stroke="#fff" stroke-width="2.4"/>
   <path d="M9.5 22.5h11" stroke="#fff" stroke-width="2.4"/>
   <circle cx="29.5" cy="29" r="7" fill="#0B1B33" stroke="#fff" stroke-width="2.6"/>
-  <path d="M26.6 29.2l2 2 3.8-4" fill="none" stroke="#8FB8FF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
   <path d="M34.6 34.1l3.6 3.6" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
 </svg>

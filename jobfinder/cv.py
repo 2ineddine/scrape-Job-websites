@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 from .config import DATA_DIR
 from .llm import AIError, call_json, require_cv_consent
 from .store import CoverLetter, CVDocument, Job
+from .trim import essential_text
 from .web import norm
 
 
@@ -135,7 +136,8 @@ def match_job(s, job: Job, cfg, keys=None):
         user = (f"Score how well this CV fits the job. Weights: {RUBRIC}. Separate requirements that are clearly "
                 "missing from those that are merely not mentioned. 'cv_evidence' must be a verbatim excerpt from the CV.\n"
                 f"<untrusted>\nJOB: {job.title} @ {job.employer} ({job.location_original})\n"
-                f"{(job.description or '')[:3500]}\n</untrusted>\n<untrusted>\nCV ({cv.name}):\n{cv.text[:6000]}\n</untrusted>\n"
+                f"{essential_text(job.description or '', 3500, job.employer or '', job.location_original or '')}\n</untrusted>\n<untrusted>\nCV ({cv.name}):\n"
+                f"{cv.text[:6000]}\n</untrusted>\n"
                 "JSON keys: match_score (0-100), matching_skills[], matching_experience[], missing_requirements[], "
                 "not_evidenced[], evidence[{requirement,cv_evidence}], recommendation(apply|maybe|skip), confidence (0-1)")
         results[cv.name] = verify_evidence(call_json(user, CVMatch, cfg, s, keys), cv.text).model_dump()

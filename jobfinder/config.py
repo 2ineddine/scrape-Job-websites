@@ -23,6 +23,11 @@ PRESET_DAYS = {"Last 24 hours": 1, "Last 3 days": 3, "Last 7 days": 7, "Last 14 
 # --------------------------------------------------------------------------- settings shown in the app
 CONFIG_DEFAULT = {
     "date_preset": "Last 30 days",
+    "hellowork_keywords": True,  # also search Hellowork with the search profile's keywords (one open keyword page per word)
+    # robots.txt: off by default (the client is a partner of the websites it reads: 2026-11-12), switchable before a scan.
+    # Off, no robots.txt rule is applied; its 'Sitemap:' lines are still used to find every offer (3DS: ~700 offers only
+    # there). Anti-bot pages, logins and captchas are never bypassed either way.
+    "respect_robots": False,
     "min_relevance": 60,
     "send_cv_remote_ok": False,
     "cv_consent_providers": [],  # with automatic switching: the hosted providers allowed to receive the CV
@@ -41,6 +46,10 @@ CONFIG_DEFAULT = {
     },
 }
 
+# the built-in source that searches Hellowork with the profile's keywords (its job home page: what a person opening it sees)
+HW_KEYWORDS_URL = "https://www.hellowork.com/fr-fr/emploi.html"
+HW_KEYWORDS_LABEL, HW_KEYWORDS_ORIGIN = "Hellowork (your keywords)", "Hellowork search with your keywords"
+
 # --------------------------------------------------------------------------- fixed behaviour (not settings)
 # The PUBLICATION DATE decides when a website is finished; page counts are only safety ceilings.
 LIMITS = {
@@ -48,14 +57,15 @@ LIMITS = {
     "ai_site_filters": True, "site_filter_location": "France",
     "unknown_date_policy": "review",  # an offer without a publication date is returned, marked 'date not stated'
     "include_remote_fr": True, "min_match": 0,
-    "delay": 1.0, "max_duration": 5400, "max_site_duration": 1200, "timeout": 25, "retries": 2, "respect_robots": True,
+    "delay": 1.0, "max_duration": 21600, "max_site_duration": 1200, "timeout": 25, "retries": 2,
     "max_pages": 500, "max_details_per_source": 300, "stale_pages": 2, "parallel_sites": 4,
     # every offer is analysed (0 = no limit); a billed model (xAI) answers at most max_billed_calls requests per scan, the
     # free models take the rest as their quotas allow
     "max_ai_calls": 0, "max_ai_jobs_per_run": 0, "max_billed_calls": 100,
-    # offers analysed at the same time (automatic model switching only), and requests one model serves at once: the next
-    # request goes to the next model in rank (llm.call_json)
-    "ai_workers": 4, "ai_per_model": 2,
+    # offers analysed at the same time (automatic model switching only); requests one model serves at once: it starts at
+    # ai_per_model and learns what it accepts, up to ai_per_model_max (llm.call_json); every model at its limit: the offers
+    # wait in the queue up to ai_wait_max seconds for the first one to be free again
+    "ai_workers": 8, "ai_per_model": 2, "ai_per_model_max": 6, "ai_wait_max": 1800,
     "thin_job_chars": 800, "job_text_chars": 9000, "ai_nav_max_steps": 150, "ai_filter_max_steps": 8,
 }
 
@@ -109,6 +119,17 @@ _KEYWORDS_ADDED = {2: ["mlops", "ml ops", "ml model", "ai model", "model deploym
                    3: None}  # 3: every keyword after 'deploiement de modeles' in PROFILE_DEFAULT (filled below)
 _kw = PROFILE_DEFAULT["keywords"]
 _KEYWORDS_ADDED[3] = _kw[_kw.index("deploiement de modeles") + 1:]
+
+
+SETTINGS_REV = 2  # kept OUT of CONFIG_DEFAULT: saved settings are merged with the defaults before upgrade_config reads it
+
+
+def upgrade_config(cfg: dict) -> tuple[dict, bool]:
+    """Settings saved by an older version: 'respect_robots' was a fixed value written into every saved config, never the
+    user's choice; from revision 2 it is a setting, off by default. -> (config, changed)"""
+    if int(cfg.get("settings_rev") or 1) >= SETTINGS_REV:
+        return cfg, False
+    return {**cfg, "respect_robots": CONFIG_DEFAULT["respect_robots"], "settings_rev": SETTINGS_REV}, True
 
 
 def upgrade_profile(profile: dict) -> tuple[dict, bool]:

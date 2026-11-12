@@ -307,6 +307,24 @@ def company_from_url(url: str) -> str:
     return name.upper() if len(name) <= 3 else name.title()
 
 
+def keyword_sources(s, cfg) -> list[int]:
+    """The built-in searches of this scan: Hellowork with the profile's keywords when the setting is on (-> its source id).
+    Added at Start, after the website files (loading a file replaces every source); removed when the setting is off."""
+    from .config import HW_KEYWORDS_LABEL, HW_KEYWORDS_ORIGIN, HW_KEYWORDS_URL
+    src = s.query(Source).filter_by(url=HW_KEYWORDS_URL).first()
+    if not cfg.get("hellowork_keywords", True):
+        if src is not None and src.origin == HW_KEYWORDS_ORIGIN:
+            s.query(Job).filter_by(source_id=src.id).delete()
+            s.delete(src)
+            s.commit()
+        return []
+    if src is None:
+        src = Source(url=HW_KEYWORDS_URL, label=HW_KEYWORDS_LABEL, platform="", origin=HW_KEYWORDS_ORIGIN, last_error="")
+        s.add(src)
+        s.commit()
+    return [src.id]
+
+
 def add_sources(s, urls: list[str], origins: dict | None = None):
     """Each URL is put in one uniform form first (urlclean): search words, page numbers and tracking codes of a past
     search are removed, so every website is read whole and filtered the same way. Duplicates collapse.
@@ -388,9 +406,16 @@ RECENT_HOURS = 24
 _DATES = ("pub_date", "discovered", "last_seen")
 
 
+# the version of the app's analysis rules (contract, place, date checks; the models' levels): raised with every change of
+# them, so that an offer analysed with older rules is analysed again instead of kept (a CDD read as an internship in the
+# morning stayed excluded after the rule was fixed, November 2026)
+ANALYSIS_RULES = 2
+
+
 def profile_key(profile) -> str:
-    """The search profile an analysis was made for: another profile -> the offer is analysed again."""
-    return hashlib.sha1(json.dumps(profile or {}, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    """The search profile and the rules an analysis was made with: another profile, or rules changed since -> the offer is
+    analysed again."""
+    return hashlib.sha1(json.dumps([ANALYSIS_RULES, profile or {}], sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def cv_key(s) -> str:

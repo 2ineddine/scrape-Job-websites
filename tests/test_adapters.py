@@ -197,3 +197,24 @@ def test_shared_template_date_is_not_trusted():
     api = [_raw(t, f"https://x.com/jobs/{i}", date=d, date_conf=0.9, date_source="workday posting startDate")
            for i, t in enumerate(["A role", "B role", "C role"])]
     assert all(j["date_conf"] == 0.9 for j in distrust_shared_dates(api))  # the same day from an API is real
+
+
+def test_a_full_teamtailor_feed_is_completed_from_the_career_pages():
+    # jobs.rss holds the 100 newest offers (BearingPoint: 140 on its pages): when its oldest one is still inside the range,
+    # the rest is read on the career site's 'show more' pages (Turbo streams: the cards inside <template> tags)
+    item = lambda i: (f"<item><title>Ingénieur IA {i} H/F</title><description>{'Texte ' * 100}</description>"
+                      f"<pubDate>{TODAY}</pubDate><link>https://jobs.x.fr/jobs/{1000 - i}-ingenieur-ia-{i}</link>"
+                      "<tt:locations><tt:location><tt:city>Paris</tt:city><tt:country>France</tt:country></tt:location>"
+                      "</tt:locations></item>")
+    rss = ('<?xml version="1.0"?><rss version="2.0" xmlns:tt="https://teamtailor.com/locations"><channel>'
+           + "".join(item(i) for i in range(100)) + "</channel></rss>")
+    more = ('<turbo-stream action="append" target="jobs_list_container"><template><li><a href="https://jobs.x.fr/jobs/5-'
+            'ingenieur-vision-h-f">Ingénieur Vision (H/F)</a><div><span>R&amp;D</span><span>Lyon</span></div></li></template></turbo-stream>')
+    f = FakeFetcher({"jobs.rss": rss, "show_more?page=6": more, "show_more?page=7": "", "/jobs/5-": "<html><body>x</body></html>"})
+    jobs = [j for pg in crawl_feed(f, ("https://jobs.x.fr/jobs.rss", "teamtailor"), CFG(), set(), ScanState()) for j in pg.jobs]
+    assert len(jobs) == 101 and jobs[-1]["title"] == "Ingénieur Vision (H/F)" and jobs[-1]["location"] == "Lyon"
+    # the feed's oldest offer is already outside the range: nothing it left out can be inside it
+    old = rss.replace(f"<pubDate>{TODAY}</pubDate>", f"<pubDate>{OLD}</pubDate>")
+    f = FakeFetcher({"jobs.rss": old})
+    assert sum(len(pg.jobs) for pg in crawl_feed(f, ("https://jobs.x.fr/jobs.rss", "teamtailor"), CFG(), set(), ScanState())) == 100
+    assert not any("show_more" in u for u in f.calls)

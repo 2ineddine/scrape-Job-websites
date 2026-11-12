@@ -12,16 +12,16 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
-from urllib.parse import parse_qsl, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from .adapters import (ADAPTERS, FT_HOSTS, JP_HOSTS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, detect_from_page, detect_from_url,
+from .adapters import (ADAPTERS, FT_HOSTS, JP_HOSTS, NOT_JOB, Page, _Budget, _open_detail, _raw, is_job_path, _jsonld_jobs, _parse_detail, date_order, detect_from_page, detect_from_url,
                        detect_one_hop, embedded_jobs, find_board, guess_board, jobs_from_json, raw_verdict, worth_opening)
 from .classify import classify_location, is_boilerplate_title, location_from_text
 from .sitefilters import filtered_url, with_own_filters
 from .dates import _UPDATE_WORDS, _dayfirst, parse_date, text_publication_date
-from .config import utcnow
+from .config import HW_KEYWORDS_URL, utcnow
 from .urlclean import JOB_BOARDS, is_job_board
 from .web import PARSER, UA, AccessError, RobotsRefused, browser_guard, check_url, norm, normalize_url, syntactic_ok
 
@@ -70,7 +70,17 @@ def _job_links(soup, base, exclude, by_text=True):
                 nu = normalize_url(u)
                 if nu not in out and nu != normalize_url(base):
                     out.append(nu)
-    return out[:300]
+    return _offer_links(out, base)[:300]
+
+
+# websites whose offers all have one address form: their other links that look like offers are lists (Hellowork's keyword
+# pages link 32 other keyword pages, 'Offres d'emploi Intelligence artificielle', beside their 20 offers)
+_OFFER_ADDRESS = {"www.hellowork.com": re.compile(r"/fr-fr/emplois/\d+\.html$")}
+
+
+def _offer_links(links, base):
+    rx = _OFFER_ADDRESS.get((urlparse(base).hostname or "").lower())
+    return [u for u in links if rx.search(urlparse(u).path)] if rx else links
 
 
 _PAGE_CALL = re.compile(r"\w*page\w*\((?:[^()]*,\s*)?(\d+)\)", re.I)
@@ -277,28 +287,90 @@ def _title_in(box):
     return next((x for x in found if _looks_like_job_title(x.get_text(" ", strip=True))), found[0] if found else None)
 
 
+_SLUG_FOLDERS = {"job", "jobs", "offre", "offres", "offer", "offers", "emploi", "emplois", "career", "careers", "carriere",
+                 "carrieres", "poste", "postes", "detail", "details", "view", "annonce", "annonces", "vacancy", "position", "html",
+                 "php", "aspx", "the", "and", "des", "les", "pour", "with"}
+
+
+def _plain(w):
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def _words(text) -> set:
+    return {_plain(w) for w in re.findall(r"[a-z]{3,}", norm(unquote(text or "")))}
+
+
+def _slug_words(url) -> set:
+    """The words of the offer's address ('.../career/manager-ai-transformation-bureau-de-lille' -> {'manager',
+    'transformation', 'bureau', 'lille'}): its last segment, or the one before an offer number ('/ingenieur-ia/12345').
+    Empty for an address made of numbers and codes ('/job/12345') or of one word ('/trainee5'): nothing to compare."""
+    segs = [x for x in urlparse(url).path.split("/") if x]
+    for seg in reversed(segs[-2:]):
+        tokens = re.split(r"[-_.+,~]+", norm(unquote(re.sub(r"\.(?:html?|php|aspx?)$", "", seg, flags=re.I))))
+        words = {_plain(re.sub(r"\d+$", "", t)) for t in tokens if re.fullmatch(r"[a-z]{3,}\d*", t)}
+        if words:
+            words -= _SLUG_FOLDERS
+            return words if len(words) >= 2 else set()
+    return set()
+
+
+def _anchor_title(a):
+    """The title one link to an offer gives: its heading when the whole card is the link, else its text; for a button
+    ('Lire la suite'), the heading of the card around it. '' when the link names nothing ('I'm interested', a reference)."""
+    head = _title_in(a)
+    t = (head or a).get_text(" ", strip=True)
+    box = a
+    for _ in range(4):  # 'Lire la suite' / 'Read more': the title is the heading of the card around the button
+        if not _CTA.fullmatch(t):
+            break
+        box = box.parent
+        if box is None:
+            return ""
+        h = _title_in(box)
+        t = h.get_text(" ", strip=True) if h else t
+    if _CTA.fullmatch(t) or _CODE.fullmatch(t):
+        return ""
+    t = _CARD_LABELS.split(t, 1)[0].strip() or t
+    return t if 3 <= len(t) <= 200 else ""
+
+
+def _card_box(soup, base, a, url):
+    """The offer's card: the largest box around its link that holds no other offer's link (at most 4 levels up)."""
+    box = a
+    for _ in range(4):
+        up = box.parent
+        if up is None or up.name in ("body", "html", "main", "ul", "ol", "table", "tbody") or len(up.get_text(" ", strip=True)) > 800:
+            break
+        if any(normalize_url(urljoin(base, x["href"])) != url and is_job_path(urlparse(urljoin(base, x["href"])).path)
+               for x in up.find_all("a", href=True)):
+            break
+        box = up
+    return box
+
+
 def _card_title(soup, base, url):
-    for a in soup.find_all("a", href=True):
-        if normalize_url(urljoin(base, a["href"])) == url:
-            # a whole card can be the link: its heading is the title, not 'Location : ... Job Category : Marketing'
-            head = _title_in(a)
-            t = (head or a).get_text(" ", strip=True)
-            box = a
-            for _ in range(4):  # 'Lire la suite' / 'Read more': the title is the heading of the card around the button
-                if not _CTA.fullmatch(t):
-                    break
-                box = box.parent
-                if box is None:
-                    return ""
-                h = _title_in(box)
-                t = h.get_text(" ", strip=True) if h else t
-            if _CTA.fullmatch(t):
-                return ""
-            if _CODE.fullmatch(t):
-                continue
-            t = _CARD_LABELS.split(t, 1)[0].strip() or t
-            if 3 <= len(t) <= 200:
-                return t
+    """The offer's title on the list, used to skip a clearly unwanted offer without opening it. When the offer's address
+    is written in words, the title must share one of them: the first link of a card may only show the offer's category
+    (Sia Partners: 'Consulting' over 'Manager AI Transformation - Bureau de Lille', in another element of the card); the
+    card's element that agrees with the address is taken then, and '' when none does (the offer's page is opened)."""
+    anchors = [a for a in soup.find_all("a", href=True) if normalize_url(urljoin(base, a["href"])) == url]
+    texts = [t for t in (_anchor_title(a) for a in anchors) if t]
+    slug = _slug_words(url)
+    if not slug:
+        return texts[0] if texts else ""
+    agree = [t for t in texts if _words(t) & slug]
+    if agree:
+        return agree[0]
+    if not anchors:
+        return ""
+    box = _card_box(soup, base, anchors[0], url)
+    parts = box.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"]) + box.find_all(class_=re.compile(r"title", re.I)) \
+        + box.find_all(["p", "span", "div", "li"])
+    for el in parts:
+        t = el.get_text(" ", strip=True)
+        t = _CARD_LABELS.split(t, 1)[0].strip() or t
+        if 3 <= len(t) <= 200 and len(_words(t) & slug) >= min(2, len(slug)) and not _CTA.fullmatch(t):
+            return t
     return ""
 
 
@@ -368,6 +440,12 @@ def _parent_list(url):
 
 
 _OLD_RUN = 2  # offers in a row older than the range that end a newest-first list (one may be pinned at the top)
+_SORT_KEY = re.compile(r"sort|order|tri", re.I)
+
+
+def _sort_params(url) -> set:
+    """The sort written in a list's address: {('sortBy', 'date')}."""
+    return {(k, v) for k, v in parse_qsl(urlparse(url).query) if _SORT_KEY.search(k)}
 _DATE_SORT = re.compile(r"[?&](?:sort|sortby|sort_by|order|orderby|tri)=(?:[^&]*date|[^&]*recent|[^&]*newest|[^&]*publi)", re.I)
 
 
@@ -444,6 +522,16 @@ def crawl_generic(f, url, cfg, known, st):
                     st.platform += "+parent"
                     page_url, n = parent, 0
                     continue
+                moved = suggest_page(f, url) if "+moved" not in st.platform else ""
+                if moved and normalize_url(moved) not in seen_pages:
+                    # the career page has a new address (LISN: /job-offers -> /nous-rejoindre): the one the website's home
+                    # page links is read, and the note tells the user to update the address
+                    f.note(f"page not found: the website's home page links its career page, read instead: {moved} "
+                           "(update this website's address)")
+                    st.platform += "+moved"
+                    st.moved = moved
+                    page_url, n = moved, 0
+                    continue
                 if err:
                     raise err
             if n == 1 and not filtered:  # the website's own filters first: France, posted within, newest first
@@ -517,18 +605,19 @@ def crawl_generic(f, url, cfg, known, st):
             page_out = sum(1 for u in links if u in st.out_known)  # already known to be too old
             page_seen = sum(1 for u in links if u in known and u not in st.out_known)
             cards = _card_dates(soup, page_url, dayfirst=_dayfirst(soup)) if not jobs else {}
+            page_dates = []  # the dates of this page's offers in list order (cards, or the offers' own pages)
             if not jobs:
                 older, old_run = False, 0
                 for lk in new_links:
-                    if st.deadline and time.time() > st.deadline:
-                        st.details_capped = True  # this website's time is up
-                        break
-                    if lk in known or details >= cfg["max_details_per_source"] or not f.robots_ok(lk):
-                        continue
                     cd = cards.get(lk)
+                    if cd:
+                        page_dates.append(cd[0])
+                    if lk in known:
+                        continue
                     if older or (cd and gate and gate(cd[0], cd[1], cd[3]) is False):  # DATE FIRST: too old -> never opened
                         page_out += 1
-                        older = older or by_date  # newest-first list: every next card is older too
+                        # a list PROVED newest first (its dates so far): every next card is older too
+                        older = older or (by_date and date_order(st.order + page_dates) is True)
                         continue
                     title = _card_title(soup, page_url, lk)
                     if title and not worth_opening(cfg, {"title": title, "date": None}):
@@ -537,6 +626,15 @@ def crawl_generic(f, url, cfg, known, st):
                     if wants_fr and _card_abroad(soup, page_url, lk, title or ""):
                         st.abroad += 1
                         continue  # the list places it outside France only ('Bruxelles, Belgique'): not opened
+                    capped = (st.deadline and time.time() > st.deadline) or details >= cfg["max_details_per_source"]
+                    if capped or not f.robots_ok(lk):
+                        # this website's time or job-page budget is used up, or robots.txt closes the offer's page: the
+                        # offer is kept as its card shows it, never dropped (the AI analysis reads its page when allowed)
+                        st.details_capped = st.details_capped or bool(capped)
+                        kept = _list_only(soup, page_url, lk, title, cd)
+                        if kept:
+                            jobs.append(kept)
+                        continue
                     details += 1
                     try:
                         dhtml = f.get(lk).text
@@ -551,15 +649,22 @@ def crawl_generic(f, url, cfg, known, st):
                         if job["provenance"] == "html-fallback" and len(_job_links(BeautifulSoup(dhtml, PARSER), lk, set(), False)) >= 8:
                             continue  # the link opened another list ('Account Executive jobs', '170 jobs found'), not a job
                         jobs.append(job)
+                        if job.get("date") and not cd:
+                            page_dates.append(job["date"])
                         if by_date and gate and job.get("date"):  # the list's cards have no date: the offer's page has one
                             if raw_verdict(cfg, dict(job)) is False:
                                 old_run += 1
-                                if old_run >= _OLD_RUN and not older:  # one old offer may be pinned at the top: two in a row
+                                # one old offer may be pinned at the top: two in a row, in a list whose dates so far go
+                                # from newest to oldest
+                                if old_run >= _OLD_RUN and not older and date_order(st.order + page_dates) is True:
                                     older = True  # newest-first list: every next offer is older too -> not opened
                                     f.note(f"newest-first list: {_OLD_RUN} offers in a row older than the range -> "
                                            "the next offers of the list are not opened")
                             else:
                                 old_run = 0
+                        if by_date and date_order(st.order + page_dates) is False:
+                            by_date = False  # the website's 'newest first' is not the publication date: every offer is read
+                            f.note("the website's date sort does not follow the publication dates: every offer of the list is read")
                     except RobotsRefused as e:  # robots.txt closes this one document: the offer is kept without it
                         f.note(f"detail failed {lk}: {e}")
                     except AccessError:
@@ -569,19 +674,20 @@ def crawl_generic(f, url, cfg, known, st):
             jobs = [_open_detail(f, cfg, j, budget) if j["provenance"] == "network-json" and len(j["description"]) < 300
                     and normalize_url(j["url"]) not in known and "jbid=" not in j["url"] else j for j in jobs]
             jobs = _drop_odd_links(_drop_listing_pages(jobs, soup))
-            if n == 1 and not jobs and not page_out and not hopped and not new_links:
+            # a page whose offers are all known already (read under another keyword, kept from the last 24 hours) is not empty
+            if n == 1 and not jobs and not page_out and not page_seen and not hopped and not new_links:
                 hopped, listing = True, _list_page(soup, page_url)
                 if listing:
                     f.note(f"no offers on this page, reading its list: {listing}")
                     seen_pages.discard(key)
                     page_url, n, rendered, filtered = listing, 0, False, False
                     continue
-            if n == 1 and not jobs and not page_out and not rendered and not retry:
+            if n == 1 and not jobs and not page_out and not page_seen and not rendered and not retry:
                 retry = True  # the links of the static page gave no offer (menus): read the page again, rendered
                 seen_pages.discard(key)
                 n = 0
                 continue
-            yield Page(key, page_url, jobs, out=page_out, seen=page_seen, sorted=by_date)
+            yield Page(key, page_url, jobs, out=page_out, seen=page_seen, sorted=by_date, dates=page_dates if not jobs or cards else None)
             if not new_links and not jobs and n > 1:
                 return  # no new content: reliable end condition
             nxt = _next_page(soup, page_url, n)
@@ -597,6 +703,11 @@ def crawl_generic(f, url, cfg, known, st):
             form = _form_post(soup, page_url, nxt) if nxt else None
             if form:
                 posts[normalize_url(nxt)] = form
+            if nxt and by_date and not form and not _sort_params(page_url) <= _sort_params(nxt):
+                # Randstad Digital: page 1 is '?sortBy=date', its next page '/page-2/' drops the sort: the website's own
+                # order there says nothing about the dates (its first two offers were old, offers of the week came after)
+                by_date = False
+                f.note("the next pages do not keep the website's date sort: every offer of the list is read")
             page_url = nxt
         except AccessError:
             raise
@@ -637,6 +748,19 @@ def sitemap_jobs(f, url, limit=5000):
             if urlparse(u).hostname == host and (_SITEMAP_JOB.search(urlparse(u).path) or is_job_path(urlparse(u).path)) and f.robots_ok(u):
                 out.setdefault(normalize_url(u), m[2] or "")
     return list(out.items())[:limit]
+
+
+def _list_only(soup, base, url, title, card_date):
+    """An offer kept as its card on the list shows it, its page not opened: title (or the words of its address), the card's
+    date and place. None when nothing names it (no title on the card, no words in its address)."""
+    title = title or (_slug_title(url) if _slug_words(url) else "")
+    if not title or len(title) < 4:
+        return None
+    raw = _raw(title, url, location=_card_location(soup, base, url, title), description=title, conf=0.4,
+               provenance="list-only")
+    if card_date:
+        raw.update(date=card_date[0], date_conf=card_date[1], date_source=card_date[2], date_text=card_date[3])
+    return raw
 
 
 def _slug_title(u):
@@ -883,6 +1007,131 @@ def open_alternative(f, url):
     return None
 
 
+def hellowork_keyword_pages(cfg) -> list[str]:
+    """The open Hellowork pages of each keyword of the search profile, in the profile's order: its keyword page
+    ('/fr-fr/emploi/mot-cle_vision-par-ordinateur.html') and its job-title page ('/fr-fr/emploi/metier_data-scientist.html':
+    the titles 'data scientist' and 'research engineer' have no keyword page). Each lists different offers."""
+    words = (cfg.get("_profile") or {}).get("keywords") or []
+    slugs = [re.sub(r"[^a-z0-9]+", "-", norm(w)).strip("-") for w in words]
+    return [f"https://www.hellowork.com/fr-fr/emploi/{kind}_{x}.html"
+            for x in dict.fromkeys(x for x in slugs if len(x) >= 2) for kind in ("mot-cle", "metier")]
+
+
+def crawl_hellowork_keywords(f, url, cfg, known, st):
+    """Hellowork searched with the profile's keywords. robots.txt closes its search engine and every address with '?' (so
+    its own date filter and its page 2), and opens one page per keyword with the 20 newest offers in France. Each page is
+    read like any list: an offer whose card date is outside the date range is never opened, an offer whose card title is
+    clearly unwanted neither; the others are opened and dated from their own page. An offer found under several keywords
+    is read once. A word without a page (HTTP 404) is skipped. When the user switched robots.txt off, Hellowork's own
+    search is read first for every keyword (newest first, page after page, until the range ends: hellowork_search)."""
+    searched = 0
+    pages = hellowork_keyword_pages(cfg)
+    if not pages:
+        raise ConnectionError("no keyword in the search profile: nothing to search on Hellowork")
+    if not cfg.get("respect_robots", True):  # the user allowed it: Hellowork's own search, every page, newest first
+        words = list(dict.fromkeys(w.strip() for w in (cfg.get("_profile") or {}).get("keywords") or [] if len(w.strip()) >= 2))
+        f.note(f"robots.txt not respected (setting): Hellowork's search is read for the {len(words)} keywords of the profile, "
+               "newest first, page after page until the offers are older than the date range")
+        seen = set(known)
+        for w in words:
+            if st.deadline and time.time() > st.deadline:
+                f.note(f"Hellowork: the time for this search is up at the keyword '{w}'")
+                st.details_capped = True
+                break
+            for pg in hellowork_search(f, "https://www.hellowork.com/fr-fr/emploi/recherche.html?" + urlencode({"k": w}),
+                                       cfg, seen, st):
+                searched += len(pg.jobs) + pg.out + pg.seen
+                yield pg
+        # the keyword and job-title pages match offers differently from the search (40 more offers of the last 24 hours on
+        # 2026-11-12, beside the search's 191): read them too, each offer once
+        known = seen
+    f.note(f"Hellowork: the {len(pages) // 2} keywords of the profile, their keyword and job-title pages (the 20 newest offers "
+           "in France on each)")
+    seen, read, none = set(known), [], []
+    for u in pages:
+        if st.deadline and time.time() > st.deadline:
+            f.note(f"Hellowork: the time for this search is up after {len(read)} keywords")
+            st.details_capped = True
+            break
+        if not f.robots_ok(u):
+            continue
+        try:
+            f.get(u)  # the keyword has a page (no page: HTTP 404)
+        except AccessError:
+            raise
+        except Exception:
+            none.append(u.rsplit("/", 1)[-1][:-5])
+            continue
+        read.append(u)
+        for pg in crawl_generic(f, u, cfg, seen, st):
+            seen |= {normalize_url(j["url"]) for j in pg.jobs}
+            # each keyword page is its own list: one without recent offers never ends the search
+            pg.ordered, pg.sorted = False, False
+            yield pg
+        st.announced, st.more_pages = None, False  # a keyword's total ('1 393 offres') is not this search's
+    words = {u.rsplit("_", 1)[-1] for u in read}
+    lost = sorted({x.split("_", 1)[1] for x in none} - {w[:-5] for w in words})
+    f.note(f"Hellowork: {len(read)} keyword and job-title pages read" + (f"; no page for: {', '.join(lost)}" if lost else ""))
+    if not read and none and not searched:
+        raise ConnectionError("Hellowork has no keyword page for the profile's keywords")
+
+
+_HW_PAGE = 30  # offers per page of Hellowork's search
+
+
+def hellowork_search(f, url, cfg, seen, st):
+    """Hellowork's search ('recherche.html?k=...', with the user's own place / contract filters when the address has them),
+    sorted newest first ('st=date'), page after page ('p=2'...): read only when the user switched robots.txt off. The cards
+    are dated: an offer older than the range is never opened, and the first page that reaches such offers is the last one
+    (the list is checked to be in date order on that page). seen: the offers already read (by address), updated."""
+    p = urlparse(url)
+    q = [(k, v) for k, v in parse_qsl(p.query) if k not in ("p", "st")] + [("st", "date")]
+    gate, budget = cfg.get("_gate"), _Budget(cfg, st)
+    for n in range(1, int(cfg["max_pages"]) + 1):
+        page = urlunparse(p._replace(query=urlencode(q + ([("p", str(n))] if n > 1 else []))))
+        soup = BeautifulSoup(f.get(page).text, PARSER)
+        links = _job_links(soup, page, set())
+        if not links:
+            return
+        cards = _card_dates(soup, page, dayfirst=_dayfirst(soup))
+        jobs, out, known_here = [], 0, 0
+        for lk in links:
+            cd = cards.get(lk)
+            if cd and gate and gate(cd[0], cd[1], cd[3]) is False:  # DATE FIRST: too old -> never opened
+                out += 1
+                continue
+            if lk in seen:
+                known_here += 1
+                continue
+            seen.add(lk)
+            title = _card_title(soup, page, lk)
+            if title and not worth_opening(cfg, {"title": title, "date": None}):
+                st.skipped += 1
+                continue
+            if _card_abroad(soup, page, lk, title or ""):
+                st.abroad += 1
+                continue
+            if not budget.take():  # this source's time or job-page budget is used up: kept as its card shows it
+                kept = _list_only(soup, page, lk, title, cd)
+                if kept:
+                    jobs.append(kept)
+                continue
+            try:
+                job = _parse_detail(f.get(lk).text, lk, card=cd)
+                job["location"] = job["location"] or _card_location(soup, page, lk, job["title"])
+                jobs.append(job)
+            except AccessError:
+                raise
+            except Exception as e:
+                f.note(f"job page not read {lk}: {str(e)[:100]}")
+        yield Page(page, page, jobs, out=out, seen=known_here, ordered=False)
+        dates = [cards[x][0] for x in links if x in cards]
+        if out and date_order(dates) is not False:
+            return  # newest first: every next page is older than the range
+        if len(links) < _HW_PAGE:
+            return  # the last page
+
+
 # ---------------------------------------------------------------------------- offers published as PDF files
 _PDF_OFFER = re.compile(r"annonce|offre|offer|stage|intern|th[eè]se|phd|post-?doc|poste|position|job|sujet|subject|"
                         r"proposal|proposition|recrut|vacanc|fiche|m2", re.I)
@@ -1062,7 +1311,22 @@ _PLATFORM_HOSTS = re.compile(r"(?:^|\.)(?:myworkdayjobs\.com|myworkdaysite\.com|
                              r"talent-soft\.com|breezy\.hr|jobs\.personio\.(?:de|com))$")
 
 
+_TRANSIENT = re.compile(r"HTTP 5\d\d|HTTP 429|source_unreachable|Timeout", re.I)
+
+
 def crawl_source(f, url, cfg, known, st):
+    """Every offer of one website (see the module's docstring for the order of the readers). A job platform that failed for
+    a passing reason (HTTP 503, a timeout) while nothing else found an offer makes the website FAIL with that reason, so
+    the scan's second try reads it again; 'completed, no offer' would have hidden the failure (Parrot: Talentview 503)."""
+    seen = 0
+    for pg in _crawl_source(f, url, cfg, known, st):
+        seen += len(pg.jobs) + pg.out + pg.seen
+        yield pg
+    if st.platform_error and not (seen or st.skipped or st.abroad):
+        raise ConnectionError(st.platform_error)
+
+
+def _crawl_source(f, url, cfg, known, st):
     host = (urlparse(url).hostname or "").lower()
     if host.endswith("welcometothejungle.com"):
         alt = wttj_alternative(f, url)
@@ -1080,6 +1344,15 @@ def crawl_source(f, url, cfg, known, st):
     if JP_HOSTS.search(host):  # JobsPipe: its API with your key (offers of many companies in France)
         st.platform = "jobspipe (API, your key)"
         yield from ADAPTERS["jobspipe"](f, url, cfg, known, st)
+        return
+    if normalize_url(url) == normalize_url(HW_KEYWORDS_URL):  # Hellowork searched with the profile's keywords
+        st.platform = "hellowork (profile keywords)"
+        yield from crawl_hellowork_keywords(f, url, cfg, known, st)
+        return
+    if host.endswith("hellowork.com") and "/emploi/recherche" in urlparse(url).path and not cfg.get("respect_robots", True):
+        st.platform = "hellowork search (robots.txt not respected)"
+        f.note("robots.txt not respected (setting): Hellowork's search is read with its own filters, page after page")
+        yield from hellowork_search(f, url, cfg, set(known), st)
         return
     own = with_own_filters(url, cfg)
     if own != url:
@@ -1116,7 +1389,7 @@ def crawl_source(f, url, cfg, known, st):
             raise blocked  # the board gave nothing either: the website stays 'blocked', with its real reason
         return
     st.platform = name
-    found, read, places, dates = 0, set(), Counter(), []
+    found, read, places, dates, listed_out = 0, set(), Counter(), [], 0
     if name in ADAPTERS:
         f.note(f"platform: {name}")
         try:
@@ -1139,6 +1412,8 @@ def crawl_source(f, url, cfg, known, st):
                 raise
             f.note(f"{name} reader failed ({str(e)[:120]}): trying the generic crawler")
             st.platform = f"{name}->generic"
+            if _TRANSIENT.search(f"{type(e).__name__} {e}"):
+                st.platform_error = f"{name} reader: {str(e)[:200]}"
         gate = cfg.get("_gate")
         # a feed holds only the newest offers: when even its oldest one is inside the range, older ones may be on the page
         full = name == "rss" and found >= 10 and len(dates) == found and gate and gate(min(dates), 0.9, "") is not False
@@ -1152,11 +1427,14 @@ def crawl_source(f, url, cfg, known, st):
         got = set()
         for pg in crawl_generic(f, url, cfg, known, st):
             found += len(pg.jobs)
+            listed_out += pg.out
             got.update(normalize_url(j["url"]) for j in pg.jobs)
             for j in pg.jobs:
                 loc = classify_location(j.get("location"), j.get("country_hint"), j.get("remote_hint"))
                 places[loc["france_eligible"]] += bool(loc["location_verified"])
             yield pg
+        if st.moved:  # the page moved: the next readers (sitemap, AI page reader, PDFs) read its new address
+            url = st.moved
         if st.redirect:
             name, arg = st.redirect
             st.platform = f"{name} (from the page's offers)"
@@ -1239,6 +1517,12 @@ def crawl_source(f, url, cfg, known, st):
             yield pg
         if found:
             return
+    if found == 0 and mode == "auto" and (st.skipped or st.abroad or listed_out):
+        # the list was read: its offers were all left out by their title, place or date (a Welcome Kit page with one sales
+        # offer). The AI browser would only find them again (checked on 7 websites: nothing new, 25-50 s each)
+        f.note(f"the list's {st.skipped + st.abroad + listed_out} offers were read and left out (title, place or date): "
+               "no AI browser")
+        return
     if found == 0 and mode in ("auto", "ai") and not known and cfg.get("_keys") is not None:
         if mode == "auto":
             f.note("no job found by reading the page: switching to the AI browser")

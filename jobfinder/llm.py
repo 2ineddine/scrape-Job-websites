@@ -50,39 +50,42 @@ BILLED = {"xai"}  # paid per request: used last, and at most cfg['max_billed_cal
 _USAGE_LOCK = threading.Lock()  # websites are read in parallel
 
 
-def reset_usage():
-    USAGE.update(calls=0, cache_hits=0, model="", billed=0, **{"in": 0, "out": 0})
-    with _HEALTH_LOCK:  # a new run judges every model afresh (a pause already given keeps running until its end)
-        for h in _HEALTH.values():
-            h.update(bad=0, slow=0, ok=0, fail=0, secs=0.0)
-
-
 # ---------------------------------------------------------------------------- automatic switching: the models' health
-# The models are tried best first (LADDER). During a run each one is watched, so that the scan never waits on a model that
-# misbehaves while a good one is free:
+# The models are tried best first, by quality level (LEVELS). During a run each one is watched, so that the scan never waits
+# on a model that misbehaves while a good one is free:
 #   - BAD_IN_A_ROW unusable answers in a row (not JSON, wrong shape, empty): the model is paused 10 min, then 30, then 60.
 #     Before, such a model was asked again for every offer, at two wasted calls each time;
 #   - SLOW_CALL seconds or more, twice in a row: paused 10 min (the next models answer in a few seconds);
-#   - analyses run in parallel (config 'ai_workers'): a model serves at most 'ai_per_model' requests at once and the next
-#     request goes to the next model IN RANK, so the best models do most of the work without hitting their per-minute
-#     limits, and the scan is not held by one model.
+#   - a per-minute limit ('429, retry in 20 s'): the model is left for the time the provider asks, the next model of the
+#     same level takes its offers, and it is used again as soon as its limit has passed;
+#   - requests at once: each model starts at 'ai_per_model' requests at a time and learns what it accepts: one more after
+#     good answers about as fast as its first ones, one fewer after a much slower answer, half as many after a rate-limit
+#     refusal and no new increase for HOLD seconds (additive increase, multiplicative decrease, as TCP does), up to
+#     'ai_per_model_max'.
 BAD_IN_A_ROW, BAD_PAUSES = 3, (600, 1800, 3600)
 SLOW_CALL, SLOW_PAUSE = 45, 600
-_HEALTH: dict = {}  # (provider, model, key) -> {"bad", "strikes", "slow", "busy", "ok", "fail", "secs"}
+HOLD = 300
+_HEALTH: dict = {}  # (provider, model, key) -> counters, and "cap": the requests it serves at once
 _HEALTH_LOCK = threading.Lock()
 
 
 def _health(step) -> dict:
-    return _HEALTH.setdefault(step, {"bad": 0, "strikes": 0, "slow": 0, "busy": 0, "ok": 0, "fail": 0, "secs": 0.0})
+    return _HEALTH.setdefault(step, {"bad": 0, "strikes": 0, "slow": 0, "busy": 0, "ok": 0, "fail": 0, "secs": 0.0,
+                                     "limits": 0, "limited_at": 0.0, "cap": None, "max": 2, "peak": 0})
 
 
-def _take(step, cap) -> bool:
-    """A free place on this model (False: it already serves `cap` requests)."""
+def _take(step, cfg) -> bool:
+    """A free place on this model (False: it already serves as many requests as it accepts)."""
     with _HEALTH_LOCK:
         h = _health(step)
-        if h["busy"] >= cap:
+        start = max(1, int(cfg.get("ai_per_model", 2)))
+        h["max"] = max(start, int(cfg.get("ai_per_model_max", start)))
+        if h["cap"] is None:
+            h["cap"] = float(start)
+        if h["busy"] >= int(h["cap"]):
             return False
         h["busy"] += 1
+        h["peak"] = max(h["peak"], h["busy"])
         return True
 
 
@@ -97,12 +100,30 @@ def _went_well(step, secs):
         h = _health(step)
         h["bad"], h["ok"], h["secs"] = 0, h["ok"] + 1, h["secs"] + secs
         h["slow"] = h["slow"] + 1 if secs >= SLOW_CALL else 0
+        # its normal speed: the first answers, while it serves few requests (a provider that queues requests answers slower
+        # with more of them at once: Nemotron took 31 s each at 6 at once)
+        h.setdefault("times", [])
+        if len(h["times"]) < 5:
+            h["times"].append(secs)
+        base = sum(h["times"]) / len(h["times"])
+        if h["cap"] is not None and secs > 2.5 * base + 2:
+            h["cap"] = max(1.0, h["cap"] - 1 / h["cap"])  # much slower than usual: fewer requests at once
+        elif h["cap"] is not None and time.time() - h["limited_at"] > HOLD and secs <= 1.5 * base + 1:
+            h["cap"] = min(float(h["max"]), h["cap"] + 1 / h["cap"])  # it keeps up: one more request at once, step by step
         paused = h["slow"] >= 2
         if paused:
             h["slow"] = 0
             _EXHAUSTED[step] = max(_EXHAUSTED.get(step, 0), time.time() + SLOW_PAUSE)
     if paused:
         LOG.info("AI: %s / %s paused %d min: two answers over %d s in a row", step[0], step[1], SLOW_PAUSE // 60, SLOW_CALL)
+
+
+def _rate_limited(step):
+    """The provider refused a request for its per-minute limit: half as many requests at once on this model."""
+    with _HEALTH_LOCK:
+        h = _health(step)
+        h["cap"] = max(1.0, (h["cap"] or 2.0) / 2)
+        h["limits"], h["limited_at"] = h["limits"] + 1, time.time()
 
 
 def _went_bad(step):
@@ -119,17 +140,25 @@ def _went_bad(step):
         note_quota(step, error=f"paused {pause // 60} min: {BAD_IN_A_ROW} unusable answers in a row")
 
 
+def reset_usage():
+    USAGE.update(calls=0, cache_hits=0, model="", billed=0, **{"in": 0, "out": 0})
+    with _HEALTH_LOCK:  # a new run judges every model afresh (a pause already given keeps running until its end, and what a
+        for h in _HEALTH.values():  # model accepts at once stays learned)
+            h.update(bad=0, slow=0, ok=0, fail=0, secs=0.0, limits=0, peak=0)
+
+
 def health_report() -> list:
     """The models used in this run, best first, all keys of a model together:
-    [(provider, model, answers, unusable, average seconds)]."""
+    [(provider, model, answers, unusable, average seconds, rate-limit refusals, most requests at once on one key)]."""
     tot: dict = {}
     with _HEALTH_LOCK:
         for st, h in _HEALTH.items():
-            if h["ok"] or h["fail"]:
-                t = tot.setdefault((st[0], st[1]), [0, 0, 0.0])
+            if h["ok"] or h["fail"] or h["limits"]:
+                t = tot.setdefault((st[0], st[1]), [0, 0, 0.0, 0, 0])
                 t[0], t[1], t[2] = t[0] + h["ok"], t[1] + h["fail"], t[2] + h["secs"]
+                t[3], t[4] = t[3] + h["limits"], max(t[4], h["peak"])
     rank = {m: i for i, m in enumerate(LADDER)}
-    return sorted(((p, m, ok, bad, secs / ok if ok else 0.0) for (p, m), (ok, bad, secs) in tot.items()),
+    return sorted(((p, m, ok, bad, secs / ok if ok else 0.0, lim, peak) for (p, m), (ok, bad, secs, lim, peak) in tot.items()),
                   key=lambda r: rank.get((r[0], r[1]), len(rank)))
 
 
@@ -166,7 +195,7 @@ _LAST = threading.local()  # rate-limit headers of the last answer of this threa
 
 def _post(url, headers, payload, timeout=90, retries=5, cap_key=None, max_wait=120, max_timeouts=2):
     delay, timeouts = 2, 0
-    _LAST.headers = {}
+    _LAST.headers, _LAST.limited = {}, False
     for i in range(retries + 1):
         wait = delay
         try:
@@ -188,6 +217,7 @@ def _post(url, headers, payload, timeout=90, retries=5, cap_key=None, max_wait=1
                 if i == retries:
                     raise AIError(f"Provider error {r.status_code} (rate limit or outage): {r.text[:200]}")
                 if r.status_code == 429:  # rate limit: wait as long as the provider asks
+                    _LAST.limited = True  # the caller sends fewer requests at once to this model
                     wait = _wait_time(r, delay)
                     if wait > max_wait:  # a daily quota, not a per-minute limit: waiting here would freeze the analysis
                         per_day = re.search(r"per[ -]?day|daily|quota", r.text, re.I)
@@ -343,24 +373,44 @@ def _soften(schema, data):
     return out
 
 
-# THE RULE: start with the most capable model; when a limit is reached, the next one takes over (same provider or another),
-# and the better model is used again as soon as its limit has passed. A provider without a key is skipped; a second key
+# THE RULE: start with the most capable model; when a limit is reached, the next one takes over (same provider or another,
+# same quality level first), and the better model is used again as soon as its limit has passed. A provider without a key is skipped; a second key
 # ('gemini#2', 'groq#2') gives the same model its own quota. Ranked by general capability, checked on the app's offer analysis
 # (November 2026). Left out: Gemini 3.7 / 3.8 Flash (time out), Gemini Pro models (no free quota), Cohere Command A Plus
 # (no valid JSON answer), NVIDIA's gpt-oss-120b (retired); SambaNova and Ollama Cloud need credits.
-LADDER = [("gemini", "gemini-3.6-flash"), ("gemini", "gemini-3.5-flash"),
-          ("groq", "openai/gpt-oss-120b"),
-          # Nemotron 3.5 Super before 3 Ultra: as accurate on the offers (85 vs 75) and fast, where Ultra timed out on
-          # long CV-match prompts (11 times in one check run, November 2026)
-          ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"), ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
-          ("cohere", "command-a-reasoning-08-2025"),
-          ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"), ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-          ("gemini", "gemini-2.5-flash"), ("cohere", "command-a-03-2025"), ("groq", "qwen/qwen3.8-27b"),
-          ("openrouter", "dots-studio/dots-3-note-preview:free"), ("gemini", "gemini-3.5-flash-lite"),
-          ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"), ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
-          ("cohere", "command-r-plus-08-2024"), ("gemini", "gemini-3.1-flash-lite"), ("groq", "openai/gpt-oss-20b"),
-          ("cohere", "command-r-08-2024"),
-          ("xai", "grok-4.3")]  # billed per use: last, so that credits are spent only when every free quota has run out
+LEVELS = [
+    # 1 - the best: an offer waits a moment for one of them rather than going to a weaker model
+    [("gemini", "gemini-3.6-flash"), ("gemini", "gemini-3.5-flash"),
+     ("groq", "openai/gpt-oss-120b"),
+     # Nemotron 3.5 Super before 3 Ultra: as accurate on the offers (85 vs 75) and fast, where Ultra timed out on
+     # long CV-match prompts (11 times in one check run, November 2026)
+     ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"), ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
+     ("cohere", "command-a-reasoning-08-2025"),
+     ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"), ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free")],
+    # 2 - good
+    [("gemini", "gemini-2.5-flash"), ("cohere", "command-a-03-2025"), ("groq", "qwen/qwen3.8-27b"),
+     ("openrouter", "dots-studio/dots-3-note-preview:free")],
+    # 3 - small models: used only when every better model is out for a while; their readings are read again by a better
+    # model at the end of the run when one is free (WEAK_LEVEL)
+    [("gemini", "gemini-3.5-flash-lite"), ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
+     ("openrouter", "nvidia/nemotron-3.5-lightning:free"), ("cohere", "command-r-plus-08-2024"),
+     ("gemini", "gemini-3.1-flash-lite"), ("groq", "openai/gpt-oss-20b"), ("cohere", "command-r-08-2024")],
+    # 4 - billed per use: last, so that credits are spent only when every free quota has run out
+    [("xai", "grok-4.3")],
+]
+LADDER = [m for lv in LEVELS for m in lv]
+_LEVEL = {m: i for i, lv in enumerate(LEVELS, 1) for m in lv}
+WEAK_LEVEL = 3
+
+
+def level(step) -> int:
+    """Quality level of a model (1 = best); the model chosen in Settings, outside the ladder, comes after all of them."""
+    return _LEVEL.get((step[0], step[1]), len(LEVELS) + 1)
+
+
+def last_step():
+    """(provider, model, key) that gave this thread's last answer (None before any)."""
+    return getattr(_LAST, "step", None)
 
 
 # a model the provider no longer offers on this key, or an account without credits: skipped for a week, even after a restart
@@ -473,6 +523,7 @@ def _ask(step, user, schema, cfg, s, keys, system):
             USAGE["calls"] += 1
             USAGE["billed"] += prov in BILLED
         t0 = time.time()
+        _LAST.limited = False
         try:
             text, i, o = chat(prov, model, system, prompt, cfg, {**(keys or {}), prov: get_key(slot, keys)})
         except MalformedOutput:
@@ -481,11 +532,16 @@ def _ask(step, user, schema, cfg, s, keys, system):
         except QuotaExhausted as e:
             _EXHAUSTED[step] = time.time() + getattr(e, "wait", 3600)
             note_quota(step, until=_EXHAUSTED[step])
+            _rate_limited(step)
             raise
         except AIError as e:
+            if getattr(_LAST, "limited", False):
+                _rate_limited(step)
             if not isinstance(e, MalformedOutput) and re.search(r"Authentication|no credits|HTTP 40[0-9]", str(e)):
                 note_quota(step, error=e)
             raise
+        if getattr(_LAST, "limited", False):  # answered after a short rate-limit wait: it was asked too often
+            _rate_limited(step)
         note_quota(step)
         with _USAGE_LOCK:
             USAGE["in"] += i
@@ -509,29 +565,58 @@ def _ask(step, user, schema, cfg, s, keys, system):
     raise MalformedOutput(f"Malformed AI output after retry: {last}")
 
 
+SHORT_WAIT = 90   # a better model free again within this time is waited for, instead of a weaker model taking the offer
+BUSY_WAIT = 300   # every model of the best level busy that long (seconds): the next level helps
+
+
+def _billed_out(step, cfg) -> bool:
+    return step[0] in BILLED and USAGE["billed"] >= int(cfg.get("max_billed_calls", 100))
+
+
 def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
+    """One AI request, answered by the best model that can take it now (see LEVELS):
+    - the best level first; within a level, rank order, each model taking as many requests at once as it accepts;
+    - a model at its limit for a moment (per-minute limit, an outage retry) is replaced by the next model OF ITS LEVEL; when
+      the whole level is out only for a moment (up to SHORT_WAIT), the request waits for it rather than going to a weaker
+      model; it moves down a level only when the better ones are out for longer (daily quota, a pause);
+    - cfg['_max_level']: only models of that level or better (a second reading of a small model's answer); cfg['_no_wait']:
+      never wait (that reading is skipped instead)."""
+    _LAST.step = None
     chain = model_chain(cfg, keys)
+    if cfg.get("_max_level"):
+        chain = [x for x in chain if level(x) <= int(cfg["_max_level"])]
+        if not chain:
+            raise QuotaExhausted("No model of a better level has a key")
     for step in chain:
         row = s.get(AICache, _cache_key(step, system, user, schema))
         if row:
             with _USAGE_LOCK:
                 USAGE["cache_hits"] += 1
+            _LAST.step = step
             return schema.model_validate_json(row.value)
-    cap = max(1, int(cfg.get("ai_per_model", 2)))
-    last, tried, attempt, t_start = None, set(), 0, time.time()
+    patience = 0 if cfg.get("_no_wait") else SHORT_WAIT
+    last, tried, t_start, spill = None, set(), time.time(), False
     while True:
+        now = time.time()
+        usable = [x for x in chain if x not in tried and not _billed_out(x, cfg)]
+        free = [x for x in usable if _EXHAUSTED.get(x, 0) <= now]
+        top = min((level(x) for x in free), default=None)
+        # the soonest return of a model better than every free one (all of them when none is free)
+        back = min((_EXHAUSTED[x] for x in usable if _EXHAUSTED.get(x, 0) > now and (top is None or level(x) < top)),
+                   default=0)
+        if back and back - now <= patience and now - t_start < 2 * patience:
+            time.sleep(min(back - now, 1.0))  # a better model is back in a moment: waited for, not replaced by a weaker one
+            continue
+        if top is None:
+            break
         busy = False
-        for step in chain:  # best first
-            if step in tried or _EXHAUSTED.get(step, 0) > time.time():
-                continue
-            if step[0] in BILLED and USAGE["billed"] >= int(cfg.get("max_billed_calls", 100)):
-                continue  # the billed model's share of this scan is used: the free models' quotas decide the rest
-            if not _take(step, cap):  # serving other offers: the next model in rank takes this one
+        for step in (x for x in free if spill or level(x) == top):  # best first
+            if not _take(step, cfg):  # serving as many offers as it accepts: the next model of the level takes this one
                 busy = True
                 continue
             try:
                 obj = _ask(step, user, schema, cfg, s, keys, system)
-                USAGE["model"] = f"{step[0]} / {step[1]}"
+                USAGE["model"], _LAST.step = f"{step[0]} / {step[1]}", step
                 return obj
             except BudgetExceeded:
                 raise
@@ -555,19 +640,19 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
             finally:
                 _give(step)
             LOG.info("AI: %s / %s not available (%s), next model", step[0], step[1], str(last)[:100])
-        if busy and time.time() - t_start < 600:
-            time.sleep(0.25)  # every free model is serving other offers: one is free again in a moment
-            continue
-        wait = min((_EXHAUSTED.get(x, 0) for x in chain if x not in tried), default=0) - time.time()
-        if attempt or not 0 < wait <= 90:
-            break
-        attempt += 1
-        time.sleep(wait)  # every model is at its per-minute limit: the first one is free again in a moment
-    if isinstance(last, (MalformedOutput, RequestTooLarge)) or last is None:
-        raise last or QuotaExhausted("No AI model available: add an API key in Settings")
-    wait = min((_EXHAUSTED.get(x, 0) for x in chain), default=0) - time.time()
-    if len(chain) == 1:
+            break  # this model is out of this request: the levels are judged again
+        else:
+            if busy:
+                if time.time() - t_start >= BUSY_WAIT:
+                    spill = True  # every model of the level has been busy for minutes: the next levels help
+                time.sleep(0.25)  # every model of the level is serving other offers: one is free again in a moment
+    if isinstance(last, (MalformedOutput, RequestTooLarge)):
         raise last
+    wait = min((_EXHAUSTED.get(x, 0) for x in chain if not _billed_out(x, cfg)), default=0) - time.time()
+    if len(chain) == 1 and last is not None:
+        raise last
+    if last is None and wait <= 0:
+        raise QuotaExhausted("No AI model available: add an API key in Settings")
     err = QuotaExhausted(f"All {len(chain)} AI models have reached their limit: the first one is free again in about "
                          f"{max(wait, 60) / 60:.0f} min. Add another key, or try again later.")
     err.wait = max(wait, 60)

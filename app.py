@@ -6,6 +6,7 @@ import html
 import json
 import os
 import threading
+from collections import Counter
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,12 +21,13 @@ from jobfinder import llm
 from jobfinder import market
 from jobfinder.analysis import analyze_pipeline
 from jobfinder.classify import OFFER_TYPES
-from jobfinder.config import APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config, upgrade_profile
-from jobfinder.scan import Progress, run_scan
+from jobfinder.config import (APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PROFILE_DEFAULT, run_config, upgrade_config,
+                             upgrade_profile)
+from jobfinder.scan import PROBLEM_ORDER, Progress, run_scan, site_problem
 from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, file_coverage,
-                             get_setting, init_db, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
+                             get_setting, init_db, keyword_sources, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
                              wipe_session_data, recent_count, forget_recent_offers)
-from jobfinder.web import extract_urls, offer_link
+from jobfinder.web import extract_urls, offer_link, pasted_urls
 
 ASSETS = Path(__file__).parent / "assets"
 st.set_page_config(page_title="Job Finder", page_icon=str(ASSETS / "icon.svg"), layout="wide")
@@ -53,6 +55,9 @@ with SessionLocal() as _s:
     PROFILE, _upgraded = upgrade_profile(PROFILE)  # keywords added to the defaults since this profile was saved
     if _upgraded:
         set_setting(_s, "profile", PROFILE)
+    CFG, _upgraded = upgrade_config(CFG)  # robots.txt: a setting now (saved once, then the user's choice is kept)
+    if _upgraded:
+        set_setting(_s, "config", CFG)
 c, p, ap = (json.loads(json.dumps(x)) for x in (CFG, PROFILE, APPLICANT))  # working copies, auto-saved at the end
 KEYS = load_keys()
 PRESETS = list(PRESET_DAYS) + ["All dates"]
@@ -137,10 +142,10 @@ def step_websites(running, n):
             st.rerun()
         with st.expander("…or paste URLs"):
             pasted = st.text_area("One URL per line", height=90, label_visibility="collapsed")
-            if st.button("Use these URLs", disabled=running or not extract_urls(pasted)):
+            if st.button("Use these URLs", disabled=running or not pasted_urls(pasted)):
                 try:
                     with SessionLocal() as s:
-                        load_new_sources(s, extract_urls(pasted), {u: ["pasted URLs"] for u in extract_urls(pasted)})
+                        load_new_sources(s, pasted_urls(pasted), {u: ["pasted URLs"] for u in pasted_urls(pasted)})
                 except RuntimeError as e:
                     st.error(str(e))
                     return
@@ -234,13 +239,43 @@ def coverage_bars(running):
                    f'<div class="jf-cov-bar" role="img" aria-label="{html.escape(r["file"])}: {head}">{segs}</div>'
                    f'<div class="jf-cov-legend">{legend}</div></div>')
     st.html('<div class="jf-covs">' + "".join(out) + "</div>")
-    missed = [(r["file"], m) for r in rows for m in r["missed"]]
-    if missed and not running:
-        with st.expander(f"Websites not searched, or blocked ({len(missed)})"):
-            st.caption("Not reached: the scan stopped first (90-minute limit or Stop): start it again, or load a smaller file. "
-                       "Blocked or failed: the reason is in 'Websites and how each one was read' (step 1).")
-            st.dataframe(pd.DataFrame([dict(file=f, website=m) for f, m in missed]), hide_index=True, width="stretch",
-                         height=min(38 + 35 * len(missed), 320))
+
+
+def problems_panel(running):
+    """Every website that did not work at this scan (blocked, not reachable, page gone, partly read, no offer found...),
+    with the reason and what to do. Updated while the scan runs."""
+    with SessionLocal() as s:
+        rows = []
+        for x in s.query(Source).all():
+            pb = site_problem(x, scan_finished=not running, respect_robots=bool(c.get("respect_robots", False)))
+            if pb:
+                rows.append(dict(problem=pb[0], website=x.label or x.url, why=pb[1], what_to_do=pb[2],
+                                 file=(x.origin or "").replace("\n", ", "), address=x.url))
+    if not rows:
+        return
+    rows.sort(key=lambda r: (PROBLEM_ORDER.index(r["problem"]), r["website"].lower()))
+    by = Counter(r["problem"] for r in rows)
+    title = (f"{len(rows)} website{'s' if len(rows) > 1 else ''} did not work{' so far' if running else ''}: "
+             + ", ".join(f"{by[k]} {k.lower()}" for k in PROBLEM_ORDER if by[k]))
+    esc = html.escape
+    groups = []
+    for k in PROBLEM_ORDER:
+        items = [r for r in rows if r["problem"] == k]
+        if not items:
+            continue
+        dot = "red" if k in PROBLEM_ORDER[:4] else "grey" if k == "Not reached" else "amber"
+        lis = "".join(f'<li><a href="{esc(r["address"], quote=True)}" target="_blank" rel="noopener noreferrer">{esc(r["website"])}</a>'
+                      + (f' <span class="jf-prob-file">· {esc(r["file"])}</span>' if r["file"] else "")
+                      + f'<div class="jf-prob-why">{esc(r["why"])}</div><div class="jf-prob-do">→ {esc(r["what_to_do"])}</div></li>'
+                      for r in items)
+        groups.append(f'<div><div class="jf-prob-head"><span class="jf-cov-key {dot}"></span>{esc(k)} <span>{len(items)}</span></div>'
+                      f'<ul class="jf-prob-list">{lis}</ul></div>')
+    df = pd.DataFrame(rows)
+    with st.expander(title, expanded=not running):
+        st.html('<div class="jf-probs">' + "".join(groups) + "</div>")
+        if not running:
+            st.download_button("Download this list (CSV)", df.to_csv(index=False).encode("utf-8"), "websites_not_working.csv",
+                               "text/csv", icon=":material/download:")
 
 
 def _monitor():
@@ -254,8 +289,10 @@ def _monitor():
     st.progress(min(d["sources_done"] / (d["sources_total"] or 1), 1.0),
                 text=f"{d['task'].capitalize()} — websites {d['sources_done']} / {d['sources_total']}")
     coverage_bars(d["running"])
+    problems_panel(d["running"])
     if d["ai_total"]:
-        st.progress(min(d["ai_done"] / d["ai_total"], 1.0), text=f"AI reading offers {d['ai_done']} / {d['ai_total']}")
+        more = " — more arrive as the websites are read" if d["running"] and d["task"] == "crawling" else ""
+        st.progress(min(d["ai_done"] / d["ai_total"], 1.0), text=f"AI reading offers {d['ai_done']} / {d['ai_total']}{more}")
         if llm.USAGE["model"]:
             st.caption(f"Model in use: {llm.USAGE['model']}")
     m = st.columns(4)
@@ -282,6 +319,19 @@ def step_analysis(running, n):
                                     format_func=OFFER_TYPES.get, key="types") or cur
         pre = c["date_preset"] if c["date_preset"] in PRESETS else "Last 30 days"
         c["date_preset"] = st.segmented_control("Published within", PRESETS, default=pre, key="preset") or pre
+        c["respect_robots"] = st.toggle(
+            "Respect robots.txt", value=bool(c.get("respect_robots", False)), disabled=running,
+            help="Off (default): no robots.txt rule is applied, only its list of sitemaps is used to find every offer "
+                 "(Hellowork's search and its next pages are read, SmartRecruiters' data feed, every offer page). On: the "
+                 "app reads only the pages each website's robots.txt allows. Either way the app keeps its own name, reads "
+                 "one page per second per website and never gets around an anti-bot page, a login or a captcha.")
+        if not c["respect_robots"]:
+            st.caption("robots.txt rules are not applied in this scan (the websites' anti-bot protections still are).")
+        c["hellowork_keywords"] = st.checkbox(
+            "Also search Hellowork with my keywords", value=bool(c.get("hellowork_keywords", True)), disabled=running,
+            help="Reads Hellowork's open page of each keyword of the search profile (its 20 newest offers in France: Hellowork "
+                 "does not let robots read its search or its next pages). The offers go through the same filters, the "
+                 "date range first. Company pages on Hellowork are read when their address is in a website file.")
         m = c["model"]
         first = llm.model_chain(c, KEYS)[0]
         st.caption((f"AI models: starts with **{first[0]} / {first[1]}** and switches when a limit is reached — see Settings. "
@@ -312,10 +362,12 @@ def step_analysis(running, n):
         x, y, _ = st.columns([1, 1, 3])
         if x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:", width="stretch"):
             with SessionLocal() as s:
+                keyword_sources(s, c)  # Hellowork searched with the profile's keywords (when ticked)
                 ids = [r.id for r in s.query(Source).all()]
             cfg, prof, keys = json.loads(json.dumps(c)), json.loads(json.dumps(p)), dict(KEYS)
             cfg["_keys"] = keys  # in memory only (never saved): lets the AI read pages and offers
-            threading.Thread(target=run_scan, args=(ids, cfg, prof, prog, lambda pr: analyze_pipeline(cfg, prof, keys, pr)),
+            threading.Thread(target=run_scan, args=(ids, cfg, prof, prog,
+                                                    lambda pr, feed: analyze_pipeline(cfg, prof, keys, pr, feed)),
                              daemon=True).start()
             st.rerun()
         if y.button("Stop", disabled=not running, icon=":material/stop:", width="stretch"):
@@ -436,6 +488,10 @@ def job_detail(uid):
             b.caption(j.location_evidence or "")
             if r:
                 st.markdown(f"**Relevance {r.get('relevance_score', 0):.0f}/100** · {r.get('reasoning_summary', '')}")
+                ex = j.extra or {}
+                if ex.get("ai_model"):
+                    st.caption(f"Read by {ex['ai_model']}" + (f" · first read by {ex['first_reading']}, then by a better model"
+                                                             if ex.get("first_reading") else ""))
             if j.status == "review":
                 flags = [f.replace("_", " ") for f in (j.review_flags or "").split(",") if f and f != "publication_date_unknown"]
                 st.info("To check: " + " · ".join(flags) if flags else "To check.")

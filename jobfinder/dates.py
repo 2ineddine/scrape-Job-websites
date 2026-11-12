@@ -434,11 +434,21 @@ def reconcile_date(cur, texts, now=None, dayfirst=None):
         d1, c1, t1, rel1 = text_publication_date(txt, now, dayfirst, loose=trusted)
         if d1 is None or (not trusted and (rel1 or c1 < 0.6)):  # page widgets ('similar jobs: posted 2 days ago') are not trusted
             continue
+        # a text that names the publication of several offers ('Offres similaires ... En ligne depuis le 10 novembre' x6 on
+        # every offer of Choisir le service public) says nothing sure about THIS offer
+        several = sum(1 for h in find_dates(txt, now, dayfirst) if h.kind == "pub") > 1
+        if several and not trusted:
+            continue
         src = f"{label}: '{t1}'"
         if d0 is None or c0 < 0.5:
             return d1, c1, src, t1
         if abs(d0 - d1) <= _DAY:  # the text confirms the structured date
             return (d0, max(c0, c1), s0 if ("confirmed" in s0 or "'" in s0) else s0 + " + confirmed by text", t0)
+        if several or (not trusted and d1 > d0):
+            # a text naming several publication dates never replaces a structured date; the rest of the page (outside the
+            # offer's own text) replaces it only with an EARLIER date (a refreshed structured date is always later): a
+            # later one is the date of another offer on the page or of a refresh
+            continue
         if c1 < 0.5:  # ambiguous 06/10/2026: do the two readings include the structured date?
             reads = date_readings(t1, now, dayfirst)
             if any(abs(r - d0) <= _DAY for r in reads):

@@ -114,6 +114,20 @@ def extract_urls(text: str) -> list[str]:
     return out
 
 
+def pasted_urls(text: str) -> list[str]:
+    """The addresses a user pastes: one per line (or separated by spaces or commas), with or without quotes. Website files
+    keep extract_urls' rule (an address without quotes, in a comment, is not read)."""
+    bare = [t.strip("'\"`()<>[]{};,.") for t in re.split(r"[\s,]+", text or "")]
+    found = extract_urls(text) + [u for u in bare if re.match(r"https?://", u, re.I)]
+    seen, out = set(), []
+    for u in found:
+        n = normalize_url(u) if syntactic_ok(u) else None
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 # --------------------------------------------------------------------------- fetcher
 class AccessError(Exception):
     pass
@@ -203,9 +217,7 @@ class Fetcher:
         if slot > now:
             time.sleep(slot - now)
 
-    def robots_ok(self, url) -> bool:
-        if not self.cfg["respect_robots"]:
-            return True
+    def _robots(self, url):
         p = urlparse(url)
         origin = f"{p.scheme}://{p.netloc}"
         if origin not in self.robots:
@@ -214,14 +226,20 @@ class Fetcher:
                 self.robots[origin] = Robots(r.text if r.status_code == 200 else "")
             except Exception:
                 self.robots[origin] = Robots()
-        return self.robots[origin].allowed(url)
+        return self.robots[origin]
+
+    def robots_ok(self, url) -> bool:
+        """robots.txt allows this address. Always True when the user switched 'Respect robots.txt' off before the scan
+        (websites the user is allowed to read, e.g. under a partner agreement); anti-bot pages are still never bypassed."""
+        if not self.cfg.get("respect_robots", True):
+            return True
+        return self._robots(url).allowed(url)
 
     def sitemaps(self, url) -> list:
         """The sitemaps a website declares in its robots.txt (else /sitemap.xml)."""
         p = urlparse(url)
-        origin = f"{p.scheme}://{p.netloc}"
-        self.robots_ok(origin + "/")
-        return self.robots[origin].sitemaps if origin in self.robots and self.robots[origin].sitemaps else [origin + "/sitemap.xml"]
+        rb = self._robots(url)
+        return rb.sitemaps or [f"{p.scheme}://{p.netloc}/sitemap.xml"]
 
     def get(self, url, **kw) -> requests.Response:
         return self.request("GET", url, **kw)

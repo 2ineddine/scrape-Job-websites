@@ -19,8 +19,9 @@ from .classify import OFFER_TYPES, analyze_title, wanted_types
 from .config import run_config, utcnow
 from .cv import _ws, match_job
 from .dates import NO_DATE, date_candidates, date_decision, describe_candidates, parse_date, refine_job_date, text_publication_date
-from .llm import AIError, MalformedOutput, call_json, health_report, require_cv_consent, reset_usage
-from .scan import hide_out_of_range
+from .llm import (WEAK_LEVEL, AIError, BudgetExceeded, MalformedOutput, QuotaExhausted, RequestTooLarge, call_json,
+                  health_report, last_step, level, require_cv_consent, reset_usage)
+from .scan import Feed, hide_out_of_range, merge_duplicates, offer_priority
 from .store import CVDocument, Job, SessionLocal, cv_key, profile_key
 from .trim import essential_text
 from .web import Fetcher
@@ -163,6 +164,9 @@ def analyze_job(s, job: Job, profile, cfg, keys=None, second=False):
     ti = analyze_title(job.title, ex.get("department"), profile, job.employment_type)
     cands = date_candidates(full)
     res = call_json(build_prompt(job, profile, text, cands, ti, second), JobAnalysis, cfg, s, keys)
+    step = last_step()
+    if step:  # which model read it: a small model's reading is read again by a better one when one is free
+        job.extra = {**(job.extra or {}), "ai_model": f"{step[0]} / {step[1]}", "ai_level": level(step)}
     # the offer type the TITLE states ('Stage - Data Scientist', 'Post-doc', 'CDI') beats the AI's: small models read
     # 'Stage' as a regular job, and an internship-only profile would then lose the offer
     stated = ti.training or ("job" if ti.contract in ("cdi", "cdd", "freelance", "interim") else "")
@@ -280,18 +284,21 @@ def _analyze_deep(s, j, profile, cfg, keys, fetcher, rend, say):
     return _second_reading(s, j, res, profile, cfg, keys, say)
 
 
-SECOND_READING_FROM = 25  # an AI exclusion scored between this and the minimum relevance is read a second time
+SECOND_READING_FROM = 25  # an offer the AI turns down with this score or more is read a second time
 
 
 def _second_reading(s, j, res, profile, cfg, keys, say):
     """The same model can judge the same offer 35 one time and 85 the next (checked on 30 real offers: 5 verdicts changed
-    between two readings of the same text). An offer excluded with a BORDERLINE score is read a second time; when that
-    reading finds it relevant, the offer goes to 'To check', marked, instead of being lost."""
+    between two readings of the same text). An offer the AI turns down with a BORDERLINE score (25 or more: below the
+    minimum relevance, or 'not relevant' with a fair score, which decides when the minimum is low) is read a second time;
+    when that reading finds it relevant, the offer goes to 'To check', marked, instead of being lost."""
     if (res is None or j.status != "excluded" or not (j.reason or "").startswith("AI relevance")
-            or not SECOND_READING_FROM <= res.relevance_score < cfg["min_relevance"]):
+            or res.relevance_score < SECOND_READING_FROM):
         return res
     first = res.relevance_score
     res2 = analyze_job(s, j, profile, cfg, keys, second=True)
+    j.extra = {**(j.extra or {}), "read_twice": True}
+    s.commit()
     if j.status in ("relevant", "review"):
         flags = [x for x in (j.review_flags or "").split(",") if x] + ["AI_readings_disagree"]
         j.status, j.review_flags = "review", ",".join(dict.fromkeys(flags))
@@ -301,13 +308,14 @@ def _second_reading(s, j, res, profile, cfg, keys, say):
     return res2
 
 
-def analyze_pipeline(cfg, profile, keys, prog):
-    """AI relevance on every candidate, then CV matching on relevant jobs. Never switches provider silently."""
+def analyze_pipeline(cfg, profile, keys, prog, feed=None):
+    """AI relevance on every offer handed over by `feed` (scan.run_scan: each website's offers as soon as it is read; None:
+    every offer waiting now), then CV matching on relevant jobs."""
     from .browser import ThreadedRenderer
     cfg = run_config(cfg)
     rend = ThreadedRenderer(cfg, Fetcher(cfg, prog.say))  # a browser is started only if a job page really needs one
     try:
-        _pipeline(cfg, profile, keys, prog, rend)
+        _pipeline(cfg, profile, keys, prog, rend, feed)
     finally:
         rend.close()
         from .market import run_if_due
@@ -316,12 +324,8 @@ def analyze_pipeline(cfg, profile, keys, prog):
 
 
 def _by_priority(jobs):
-    """The AI reads the most promising offers first, as a run or a free quota may end before the last one: titles in the
-    research fields, then offers with a proven date, then the newest."""
-    def key(j):
-        verdict = ((j.extra or {}).get("title_info") or {}).get("verdict")
-        return (verdict != "pass", j.status != "candidate", -(j.pub_date.timestamp() if j.pub_date else 0))
-    return sorted(jobs, key=key)
+    """The most promising offers first (scan.offer_priority)."""
+    return sorted(jobs, key=offer_priority)
 
 
 def _workers(cfg) -> int:
@@ -342,67 +346,189 @@ def _in_parallel(ids, work, workers):
                 yield futs[f], e
 
 
-def _pipeline(cfg, profile, keys, prog, rend):
+UNUSABLE_STOP = 10  # offers in a row whose two readings both failed: the models are broken, the analysis stops
+
+
+def _pipeline(cfg, profile, keys, prog, rend, feed=None):
+    """Workers take the offers from the feed, best first. No offer is dropped on one failure:
+    - an unusable answer or an error: the offer is read again after the others (another model may take it);
+    - every model at its limit: the offers wait in the queue until the first model is free again (up to 'ai_wait_max'
+      seconds), instead of staying 'Not analysed';
+    - an offer read by a small model (WEAK_LEVEL) is read again by a better model at the end, when one is free.
+    Only a broken setup (no key, the call budget, every quota out for longer) stops the analysis."""
     reset_usage()
-    prog.set(task="AI analysis", ai_msg="")
-    with SessionLocal() as s:
-        jobs = s.query(Job).filter(Job.status.in_(["candidate", "review"]), Job.relevance_score.is_(None)).all()
-        cap = int(cfg.get("max_ai_jobs_per_run") or 0) or len(jobs)  # 0: every offer is analysed
-        jobs, left = _by_priority(jobs), max(0, len(jobs) - cap)
-        jobs = jobs[:cap]
-        order, titles = [j.id for j in jobs], {j.id: j.title or "" for j in jobs}
-    prog.set(ai_total=len(order), ai_done=0)
-    if left:
-        prog.say(f"{left} offers beyond the limit of {cap} per run stay 'Not analysed'")
+    if feed is None:  # every offer waiting now (an analysis started after the crawl)
+        prog.set(task="AI analysis", ai_msg="")
+        feed = Feed()
+        with SessionLocal() as s:
+            jobs = _by_priority(s.query(Job).filter(Job.status.in_(["candidate", "review"]), Job.relevance_score.is_(None)).all())
+            prog.set(ai_total=feed.put(jobs), ai_done=0)
+        feed.close()
     workers, pkey, stop = _workers(cfg), profile_key(profile), threading.Event()
-    fetchers = threading.local()  # one HTTP session per worker thread
+    cap, max_wait = int(cfg.get("max_ai_jobs_per_run") or 0), float(cfg.get("ai_wait_max", 1800))
+    lock = threading.Lock()
+    state = {"active": 0, "resume_at": 0.0, "started": 0, "unusable": 0, "said_wait": 0.0}
 
     def relevant():  # the 'Relevant' tile: the same count as the header and the Results view
         with SessionLocal() as c:
             return c.query(Job).filter(Job.status == "relevant").count()
 
-    def analyse(jid):
-        if stop.is_set() or prog.cancel.is_set():
-            return None
-        if not hasattr(fetchers, "f"):
-            fetchers.f = Fetcher(cfg, prog.say)
+    def stop_with(msg):
+        if not stop.is_set():
+            prog.set(ai_msg=f"AI analysis stopped: {msg}", relevant=relevant())
+            prog.say(f"AI stopped: {msg}")
+        stop.set()
+
+    def finished(jid):  # this offer's reading is over (analysed, or given up after its second try)
+        feed.done(jid)
+        prog.inc("ai_done")
+        prog.set(relevant=relevant())
+
+    def read(ws, j, fetcher):
+        _analyze_deep(ws, j, profile, cfg, keys, fetcher, rend, prog.say)
+        if j.relevance_score is not None:  # the profile it was analysed for: the next scans reuse it only for this one
+            j.extra = {**(j.extra or {}), "profile_key": pkey}
+            ws.commit()
+
+    def read_better(ws, j):
+        """A small model's reading, read again by a better model; skipped when none is free now."""
+        before, model = j.relevance_score, (j.extra or {}).get("ai_model", "")
+        if (j.status not in ("relevant", "review", "excluded") or before is None or (j.reason or "").startswith("duplicate")
+                or (j.extra or {}).get("ai_level", 0) < WEAK_LEVEL):
+            return
+        better = {**cfg, "_max_level": WEAK_LEVEL - 1, "_no_wait": True}
+        try:
+            res = analyze_job(ws, j, profile, better, keys)
+            if j.status != "out_of_range":
+                _second_reading(ws, j, res, profile, better, keys, prog.say)
+        except AIError:
+            ws.rollback()  # no better model free: the small model's reading stays
+            return
+        j.extra = {**(j.extra or {}), "profile_key": pkey, "first_reading": f"{model}: {before:.0f}"}
+        ws.commit()
+        prog.say(f"read again by {j.extra.get('ai_model', 'a better model')} ({model}: {before:.0f} -> "
+                 f"{j.relevance_score if j.relevance_score is not None else 0:.0f}, {j.status}): {j.title[:60]}")
+
+    def handle(rnd, jid, fetcher):
         with SessionLocal() as ws:
             j = ws.get(Job, jid)
+            if rnd == Feed.BETTER:
+                try:
+                    read_better(ws, j)
+                finally:
+                    feed.done(jid)
+                return
+            if j is not None and j.relevance_score is not None:
+                # analysed, but its reading failed afterwards: the SECOND reading of a borderline exclusion is done now
+                if not (j.extra or {}).get("read_twice") and j.relevance_json:
+                    try:
+                        _second_reading(ws, j, JobAnalysis.model_validate(j.relevance_json), profile, cfg, keys, prog.say)
+                    except Exception:  # noqa: BLE001 - its first reading stands
+                        ws.rollback()
+                finished(jid)
+                return
+            if j is None or j.status not in ("candidate", "review"):
+                # merged as a duplicate, or being filtered again (a website's second try): handed over again if it stays
+                finished(jid)
+                return
+            if rnd == Feed.FIRST:
+                with lock:
+                    if cap and state["started"] >= cap:
+                        feed.done(jid)  # beyond the configured limit per run: stays 'Not analysed'
+                        return
+                    state["started"] += 1
+            title = j.title or ""
             try:
-                _analyze_deep(ws, j, profile, cfg, keys, fetchers.f, rend, prog.say)
-                if j.relevance_score is not None:  # the profile it was analysed for: the next scans reuse it only for this one
-                    j.extra = {**(j.extra or {}), "profile_key": pkey}
-                    ws.commit()
-            except Exception:
+                read(ws, j, fetcher)
+            except QuotaExhausted as e:  # every model at its limit
                 ws.rollback()
-                raise
-        return True
+                wait = float(getattr(e, "wait", 0) or 0)
+                if 0 < wait <= max_wait:  # back in the queue; every worker waits for the first model to be free again
+                    feed.again(jid, rnd)
+                    with lock:
+                        state["resume_at"] = max(state["resume_at"], time.time() + wait)
+                        say = time.time() - state["said_wait"] > 60
+                        state["said_wait"] = time.time() if say else state["said_wait"]
+                    if say:
+                        prog.say(f"every AI model is at its limit: the analysis waits {wait / 60:.0f} min, offers kept in the queue")
+                    return
+                finished(jid)
+                stop_with(str(e))
+                return
+            except BudgetExceeded as e:
+                ws.rollback()
+                finished(jid)
+                stop_with(str(e))
+                return
+            except (MalformedOutput, RequestTooLarge, AIError, Exception) as e:  # noqa: BLE001 - this offer only
+                ws.rollback()
+                if isinstance(e, AIError) and not isinstance(e, (MalformedOutput, RequestTooLarge)) and \
+                        re.search(r"Authentication|No API key|No AI model available", str(e)):
+                    finished(jid)
+                    stop_with(str(e))
+                    return
+                if rnd == Feed.FIRST and not isinstance(e, RequestTooLarge):
+                    feed.again(jid, Feed.AGAIN)  # read again after the other offers: another model may take it
+                    prog.say(f"AI reading failed for '{title[:60]}' ({str(e)[:100]}): read again later")
+                    return
+                prog.say(f"AI reading failed twice for '{title[:60]}': stays 'Not analysed' ({str(e)[:120]})")
+                finished(jid)
+                with lock:
+                    state["unusable"] += 1
+                    broken = state["unusable"] >= UNUSABLE_STOP
+                if broken:
+                    stop_with(f"the AI failed twice on {UNUSABLE_STOP} offers in a row - try again later")
+                return
+            with lock:
+                state["unusable"] = 0
+            if (j.extra or {}).get("ai_level", 0) >= WEAK_LEVEL and j.status in ("relevant", "review", "excluded") \
+                    and j.relevance_score is not None:
+                prog.inc("ai_done")
+                prog.set(relevant=relevant())
+                feed.again(jid, Feed.BETTER)  # stays pending until a better model has read it (or none was free)
+                return
+            finished(jid)
 
-    if workers > 1:
-        prog.say(f"AI analysis: {workers} offers at a time, spread over the models in their order")
-    failed, t0 = 0, time.time()
-    for jid, out in _in_parallel(order, analyse, workers):
-        if isinstance(out, MalformedOutput):  # this offer only: it stays 'Not analysed', the others go on
-            failed += 1
-            prog.say(f"AI answer unusable for '{titles[jid][:60]}': skipped ({str(out)[:120]})")
-            if failed >= 5 and not stop.is_set():
-                prog.set(ai_msg="AI analysis stopped: every model gave unusable answers for 5 offers in a row - try again later")
-                stop.set()
-        elif isinstance(out, AIError):  # key, quota, every model down: every next offer would fail too
-            if not stop.is_set():
-                prog.set(ai_msg=f"AI analysis stopped: {out}", relevant=relevant())
-                prog.say(f"AI error: {out}")
-            stop.set()
-        elif isinstance(out, Exception):
-            prog.say(f"analysis failed for '{titles[jid][:60]}': {str(out)[:120]}")
-        elif out:
-            failed = 0
-        if out is not None:
-            prog.inc("ai_done")
-            prog.set(relevant=relevant())
+    def worker():
+        fetcher = Fetcher(cfg, prog.say)  # one HTTP session per worker
+        while not stop.is_set() and not prog.cancel.is_set():
+            pause = state["resume_at"] - time.time()
+            if pause > 0:
+                time.sleep(min(pause, 1.0))
+                continue
+            with lock:  # taking an offer and counting it active at once: the workers end only when nothing can come
+                item = feed.get()
+                if item is None and feed.closed.is_set() and state["active"] == 0:
+                    return
+                state["active"] += item is not None
+            if item is None:
+                time.sleep(0.2)
+                continue
+            try:
+                handle(*item, fetcher)
+            except Exception as e:  # noqa: BLE001 - one offer never ends the analysis
+                prog.say(f"analysis failed for offer {item[1]}: {str(e)[:120]}")
+                feed.done(item[1])
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+    prog.say(f"AI analysis: up to {workers} offers at a time, best models first (a weaker model only when the better ones "
+             "are out for a while)")
+    t0 = time.time()
+    threads = [threading.Thread(target=worker, name=f"ai-{i}", daemon=True) for i in range(workers)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
     _say_models(prog, t0)
     if stop.is_set() or prog.cancel.is_set():
         return
+    with SessionLocal() as s:  # the same offer read on two websites while both were being read: shown once
+        n = merge_duplicates(s, cfg)
+    if n:
+        prog.inc("dups_merged", n)
+        prog.set(relevant=relevant())
     _match_cvs(cfg, keys, prog, workers)
 
 
@@ -412,7 +538,8 @@ def _say_models(prog, t0):
     if rows:
         prog.say(f"AI analysis done in {(time.time() - t0) / 60:.1f} min - " + "; ".join(
             f"{m.split('/')[-1]}: {ok} answers" + (f", {bad} unusable" if bad else "") + (f", {secs:.0f} s each" if ok else "")
-            for _, m, ok, bad, secs in rows))
+            + (f", {lim} rate limits" if lim else "") + (f", up to {peak} at once" if peak > 1 else "")
+            for _, m, ok, bad, secs, lim, peak in rows))
 
 
 def _match_cvs(cfg, keys, prog, workers):

@@ -1,7 +1,10 @@
-"""scan.py - the search engine: crawl every website, store the offers, then filter them DATE FIRST -> France -> title."""
+"""scan.py - the search engine: crawl every website, store the offers, filter them DATE FIRST -> France -> title, and hand
+each website's remaining offers to the AI as soon as the website is read (the AI works while the next websites are read)."""
 from __future__ import annotations
 
 import hashlib
+import itertools
+import queue
 import re
 import threading
 import time
@@ -11,11 +14,11 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlparse
 
-from .adapters import ScanState, distrust_shared_dates, make_gate
+from .adapters import ScanState, date_order, distrust_shared_dates, make_gate
 from .classify import (analyze_title, classify_location, clean_location, clean_title, france_among_places, is_boilerplate_title,
                        location_from_text,
                        looks_like_date, offer_kinds_heading)
-from .config import LOG, run_config, utcnow
+from .config import HW_KEYWORDS_URL, LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
 from .dates import date_decision, refine_job_date, refine_raw_date
 from .store import (RECENT_HOURS, Job, MarketOffer, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers,
@@ -102,10 +105,14 @@ def hide_out_of_range(s, job, why):
     s.commit()
 
 
-def apply_filters(s, cfg, profile, now=None):
-    """Pipeline stages 5-7: date -> France location -> fast title filter. Records reason for every outcome."""
+def apply_filters(s, cfg, profile, now=None, source_ids=None, merge=True):
+    """Pipeline stages 5-7: date -> France location -> fast title filter. Records reason for every outcome.
+    source_ids: only the offers of these websites (a website just read); merge: then merge the duplicates of every website."""
     now, st = now or utcnow(), Counter()
-    for job in s.query(Job).filter(Job.status == "new").all():
+    todo = s.query(Job).filter(Job.status == "new")
+    if source_ids is not None:
+        todo = todo.filter(Job.source_id.in_(list(source_ids)))
+    for job in todo.all():
         flags, ex = [], job.extra or {}
         refine_job_date(job, now)  # the description may state the real publication date
         first = ex.get("first_seen")
@@ -174,7 +181,8 @@ def apply_filters(s, cfg, profile, now=None):
         job.review_flags, job.reason = ",".join(flags), f"title: {twhy}; date: {why}"
         st["review" if doubts else "candidate"] += 1
     s.commit()
-    st["dups_merged"] = merge_duplicates(s, cfg, now)
+    if merge:
+        st["dups_merged"] = merge_duplicates(s, cfg, now)
     return dict(st)
 
 
@@ -255,11 +263,66 @@ def merge_duplicates(s, cfg, now=None):
     return merged
 
 
-def reset_filters(s):
-    n = s.query(Job).filter(Job.status.in_(["excluded", "review", "candidate"]), Job.relevance_score.is_(None)) \
-        .update({Job.status: "new"}, synchronize_session=False)
+def reset_filters(s, source_ids=None):
+    """Offers filtered but not analysed (kept from an earlier scan) are filtered again with this scan's settings."""
+    q = s.query(Job).filter(Job.status.in_(["excluded", "review", "candidate"]), Job.relevance_score.is_(None))
+    if source_ids is not None:
+        q = q.filter(Job.source_id.in_(list(source_ids)))
+    n = q.update({Job.status: "new"}, synchronize_session=False)
     s.commit()
     return n
+
+
+def offer_priority(job):
+    """The AI reads the most promising offers first among those waiting, as a run or a free quota may end before the last
+    one: titles in the research fields, then offers with a proven date, then the newest."""
+    verdict = ((job.extra or {}).get("title_info") or {}).get("verdict")
+    return verdict != "pass", job.status != "candidate", -(job.pub_date.timestamp() if job.pub_date else 0)
+
+
+class Feed:
+    """The offers handed to the AI while the websites are still being read: each website's offers as soon as it is read
+    and filtered, the most promising first among those waiting. Rounds: 0 first reading, 1 a reading that failed, tried
+    again after the others, 2 a small model's reading read again by a better model. An offer waiting or being read is
+    'pending': it is not handed over twice."""
+    FIRST, AGAIN, BETTER = 0, 1, 2
+
+    def __init__(self):
+        self._q, self._n, self._lock = queue.PriorityQueue(), itertools.count(), threading.Lock()
+        self.pending, self.closed = set(), threading.Event()
+
+    def put(self, jobs) -> int:
+        """Hands over offers (Job rows); -> how many were new to the feed."""
+        n = 0
+        with self._lock:
+            for j in jobs:
+                if j.id not in self.pending:
+                    self.pending.add(j.id)
+                    self._q.put(((self.FIRST, *offer_priority(j)), next(self._n), self.FIRST, j.id))
+                    n += 1
+        return n
+
+    def again(self, jid, rnd):
+        """Back in the queue, after every offer of an earlier round (it stays pending)."""
+        with self._lock:
+            self.pending.add(jid)
+            self._q.put(((rnd,), next(self._n), rnd, jid))
+
+    def get(self):
+        """-> (round, job id), or None when nothing is waiting now."""
+        try:
+            _, _, rnd, jid = self._q.get_nowait()
+            return rnd, jid
+        except queue.Empty:
+            return None
+
+    def done(self, jid):
+        with self._lock:
+            self.pending.discard(jid)
+
+    def close(self):
+        """Every website is read: nothing more will be handed over."""
+        self.closed.set()
 
 
 class Progress:
@@ -270,7 +333,8 @@ class Progress:
     def reset(self):
         self.d = dict(running=False, source="", page=0, total=None, pages=0, pages_failed=0, jobs=0, dups=0,
                       date_x=0, loc_x=0, title_x=0, type_x=0, review=0, candidate=0, sources_done=0, sources_total=0,
-                      task="idle", started=None, finished=None, ai_done=0, ai_total=0, relevant=0, matched=0, ai_msg="")
+                      task="idle", started=None, finished=None, ai_done=0, ai_total=0, relevant=0, matched=0, ai_msg="",
+                      dups_merged=0)
         self.log = deque(maxlen=300)
 
     def set(self, **k):
@@ -334,7 +398,66 @@ def health_note(s, src, preset):
     return note
 
 
-_RETRY = re.compile(r"source_unreachable|HTTP 5\d\d|HTTP 403", re.I)
+# ---------------------------------------------------------------------------- websites that did not work, for the user
+PROBLEM_ORDER = ("Blocked", "Not reachable", "Page not found", "Website error", "Partly read", "No offer found",
+                 "Possibly incomplete", "Changed since the last scan", "Address moved", "Not reached")
+
+
+def _todo_blocked(why, respect_robots):
+    w = why.lower()
+    if "robots.txt" in w:
+        return ("robots.txt closes it: switch 'Respect robots.txt' off before the scan" if respect_robots else
+                "robots.txt closed it in a scan that respected it: it is read at the next scan")
+    if "france travail" in w or "jobspipe" in w:
+        return "Add the API access described in the reason to api_keys.txt"
+    if "welcome to the jungle" in w:
+        return "Add the company's own career site instead (<company>.welcomekit.co, or jobs.stationf.co/companies/...)"
+    if "workday" in w:
+        return "Workday limits repeated reading for some hours: it is read again at the next scan"
+    if "linkedin" in w or "indeed" in w or "apec" in w:
+        return "Add the companies' own career pages instead"
+    return ("The website refuses automated reading (anti-bot page, login or captcha): add the company's page on an open "
+            "job platform (SmartRecruiters, Teamtailor, Welcome Kit...), or ask the website to allow your connection")
+
+
+def site_problem(src, scan_finished=True, respect_robots=True):
+    """A website that did not work at the last scan, in the user's words: (problem, why, what to do), or None when it was
+    read normally (with or without offers in the date range)."""
+    why = re.sub(r"^\s*access_restricted:\s*", "", src.last_error or "").strip()
+    st_ = src.status or ""
+    if st_ == "blocked":
+        return "Blocked", why or "access refused", _todo_blocked(why, respect_robots)
+    if st_ == "failed":
+        if re.search(r"HTTP 40[4]|HTTP 410", why):
+            new = re.search(r"possible new address: (\S+)", why)
+            return "Page not found", why, (f"Replace the address with {new[1]}" if new else
+                                           "The page no longer exists: find the company's career page and replace the address")
+        if re.search(r"source_unreachable|Timeout|resolved|certificate", why, re.I):
+            return "Not reachable", why, ("The website did not answer (it was tried twice): check the address in a browser. "
+                                          "It is read again at the next scan")
+        if re.search(r"HTTP 5\d\d|HTTP 429", why):
+            return "Website error", why, "The website had a passing error: it is read again at the next scan"
+        return "Website error", why or "reading failed", "It is read again at the next scan; if it keeps failing, check the address"
+    if st_ == "partially_completed":
+        return "Partly read", why or "the reading stopped early", ("The offers read are kept. The website is large or slow: "
+                                                                   "its other offers are read at the next scan")
+    if st_ == "not_started":
+        return ("Not reached", "the scan stopped before this website (Stop button or 6-hour limit)",
+                "Start the scan again") if scan_finished else None
+    if src.outcome == "no_offers_detected":
+        return ("No offer found", "the page was read but shows no job offer the app can recognise",
+                "Open the address: if it shows offers, the website has changed or loads them in another way; else it has none now")
+    if src.outcome == "partial":
+        return "Possibly incomplete", why, "Open the address and compare: the offers read are kept"
+    if src.health and not src.health.endswith("read again now"):
+        return "Changed since the last scan", src.health, "Open the address: the website may have a new address or layout"
+    moved = re.search(r"page moved: read at (\S+)", why)
+    if moved:
+        return "Address moved", why, f"Replace the address with {moved[1]}"
+    return None
+
+
+_RETRY = re.compile(r"source_unreachable|HTTP 5\d\d|HTTP 403|HTTP 429", re.I)  # down, refused or rate-limited for a moment
 
 
 def scan_source(sid, cfg, fetcher, prog, t0):
@@ -359,11 +482,13 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                     known.add(url_)
             else:
                 known.add(url_)
-        pages, found, status, err, stale, listed = 0, 0, "completed", "", 0, 0
+        pages, found, status, err, stale, listed, dated_pages = 0, 0, "completed", "", 0, 0, 0
         stale_max = int(cfg.get("stale_pages", 2))
         prog.say(f"START {label}")
         t_site = time.time()
-        st.deadline = t_site + cfg.get("max_site_duration", 1200)  # also stops job-page opening inside a list page
+        # one website's time; the Hellowork search with the profile's keywords reads about 40 lists: three times as long
+        site_limit = cfg.get("max_site_duration", 1200) * (3 if normalize_url(src.url) == normalize_url(HW_KEYWORDS_URL) else 1)
+        st.deadline = t_site + site_limit  # also stops job-page opening inside a list page
         try:
             for pg in crawl_source(fetcher, src.url, cfg, known, st):
                 pages += 1
@@ -374,6 +499,12 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                     status, err = "partially_completed", pg.error
                     LOG.warning("%s | pagination failed: %s", label, pg.error)
                 n_in, n_unk, n_out, last = pg.seen, 0, pg.out, None  # last: verdict of the page's last dated offer
+                dated = [d for d in (pg.dates if pg.dates is not None else [r.get("date") for r in pg.jobs]) if d]
+                st.order += dated
+                dated_pages += bool(dated)
+                # the website's list proved newest first by its own dates, ACROSS its pages: Randstad Digital sorts each page
+                # by itself (page 1 from 10 to 4 November, page 2 from 10 November again: 25 offers missed)
+                in_order = date_order(st.order) is True and dated_pages >= 2
                 prog.inc("date_x", pg.out)
                 listed += len(pg.jobs) + pg.out + pg.seen
                 for k, raw in enumerate(distrust_shared_dates(pg.jobs), 1):
@@ -402,11 +533,11 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                 prog.say(f"{label} - page {pages}" + (f" of {pg.total}" if pg.total else "") +
                          f": {n_in + n_unk} in range, {n_out} too old")
                 # the PUBLICATION DATE decides when the website is finished, not the number of pages
-                if n_in == 0 and n_unk == 0 and n_out > 0 and pg.ordered:
+                if n_in == 0 and n_unk == 0 and n_out > 0 and pg.ordered and in_order:
                     stale += 1
                 elif n_in or n_unk:
                     stale = 0
-                if pg.sorted and cfg["date_preset"] != "All dates" and (last is False or (n_out and not n_in and not n_unk)):
+                if pg.sorted and in_order and cfg["date_preset"] != "All dates" and (last is False or (n_out and not n_in and not n_unk)):
                     st.stopped_by_date = True  # the website sorts by date: everything after this offer is older
                     prog.say(f"{label}: the website's newest-first list reached offers older than the range -> website finished")
                     break
@@ -417,14 +548,15 @@ def scan_source(sid, cfg, fetcher, prog, t0):
                 if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
                     status = "partially_completed"
                     break
-                if time.time() - t_site > cfg.get("max_site_duration", 1200):  # one website never holds a whole run
+                if time.time() - t_site > site_limit:  # one website never holds a whole run
                     status, err = "partially_completed", "time limit for this website reached"
                     break
         except AccessError as e:
             status, err = "blocked", str(e)
             LOG.warning("%s | %s", label, err)
         except Exception as e:
-            status, err = ("failed" if pages == 0 else "partially_completed"), str(e)
+            # nothing read at all (its job platform down, the fallbacks found nothing): failed, so it is read again
+            status, err = ("failed" if pages == 0 or not (found or listed) else "partially_completed"), str(e)
             LOG.warning("%s | failed: %s", label, err)
         if status == "completed" and st.truncated:
             status, err = "partially_completed", "max pages limit reached"
@@ -436,6 +568,9 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         prog.inc("loc_x", st.abroad)  # the 'Not France / not wanted' tile counts them, though their page was never opened
         if st.abroad:
             prog.say(f"{label}: {st.abroad} offers placed outside France on the list: not opened")
+        if st.moved:  # the page moved: read at the address its home page links, which the user should write instead
+            err = f"{err}; " if err else ""
+            err += f"page moved: read at {st.moved} (update this website's address)"
         src.status, src.last_scan, src.pages_visited, src.jobs_found = status, utcnow(), pages, found
         src.last_error, src.platform, src.listed = err, st.platform, listed
         src.outcome, note = read_outcome(s, src.url, status, found, listed, st)
@@ -445,8 +580,13 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         prog.say(f"END {label}: {status} {err}")
 
 
+MERGE_EVERY = 120  # seconds: the duplicates are merged this often while websites are read, then once all are read
+
+
 def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
-    """Crawl every page of every source, apply date / France / title filters, then optionally run `then(prog)`."""
+    """Crawl every page of every source and apply the date / France / title filters to each website as soon as it is read.
+    then(prog, feed): the AI analysis. It starts with the scan and receives each website's remaining offers through `feed`
+    while the next websites are being read; it ends when the feed is closed (every website read) and empty."""
     cfg = {**run_config(cfg), "_profile": profile}  # the crawler uses the profile to open relevant / doubtful jobs first
     cfg["_gate"] = make_gate(cfg)  # date_decision for the chosen range: True inside | False outside | None unknown
     prog.reset()
@@ -456,6 +596,36 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     t0 = time.time()
     with SessionLocal() as s:  # an analysis / a CV match kept from an earlier scan is reused only for the same profile / CVs
         cfg["_profile_key"], cfg["_cv_key"] = profile_key(profile), cv_key(s)
+    feed, filtering, handed, merged_at = Feed(), threading.Lock(), set(), [time.time()]
+
+    def hand_over(sids=None):
+        """The offers of websites just read (sids; None: every website, once all are read) go through the filters, and
+        the remaining ones to the AI. One website at a time: two filters never judge the same duplicates at once."""
+        with filtering, SessionLocal() as s:
+            fresh = [x for x in (sids if sids is not None else source_ids) if x not in handed]
+            if fresh:  # offers kept from an earlier scan, filtered but not analysed: filtered again with this scan's settings
+                reset_filters(s, fresh)
+                handed.update(fresh)
+            merge = sids is None or time.time() - merged_at[0] > MERGE_EVERY
+            st = apply_filters(s, cfg, profile, source_ids=sids, merge=merge)
+            if merge:
+                merged_at[0] = time.time()
+            for k, v in st.items():
+                prog.inc(k, v)
+            if then:
+                q = s.query(Job).filter(Job.status.in_(["candidate", "review"]), Job.relevance_score.is_(None))
+                if sids is not None:
+                    q = q.filter(Job.source_id.in_(list(sids)))
+                prog.inc("ai_total", feed.put(q.all()))
+
+    def hand_over_safe(sids):
+        try:
+            hand_over(sids)
+        except Exception as e:  # pragma: no cover - the final hand-over takes these offers
+            prog.say(f"filters of website {sids} postponed to the end of the reading: {e}")
+
+    # the filters run in their own thread (about 1 s per website, 60 ms per offer): the readers go on to the next website
+    filters = ThreadPoolExecutor(max_workers=1, thread_name_prefix="filters")
 
     def one(sid):  # websites are read in parallel (the polite delay is per host); each one has its own HTTP session
         if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
@@ -465,12 +635,14 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
         except Exception as e:  # pragma: no cover - scan_source records its own errors
             prog.say(f"website {sid} crashed: {e}")
         prog.inc("sources_done")
+        filters.submit(hand_over_safe, [sid])
 
     def again(sid):  # a website that was down, or refused once, gets one more calm try after the others
         if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
             return
         calm = {**cfg, "timeout": cfg["timeout"] * 2, "retries": 0}
         scan_source(sid, calm, Fetcher(calm, prog.say), prog, t0)
+        filters.submit(hand_over_safe, [sid])
 
     def explain_dead(sid):  # the page is gone: the website's home page may link its new address
         with SessionLocal() as s:
@@ -480,6 +652,19 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
                 src.last_error = f"{src.last_error}; possible new address: {page}"
                 s.commit()
 
+    def analyse():
+        try:
+            then(prog, feed)
+        except Exception as e:  # never crash silently
+            prog.say(f"FATAL (AI analysis) {e}")
+
+    ai = threading.Thread(target=analyse, name="ai-analysis", daemon=True) if then else None
+    if not cfg.get("respect_robots", True):
+        prog.say("robots.txt is not followed during this scan (setting 'Respect robots.txt' off); anti-bot pages, logins "
+                 "and captchas are still never bypassed")
+    if ai:
+        ai.start()
+        prog.say("the AI analyses each website's offers as soon as the website is read")
     try:
         with ThreadPoolExecutor(max_workers=int(cfg["parallel_sites"])) as ex:
             list(ex.map(one, source_ids))
@@ -497,14 +682,17 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
                 src.health = health_note(s, src, cfg["date_preset"])
             s.commit()
         prog.set(task="filtering")
-        with SessionLocal() as s:
-            reset_filters(s)
-            prog.set(**apply_filters(s, cfg, profile))
-        if then and not prog.cancel.is_set():
-            then(prog)
+        filters.shutdown(wait=True)
+        hand_over(None)  # every offer still waiting, and the duplicates of every website merged
     except Exception as e:  # never crash silently
         prog.say(f"FATAL {e}")
     finally:
+        filters.shutdown(wait=True)
+        feed.close()
+        if ai:
+            if ai.is_alive():
+                prog.set(task="AI analysis")
+            ai.join()
         try:  # the offers read in the last 24 hours, with their analysis, are kept for the next scans (even a stopped one)
             with SessionLocal() as s:
                 n = keep_recent_offers(s)

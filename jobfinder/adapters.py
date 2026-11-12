@@ -60,6 +60,7 @@ class Page:
     seen: int = 0  # jobs of this page already known and inside the range (they prove the list is not finished)
     ordered: bool = True  # the list is sorted newest first: pages of old jobs mean the list is finished
     sorted: bool = False  # the WEBSITE sorts this list by date (its own sort): the first old offer ends the list
+    dates: list | None = None  # the dates of the page's offers in list order, those left unopened included (generic pages)
 
 
 @dataclass
@@ -77,6 +78,9 @@ class ScanState:
     skipped: int = 0  # offers on the list that were not opened because their title is clearly not wanted
     abroad: int = 0  # offers on the list that were not opened because their card places them outside France only
     page_titles: list = field(default_factory=list)  # offer titles on the website's own page, when its reader was found there
+    platform_error: str = ""  # the website's job platform failed for a passing reason (HTTP 503, timeout)
+    moved: str = ""  # the page is gone and the website's home page links its career page: this address is read instead
+    order: list = field(default_factory=list)  # the dates of the website's offers in list order (see date_order)
 
 
 def _raw(title, url, **kw):
@@ -98,6 +102,21 @@ def _get_date(r):
 
 _TRUSTED_SOURCES = re.compile(r"api|feed|workday|smartrecruiters|successfactors list|icims|talentsoft|wordpress|breezy|recruitee|lever|"
                               r"greenhouse|ashby|JSON-LD|job description|pdf (?:creation date|upload month)")
+
+
+def date_order(dates):
+    """Whether a list really goes from its newest offers to its oldest: True | False | None (fewer than 3 dates: unknown).
+    Only a list proved newest first may be left at its first old offers. Checked on the dates the website shows, never
+    assumed from its sort option: Choisir le service public mixes old and new offers on every page (182 offers of the
+    last 7 days were missed after two pages of old ones), Randstad Digital's 'sort by date' is not the publication date
+    (38 missed; one newer offer among its first ten). An inversion is a newer offer after an older one (by more than a
+    day). Allowed: the first two offers (pinned at the top of the list), and one inversion per 50 dated offers (an offer
+    published again)."""
+    ds = [d for d in dates if d]
+    if len(ds) < 3:
+        return None
+    inversions = sum(1 for i, (a, b) in enumerate(zip(ds, ds[1:])) if i >= 2 and b > a + timedelta(days=1))
+    return inversions <= len(ds) // 50
 
 
 def distrust_shared_dates(jobs):
@@ -657,6 +676,51 @@ def crawl_feed(f, arg, cfg, known, st):
             raw = _open_detail(f, cfg, raw, budget)
         jobs.append(raw)
     yield Page("feed", feed_url, jobs, total=1, ordered=False)
+    if flavor == "teamtailor" and len(items) >= _TT_FEED_MAX:
+        yield from _teamtailor_more(f, feed_url, cfg, known, st, jobs, budget)
+
+
+_TT_FEED_MAX = 100  # a Teamtailor feed holds the 100 newest offers (BearingPoint: 140 on its page, 100 in jobs.rss)
+_TT_LINK = re.compile(r"/jobs/\d+-[^\"'?#\s<>]+")
+
+
+def _teamtailor_more(f, feed_url, cfg, known, st, feed_jobs, budget):
+    """The offers after the feed's 100, from the career site's own 'show more' pages (20 per page, newest first, the same
+    order as the feed). Read only when the feed's oldest offer is still inside the date range: otherwise every offer it
+    left out is older still."""
+    dates = [j["date"] for j in feed_jobs if j.get("date")]
+    gate = cfg.get("_gate")
+    if dates and gate and len(dates) == len(feed_jobs) and gate(min(dates), 0.9, "") is False:
+        return
+    origin = feed_url.rsplit("/jobs.rss", 1)[0]
+    have = {normalize_url(j["url"]) for j in feed_jobs} | set(known)
+    f.note(f"the Teamtailor feed holds its {_TT_FEED_MAX} newest offers, the oldest still inside the range: reading the rest "
+           "on the career site's pages")
+    old_run = 0
+    for n in range(_TT_FEED_MAX // 20 + 1, cfg["max_pages"]):
+        r = f.get(f"{origin}/jobs/show_more?page={n}")
+        # a Turbo stream: the offers' cards come inside <template> tags, whose texts BeautifulSoup leaves out of get_text()
+        soup, jobs, cards = BeautifulSoup(re.sub(r"</?template>", "", r.text), PARSER), [], {}
+        for a in soup.find_all("a", href=True):  # an offer can have several links (picture, title): its longest text
+            if _TT_LINK.search(a["href"]):
+                u, t = normalize_url(urljoin(origin + "/", a["href"])), a.get_text(" ", strip=True)[:200]
+                if len(t) >= len(cards.get(u, ("", None))[0]):
+                    cards[u] = (t, a.find_parent("li") or a.parent)
+        links = len(cards)
+        for u, (title, card) in cards.items():
+            if u in have:
+                continue
+            have.add(u)
+            places = [x.get_text(" ", strip=True) for x in card.find_all("span")] if card else []
+            place = next((p for p in places if p and classify_location(p)["location_verified"]), "")
+            title = title or re.sub(r"^\d+-", "", u.rsplit("/", 1)[-1]).replace("-", " ")
+            raw = _raw(title, u, location=place, conf=0.7, provenance="teamtailor-page")
+            raw = _open_detail(f, cfg, raw, budget)
+            jobs.append(raw)
+            old_run = old_run + 1 if raw.get("date") and raw_verdict(cfg, raw) is False else 0
+        yield Page(f"show_more={n}", r.url, jobs, sorted=True)
+        if not links or old_run >= 2:  # the end of the list, or two offers in a row older than the range (newest first)
+            return
 
 
 # --------------------------------------------------------------------------- Talentsoft (Cegid)
@@ -1822,6 +1886,9 @@ _FEED_TITLE = re.compile(r"job|offre|emploi|career|carri|recrut|poste|vacanc|ope
                          r"phd|doctora", re.I)
 
 
+_SF_MARK = re.compile(r"jobs2web|/platform/(?:js|css)/j2w/|rmkcdn\.successfactors\.com")
+
+
 def detect_from_page(f, url, html):
     """The platform behind a company's own career page: its links, embeds, feeds and markers."""
     soup = BeautifulSoup(html, PARSER)
@@ -1829,7 +1896,10 @@ def detect_from_page(f, url, html):
     for name, arg in (("jibe", _jibe_arg(url, html)), ("phenom", _phenom_arg(url, html))):
         if arg:  # before iCIMS / Workday: these sites link their apply forms there
             return name, arg
-    if "jobs2web" in low or ("j2w" in low and "rmk" in low) or soup.select_one("tr.data-row a.jobTitle-link"):
+    # SuccessFactors' own files ('/platform/js/j2w/', 'rmkcdn.successfactors.com'), never the letters 'j2w' and 'rmk' alone:
+    # they turn up in the random state token of ASP.NET pages (CEA's Talentsoft site was read as SuccessFactors one time
+    # in a few: no dates, 300 offer pages opened)
+    if _SF_MARK.search(low) or soup.select_one("tr.data-row a.jobTitle-link"):
         return "successfactors", url
     rmk = next((urljoin(url, a["href"]) for a in soup.find_all("a", href=True) if "optionsFacetsDD_" in a["href"]), None)
     if rmk and syntactic_ok(rmk):  # a link to the company's SuccessFactors job search (Eviden -> jobs.atos.net)
@@ -1853,7 +1923,13 @@ def detect_from_page(f, url, html):
         if m[1].lower() not in _ICIMS_SKIP:
             return "icims", f"https://{m[1].lower()}.icims.com/jobs/search?ss=1"
     if "teamtailor" in low and re.search(r"teamtailor-cdn|teamtailor\.com/(?:assets|jobs)|tt\.teamtailor\.com", low):
-        return "teamtailor", (_origin(url) + "/jobs.rss", "teamtailor")
+        # the career site may live on another address than this page (prophesee.ai/careers -> careers.prophesee.ai/jobs/...):
+        # the feed is on the site its offers' links point to
+        home = urlparse(url).hostname or ""
+        site = ".".join(home.split(".")[-2:])
+        offer = next((urljoin(url, a["href"]) for a in soup.find_all("a", href=True)
+                      if re.search(r"/jobs/\d+-", a["href"]) and (urlparse(urljoin(url, a["href"])).hostname or "").endswith(site)), None)
+        return "teamtailor", (_origin(offer or url) + "/jobs.rss", "teamtailor")
     ts = urlparse(url).hostname.endswith(".talent-soft.com") or "offerrss.ashx" in low or (
         "talentsoft" in low and re.search(r"detailoffre\.aspx|/offre-de-emploi/|handlers/", low))
     board = url if ts else next((urljoin(url, a["href"]) for a in soup.find_all("a", href=True)

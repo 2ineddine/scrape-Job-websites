@@ -194,6 +194,18 @@ hr { border-color: var(--line) !important; }
 .jf-cov-seg.red, .jf-cov-key.red { background: var(--red); }
 .jf-cov-seg.grey, .jf-cov-key.grey { background: #3A4A66; }
 
+/* ---- websites that did not work: one group per problem; the reasons wrap */
+.jf-probs { display: flex; flex-direction: column; gap: 16px; margin: 2px 0 6px; }
+.jf-prob-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; color: var(--ink); }
+.jf-prob-head span { font-weight: 400; color: var(--ink-dim); }
+.jf-prob-list { list-style: none; margin: 6px 0 0; padding: 0; border-top: 1px solid var(--line-soft); }
+.jf-prob-list li { padding: 8px 0 9px; border-bottom: 1px solid var(--line-soft); font-size: 13px; line-height: 1.45; }
+.jf-prob-list a { color: var(--accent-soft); font-weight: 600; text-decoration: none; }
+.jf-prob-list a:hover { text-decoration: underline; }
+.jf-prob-file { color: var(--ink-faint); font-size: 12px; }
+.jf-prob-why { color: var(--ink-dim); overflow-wrap: anywhere; }
+.jf-prob-do { color: var(--ink); overflow-wrap: anywhere; }
+
 /* ---- slim scrollbars */
 * { scrollbar-width: thin; scrollbar-color: #2C3F62 transparent; }
 

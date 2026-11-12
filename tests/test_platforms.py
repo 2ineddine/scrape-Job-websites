@@ -2121,6 +2121,17 @@ def test_offers_of_the_last_24_hours_are_kept_with_their_analysis():
         assert kept["rel"].status == "new" and kept["rel"].relevance_score is None and kept["rel"].description == "missions"
 
 
+def test_an_analysis_made_with_older_rules_is_not_kept(monkeypatch):
+    """A CDD read as an internship in the morning stayed excluded after the contract rule was fixed: the version of the
+    analysis rules is part of the key an analysis is reused with."""
+    from jobfinder import store
+    from jobfinder.config import PROFILE_DEFAULT
+    before = store.profile_key(PROFILE_DEFAULT)
+    assert store.profile_key(PROFILE_DEFAULT) == before  # same rules, same profile: reused
+    monkeypatch.setattr(store, "ANALYSIS_RULES", store.ANALYSIS_RULES + 1)
+    assert store.profile_key(PROFILE_DEFAULT) != before  # the app's rules changed: analysed again
+
+
 def test_an_undated_offer_seen_long_ago_is_returned_with_the_day_it_was_first_seen():
     """No publication date: the offer is never hidden for its age; it shows the earliest day the app knows it was online
     (its memory of the offers, or the statistics history), even outside the date range."""
@@ -2236,3 +2247,263 @@ def test_a_billed_model_answers_at_most_its_share_of_a_scan(monkeypatch):
     with pytest.raises(llm.AIError):
         llm.call_json("u3", A, cfg, s, keys)
     assert len(calls) == 2
+
+
+def test_a_card_title_must_agree_with_the_offer_address():
+    # Sia Partners: the first link of each card only shows the offer's category ('Consulting', 'AI & Tech'); taken as the
+    # title, it made 115 offers look unwanted and left them unopened. The card's element that names the offer is taken.
+    from jobfinder.crawler import _card_title
+    card = ('<div class="bloc_result"><div class="result_img"><a href="/en/career/{s}"><span class="tag_role">{c}</span></a></div>'
+            '<div class="result_career"><p class="tag_categ">IT Strategy</p><p class="title_result">{t}</p>'
+            '<div class="result_bot"><p class="adress">Lyon, France</p><a href="/en/career/{s}">I\'m interested</a></div></div></div>')
+    offers = [("consultante-data-science-bureau-de-lyon", "Consulting", "Consultant(e) Data Science - Bureau de Lyon"),
+              ("consultant-data-analyst", "AI &amp; Tech", "Consultant – Data Analyst")]
+    soup = BeautifulSoup("<div>" + "".join(card.format(s=s, c=c, t=t) for s, c, t in offers) + "</div>", "html.parser")
+    base = "https://sia.com/en/opportunities"
+    assert [_card_title(soup, base, f"https://sia.com/en/career/{s}") for s, _, _ in offers] == \
+        ["Consultant(e) Data Science - Bureau de Lyon", "Consultant – Data Analyst"]
+    # nothing on the card agrees with the address: no title, so the offer is opened instead of being judged by a label
+    soup = BeautifulSoup('<a href="/en/career/ingenieur-vision-par-ordinateur"><span>Design</span></a>', "html.parser")
+    assert _card_title(soup, base, "https://sia.com/en/career/ingenieur-vision-par-ordinateur") == ""
+    # an address made of numbers says nothing about the title: the link's text is taken as before
+    soup = BeautifulSoup('<a href="/jobs/12345">Ingénieur IA (H/F)</a>', "html.parser")
+    assert _card_title(soup, "https://co.fr/jobs", "https://co.fr/jobs/12345") == "Ingénieur IA (H/F)"
+
+
+def test_offers_past_the_job_page_budget_are_kept_from_their_cards():
+    # the website's job-page budget is used up: the next offers are kept as their cards show them, never dropped
+    from jobfinder.crawler import crawl_generic
+    f = SiteFetcher({"/offres": _undated_list(6), "/jobs/data-scientist-machine-learning-": lambda u: _dated_offer(1, 9)})
+    st, cfg = ScanState(), {**CFG(), "max_details_per_source": 2}
+    jobs = [j for pg in crawl_generic(f, "https://co.fr/offres", cfg, set(), st) for j in pg.jobs]
+    assert len(jobs) == 6 and sum("/jobs/" in u for u in f.calls) == 2 and st.details_capped
+    kept = [j for j in jobs if j["provenance"] == "list-only"]
+    assert len(kept) == 4 and kept[0]["title"].startswith("Data Scientist")
+    # an offer page robots.txt closes is kept from its card too, without being requested
+    f = SiteFetcher({"/offres": '<a href="/closed/jobs/ingenieur-vision-3d">Ingénieur vision 3D (H/F)</a>'})
+    jobs = [j for pg in crawl_generic(f, "https://co.fr/offres", CFG(), set(), ScanState()) for j in pg.jobs]
+    assert [j["title"] for j in jobs] == ["Ingénieur vision 3D (H/F)"] and not any("/closed/" in u for u in f.calls)
+
+
+def test_a_job_platform_down_for_a_moment_fails_the_website_so_it_is_read_again(monkeypatch):
+    # Parrot: Talentview answered HTTP 503, the page itself shows no offer: 'completed, no offer' hid the failure; the
+    # website fails with the platform's reason instead, which the scan's second try reads again
+    from jobfinder import crawler
+    from jobfinder.crawler import crawl_source
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+    monkeypatch.setattr(crawler, "detect_platform", lambda f, url, st=None: ("talentview", "parrot-drones"))
+
+    def down(*a, **k):
+        raise ConnectionError("HTTP 503")
+        yield
+    monkeypatch.setitem(crawler.ADAPTERS, "talentview", down)
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    cfg = {**CFG(), "_keys": None}
+    try:
+        list(crawl_source(F({"parrot.com/en/jobs": "<html><body><h1>Jobs</h1></body></html>"}), "https://www.parrot.com/en/jobs",
+                          cfg, set(), ScanState()))
+        assert False, "must fail"
+    except ConnectionError as e:
+        assert "talentview reader: HTTP 503" in str(e)
+    from jobfinder.scan import _RETRY
+    assert _RETRY.search("talentview reader: HTTP 503")
+
+
+def test_no_ai_browser_once_the_lists_offers_were_read_and_left_out(monkeypatch):
+    # a Welcome Kit page whose only offer is a sales job: the list was read, the AI browser would only find it again
+    from jobfinder import browser, crawler, pagereader
+    from jobfinder.crawler import crawl_source
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+    monkeypatch.setattr(pagereader, "read_page", lambda *a, **k: iter(()))
+    started = []
+    monkeypatch.setattr(browser, "crawl_ai", lambda *a, **k: started.append(1) or iter(()))
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    page = '<html><ul><li><a href="/jobs/sales-manager-uk-nordics_london"><h3>Sales Manager - UK &amp; Nordics</h3></a></li></ul></html>'
+    st = ScanState()
+    jobs = [j for pg in crawl_source(F({"lighton.welcomekit.co": page}), "https://lighton.welcomekit.co/", {**CFG(), "_keys": {}},
+                                     set(), st) for j in pg.jobs]
+    assert jobs == [] and st.skipped == 1 and not started
+
+
+def test_a_teamtailor_feed_is_read_where_the_offers_live():
+    page = ('<html><head><link href="https://teamtailor-cdn.com/x.css"></head><body><a href="https://careers.prophesee.ai/jobs/'
+            '8696107-senior-electronics-engineer-f-m-x">Senior Electronics Engineer</a></body></html>')
+    assert detect_from_page(None, "https://www.prophesee.ai/careers", page) == \
+        ("teamtailor", ("https://careers.prophesee.ai/jobs.rss", "teamtailor"))
+
+
+def test_a_career_page_that_moved_is_read_at_the_address_the_home_page_links(monkeypatch):
+    # LISN: '/job-offers' answers 404; the home page links 'Nous rejoindre': it is read, and the note asks to update the
+    # address (before, the website failed at every scan)
+    from jobfinder import crawler
+    from jobfinder.crawler import crawl_source
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    home = '<html><a href="/nous-rejoindre">Nous rejoindre</a><a href="/le-labo">Le labo</a></html>'
+    jobs_page = "<ul>" + "".join(f'<li><a href="/offres/ingenieur-vision-{i}">Ingénieur vision {i} (H/F)</a></li>' for i in range(3)) + "</ul>"
+    f = F({"lisn.fr/job-offers": lambda u: (_ for _ in ()).throw(ConnectionError("HTTP 404")),
+           "lisn.fr/nous-rejoindre": jobs_page, "lisn.fr/offres/ingenieur-vision-": lambda u: _dated_offer(1, 9),
+           "https://lisn.fr/": home})
+    st = ScanState()
+    jobs = [j for pg in crawl_source(f, "https://lisn.fr/job-offers", {**CFG(), "_keys": None}, set(), st) for j in pg.jobs]
+    assert len(jobs) == 3 and st.moved == "https://lisn.fr/nous-rejoindre" and "+moved" in st.platform
+    assert any("update this website's address" in n for n in f.notes)
+
+
+def test_a_date_sort_that_does_not_follow_the_publication_dates_is_read_to_the_end():
+    # Randstad Digital: '?sortBy=date' gives 11-10, 11-06, 11-09, then old offers, then recent ones again: two old offers in
+    # a row do not end such a list (38 offers of the last 7 days were missed)
+    from datetime import datetime, timedelta
+    from jobfinder.crawler import crawl_generic
+    now = datetime.utcnow()
+    ages = [0, 1, 4, 2, 40, 40, 3, 40]  # days since publication, in list order
+
+    def offer(u):
+        i = int(u.rsplit("-", 1)[1])
+        d = (now - timedelta(days=ages[i])).strftime("%Y-%m-%d")
+        return (f'<html><head><script type="application/ld+json">{{"@type": "JobPosting", "title": "Data Scientist {i}",'
+                f'"datePosted": "{d}", "description": "missions profil candidature"}}</script></head></html>')
+    f = SiteFetcher({"offres?sort=date": _undated_list(len(ages)), "/jobs/data-scientist-machine-learning-": offer})
+    jobs = [j for pg in crawl_generic(f, "https://co.fr/offres?sort=date", CFG(date_preset="Last 7 days"), set(), ScanState())
+            for j in pg.jobs]
+    assert len(jobs) == len(ages)  # every offer opened, the recent ones after the old ones included
+    assert any("does not follow the publication dates" in n for n in f.notes)
+
+
+def test_a_date_sort_lost_on_the_next_page_is_not_trusted_there():
+    # Randstad Digital: page 1 is '?sortBy=date', its 'next' link '/page-2/' drops the sort. Page 2 starts with two old
+    # offers, then has offers of the week: they must be opened
+    from datetime import datetime, timedelta
+    from jobfinder.crawler import crawl_generic
+    now = datetime.utcnow()
+    ages = {f"p1-{i}": a for i, a in enumerate([0, 1, 2, 3])} | {f"p2-{i}": a for i, a in enumerate([40, 41, 1, 2])}
+
+    def offer(u):
+        k = u.rsplit("/", 1)[1].replace("data-scientist-", "")
+        d = (now - timedelta(days=ages[k])).strftime("%Y-%m-%d")
+        return (f'<html><head><script type="application/ld+json">{{"@type": "JobPosting", "title": "Data Scientist {k}",'
+                f'"datePosted": "{d}", "description": "missions profil candidature"}}</script></head></html>')
+    page = lambda p, nxt: ("<ul>" + "".join(f'<li><a href="/jobs/data-scientist-{p}-{i}">Data Scientist {p}-{i}</a></li>' for i in range(4))
+                           + "</ul>" + (f'<a rel="next" href="{nxt}">Suivant</a>' if nxt else ""))
+    f = SiteFetcher({"/offres?sortBy=date": page("p1", "/offres/page-2/"), "/offres/page-2/": page("p2", None),
+                     "/jobs/data-scientist-": offer})
+    jobs = [j for pg in crawl_generic(f, "https://co.fr/offres?sortBy=date", CFG(date_preset="Last 7 days"), set(), ScanState())
+            for j in pg.jobs]
+    assert {j["title"] for j in jobs} >= {"Data Scientist p2-2", "Data Scientist p2-3"}
+    assert any("do not keep the website's date sort" in n for n in f.notes)
+
+
+def test_a_random_page_token_is_not_read_as_a_successfactors_marker():
+    # CEA (Talentsoft, ASP.NET): its __VIEWSTATE changes at every visit and sometimes holds the letters 'j2w' and 'rmk'
+    state = "dDwtMTA4j2wNzU5OTt0PDtsPGk8MT47rmkPjtsPHQ8O2w8aTwxPjs"
+    page = (f'<html><input type="hidden" name="__VIEWSTATE" value="{state}"><script src="/talentsoft/x.js"></script>'
+            '<a href="/offre-de-emploi/emploi-ingenieur-ia_42511.aspx">Ingénieur IA</a></html>')
+    name, _ = detect_from_page(None, "https://www.emploi.cea.fr/offre-de-emploi/liste-offres.aspx?LCID=1036", page)
+    assert name == "talentsoft"
+    sf = '<html><script src="/platform/js/j2w/j2w.fallbacks.js"></script></html>'
+    assert detect_from_page(None, "https://careers.idemia.com/", sf)[0] == "successfactors"
+
+
+def test_hellowork_is_searched_with_the_profile_keywords_inside_the_date_range(monkeypatch):
+    # robots.txt closes Hellowork's search and every address with '?': each keyword of the profile is read on its keyword
+    # page and its job-title page (20 newest offers each). An offer whose card date is outside the range is never opened,
+    # an offer found under two keywords is read once, the links to other keyword pages are not offers
+    from jobfinder import crawler
+    from jobfinder.config import HW_KEYWORDS_URL
+    from jobfinder.crawler import crawl_source, hellowork_keyword_pages
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+    cfg = {**CFG(date_preset="Last 7 days"), "_keys": None, "_profile": {**CFG()["_profile"], "keywords": ["vision par ordinateur", "data scientist"]}}
+    assert hellowork_keyword_pages(cfg) == [
+        "https://www.hellowork.com/fr-fr/emploi/mot-cle_vision-par-ordinateur.html",
+        "https://www.hellowork.com/fr-fr/emploi/metier_vision-par-ordinateur.html",
+        "https://www.hellowork.com/fr-fr/emploi/mot-cle_data-scientist.html",
+        "https://www.hellowork.com/fr-fr/emploi/metier_data-scientist.html"]
+
+    def card(i, age):
+        return (f'<li><a href="/fr-fr/emplois/{i}.html"><h3>Ingénieur vision {i} H/F</h3></a><span>Paris - 75</span>'
+                f'<span>Publiée il y a {age} jours</span></li>')
+    vision = "<ul>" + card(1, 1) + card(2, 40) + "</ul>" + '<a href="/fr-fr/emploi/mot-cle_intelligence-artificielle.html">Offres d\'emploi Intelligence artificielle</a>'
+    data = "<ul>" + card(1, 1) + card(3, 2) + "</ul>"
+    offer = lambda u: _dated_offer(int(u.rsplit("/", 1)[1][:-5]), 9)
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return "?" not in url
+    f = F({"mot-cle_vision-par-ordinateur.html": vision, "metier_data-scientist.html": data, "/fr-fr/emplois/": offer})
+    st = ScanState()
+    jobs = [j for pg in crawl_source(f, HW_KEYWORDS_URL, cfg, set(), st) for j in pg.jobs]
+    assert sorted(j["url"] for j in jobs) == ["https://www.hellowork.com/fr-fr/emplois/1.html", "https://www.hellowork.com/fr-fr/emplois/3.html"]
+    assert not any(c.endswith("/2.html") for c in f.calls)  # its card says 40 days: outside the range, never opened
+    assert sum(c.endswith("/1.html") for c in f.calls) == 1  # under two keywords, read once
+    assert not any("mot-cle_intelligence-artificielle" in c for c in f.calls)  # another keyword's list, not an offer
+    assert st.platform == "hellowork (profile keywords)"
+
+
+def test_the_hellowork_search_is_a_source_only_when_ticked():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.config import HW_KEYWORDS_URL
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as s:
+        ids = store.keyword_sources(s, {"hellowork_keywords": True})
+        assert len(ids) == 1 and s.get(store.Source, ids[0]).url == HW_KEYWORDS_URL
+        assert store.keyword_sources(s, {}) == ids  # on by default, added once
+        assert store.keyword_sources(s, {"hellowork_keywords": False}) == [] and s.query(store.Source).count() == 0
+
+
+def test_robots_txt_can_be_switched_off_before_a_scan(monkeypatch):
+    from jobfinder import web
+    from jobfinder.config import run_config
+    calls = []
+
+    class R:
+        status_code, text = 200, "User-agent: *\nDisallow: /*?\nSitemap: https://h.fr/sm.xml\n"
+    f = web.Fetcher(run_config({"respect_robots": True}))
+    monkeypatch.setattr(f, "request", lambda m, u, _robots=False, **k: calls.append(u) or R())
+    assert not f.robots_ok("https://h.fr/emploi/recherche.html?k=ia") and f.sitemaps("https://h.fr/") == ["https://h.fr/sm.xml"]
+    g = web.Fetcher(run_config({"respect_robots": False}))  # the user's setting is not overridden by the fixed limits
+    monkeypatch.setattr(g, "request", lambda m, u, _robots=False, **k: calls.append(u) or R())
+    assert g.robots_ok("https://h.fr/emploi/recherche.html?k=ia")
+    assert g.sitemaps("https://h.fr/") == ["https://h.fr/sm.xml"]  # robots.txt still names the sitemaps
+
+
+def test_with_robots_txt_off_hellowork_s_search_is_read_page_after_page_until_the_range_ends(monkeypatch):
+    from jobfinder import crawler
+    from jobfinder.config import HW_KEYWORDS_URL
+    from jobfinder.crawler import crawl_source
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+
+    def card(i, age):
+        return (f'<li><a href="/fr-fr/emplois/{i}.html"><h3>Ingénieur vision {i} H/F</h3></a><span>Paris - 75</span>'
+                f'<span>Publiée il y a {age} jours</span></li>')
+    page1 = "<ul>" + "".join(card(i, 1) for i in range(30)) + "</ul>"            # 30 offers of yesterday
+    page2 = "<ul>" + card(30, 2) + "".join(card(i, 40) for i in range(31, 60)) + "</ul>"  # then older than the range
+    offer = lambda u: _dated_offer(1, 9)
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    cfg = {**CFG(date_preset="Last 7 days"), "_keys": None, "respect_robots": False,
+           "_profile": {**CFG()["_profile"], "keywords": ["vision par ordinateur"]}}
+    f = F({"recherche.html?k=vision+par+ordinateur&st=date&p=2": page2, "recherche.html?k=vision+par+ordinateur&st=date": page1,
+           "/fr-fr/emplois/": offer})
+    jobs = [j for pg in crawl_source(f, HW_KEYWORDS_URL, cfg, set(), ScanState()) for j in pg.jobs]
+    assert len(jobs) == 31  # page 1, and the one recent offer of page 2
+    assert not any("p=3" in c for c in f.calls)  # page 2 reached offers older than the range: the search ends
+    assert not any(c.endswith(f"/{i}.html") for c in f.calls for i in range(31, 60))  # old cards: never opened
+    # a Hellowork search address of a website file keeps its own filters (place, contract), sorted newest first
+    g = F({"recherche.html?k=stage+deep+learning&l=": page2, "/fr-fr/emplois/": offer})
+    url = "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+deep+learning&l=Paris&c=Stage"
+    assert len([j for pg in crawl_source(g, url, cfg, set(), ScanState()) for j in pg.jobs]) == 1
+    assert "l=Paris" in g.calls[0] and "c=Stage" in g.calls[0] and "st=date" in g.calls[0]

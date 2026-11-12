@@ -160,3 +160,38 @@ def test_date_first_gate():
     cd = _card_dates(BeautifulSoup(html_cards, "html.parser"), "https://x.com/jobs", n16)
     assert cd["https://x.com/jobs/1"][0] == n16 - timedelta(days=40) and cd["https://x.com/jobs/2"][0] == n16 - timedelta(days=1)
     assert "https://x.com/jobs/3" not in cd  # a deadline is not a publication date
+
+
+def test_the_dates_of_similar_offers_on_a_job_page_are_not_the_offers_date():
+    # Choisir le service public: every offer page lists 'Offres similaires', each 'En ligne depuis le 10 novembre 2026'; the
+    # offer's own date (JSON-LD and list card: 3 November) was replaced by theirs, which can move a new offer out of a
+    # 24-hour range as well as bring an old one in
+    from jobfinder.adapters import _parse_detail
+    now = datetime(2026, 11, 11, 12)
+    similar = "".join(f"<li>Offre {i} Employeur : Communes En ligne depuis le 10 novembre 2026</li>" for i in range(5))
+    page = ('<html><script type="application/ld+json">{"@type":"JobPosting","title":"TRACFIN - Data scientist",'
+            '"datePosted":"2026-11-03","description":"Missions : analyse de données."}</script><body><main>'
+            f"<h1>TRACFIN - Data scientist</h1><h2>Offres similaires</h2><ul>{similar}</ul></main></body></html>")
+    assert _parse_detail(page, "https://csp.gouv.fr/offre-emploi/tracfin", now)["date"] == datetime(2026, 11, 3)
+    # one later date in the page, outside the offer's text, does not replace its structured date either
+    page2 = page.replace(similar, "<li>Offre 1 En ligne depuis le 10 novembre 2026</li>")
+    assert _parse_detail(page2, "https://csp.gouv.fr/offre-emploi/tracfin", now)["date"] == datetime(2026, 11, 3)
+
+
+def test_pasted_addresses_are_read_one_per_line_without_quotes():
+    # the box says 'One URL per line': plain lines were refused (only quoted addresses were read) and its button stayed off
+    from jobfinder.web import extract_urls, pasted_urls
+    text = "https://www.equans.com/join-us\n  https://jobs.stationf.co/companies/beamy,\n'https://x.fr/jobs'\nnot an address"
+    assert pasted_urls(text) == ["https://x.fr/jobs", "https://www.equans.com/join-us", "https://jobs.stationf.co/companies/beamy"]
+    assert extract_urls("<!-- https://old.fr/jobs -->") == []  # a website FILE keeps its rule: an address in a comment is not read
+
+
+def test_old_saved_settings_get_robots_txt_off_once(monkeypatch):
+    # older versions saved respect_robots=True in every config (a fixed value, not a choice): once off, then the user's choice
+    from jobfinder.config import CONFIG_DEFAULT, upgrade_config
+    from jobfinder.store import _merge
+    saved = _merge(CONFIG_DEFAULT, {"date_preset": "Last 24 hours", "respect_robots": True})  # as the app loads it
+    cfg, changed = upgrade_config(saved)
+    assert changed and cfg["respect_robots"] is False
+    chosen = {**cfg, "respect_robots": True}
+    assert upgrade_config(_merge(CONFIG_DEFAULT, chosen)) == (_merge(CONFIG_DEFAULT, chosen), False)

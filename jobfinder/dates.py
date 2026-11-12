@@ -368,6 +368,13 @@ def _in_window(day, cfg, now):
     return lo <= day <= hi
 
 
+def range_start(cfg, now=None):
+    """The first day of the user's date range (date.min for 'All dates')."""
+    if cfg["date_preset"] == "All dates":
+        return datetime.min.date()
+    return _window(cfg, now or utcnow())[0]
+
+
 def date_decision(pub, conf, cfg, now=None, text=None):
     """-> (True|False|None, explanation). None = unknown. `text` = the original date text: used to check BOTH readings
     of an ambiguous numeric date (06/10/2026) - the job is accepted / rejected only if both readings agree."""

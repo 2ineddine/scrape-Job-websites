@@ -109,9 +109,13 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   A job platform that fails for a moment (HTTP 503) makes the website fail, so the scan reads it again at the end.
 - **Filters, in order**:
   1. **Date**: from evidence only. Refresh, deadline and start dates are never used, nor the dates of other offers shown
-     on an offer's page ("similar offers"): the page's text replaces the offer's own date only with an earlier one. An undated offer is always
+     on an offer's page ("similar offers"): the page's text replaces the offer's own date only with an earlier one. An undated offer is
      returned, marked "not stated", with the first day the app saw it online ("online since", from its memory of the
-     offers or the statistics history): it was published that day or before.
+     offers or the statistics history): it was published that day or before. So once that day is before the date range,
+     the offer is outside the range and leaves the results like a dated offer of that age; a wider range brings it back.
+     With "Last 24 hours", an undated offer shows in the scans of the day it is first seen and the next day (in the scan
+     of 12 Nov 2026, 145 of the 213 relevant offers had no date: Inria, Ensta, Davidson...; before this rule, the same
+     ones came back every day).
   2. **France**: tested against official communes, departments and regions. An offer open in several cities is kept
      when one of them is in France ("Bruxelles | Île-de-France", "Paris, Barcelona", "Munich - Berlin - London - Paris"),
      or when its text says it can be held in France ("living in Germany, France or Italy", "eligible to work from Belgium or
@@ -140,10 +144,18 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
 
 ## Safety
 
-- robots.txt is respected by default. **Respect robots.txt** (step 3) can be switched off before a scan, only for websites
-  you are allowed to read (for example under a partner agreement): the scan's log says so. Either way the app keeps its
-  own name, reads one page per second per website, and never gets around an anti-bot page, a login or a captcha. Blocked
-  websites are reported with the reason.
+- **Respect robots.txt** (step 3) is off by default: the client reads these websites under partner agreements. Off, no
+  robots.txt rule is applied (Hellowork's search and next pages, SmartRecruiters' data feed, every offer page are read),
+  and what robots.txt gives that costs no offer is still used: the sitemaps it lists (3DS: about 700 offers only there),
+  and the pause it asks between two requests (up to 5 seconds, the website then gets more time). On, the app reads only what
+  each website's robots.txt allows. Checked on the 372 websites on 2026-11-12: 336 have a robots.txt, and its rules
+  close pages with offers on 20 of them. Either way the app keeps its own name, reads at most one page per second per
+  website, never loads advertising or tracking requests, and never gets around an anti-bot page, a login or a captcha.
+- **Websites that did not work**: after each scan (and while it runs), the Search page lists every website that was
+  blocked, not reachable, gone (page not found), partly read, read without any offer, possibly incomplete, changed since
+  the last scan or moved, with the reason and what to do; the list downloads as CSV. A career page that says it has no
+  offer now ("We have no job openings at the moment!", "Nous n'avons pas d'offres en ce moment") works: it is not in
+  that list, and no AI browser is opened for it.
 - Text from websites is treated as untrusted. Private network addresses are refused. LaTeX runs without shell escape.
 - The app has no login: keep it on `localhost`, or reach it through an SSH tunnel.
 

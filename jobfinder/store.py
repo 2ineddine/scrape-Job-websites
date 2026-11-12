@@ -31,7 +31,7 @@ class Source(Base):
     jobs_found = Column(Integer, default=0)
     last_error = Column(Text, default="")
     listed = Column(Integer, default=0)  # offers on the website's lists, inside the date range or not
-    outcome = Column(String, default="")  # offers_found | nothing_in_range | no_offers_detected | partial
+    outcome = Column(String, default="")  # offers_found | nothing_in_range | no_openings | no_offers_detected | partial
     health = Column(String, default="")  # what changed since the previous scan ('read on 2026-11-01, now blocked')
     origin = Column(String, default="")  # the input file(s) that list it, one name per line ('pasted URLs' when pasted)
 

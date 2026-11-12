@@ -427,6 +427,38 @@ def _drop_listing_pages(jobs, listing_soup):
             or (count[norm(j["title"])] == 1 and norm(j["title"]) != own and len(norm(j["title"])) >= 4))]
 
 
+# the website's own words for an empty list: 'We have no job openings at the moment!' (Welcome Kit), 'Nous n'avons pas
+# d'offres en ce moment !', 'Aucune offre disponible pour le moment'. Never 'Aucune offre ne vous correspond ?' (the
+# spontaneous application box under a full list) nor 'no job matches your search' (a filter's empty result).
+_NO_OPENINGS = re.compile(
+    r"\b(?:we (?:currently )?(?:have|don't have) (?:no|any) (?:current |open )?(?:job )?(?:openings|positions|vacancies)"
+    r"|there (?:are|is) (?:currently )?no (?:current |open )?(?:job )?(?:openings?|positions?|vacanc(?:y|ies)|opportunit(?:y|ies))"
+    r"|no (?:current |open )?(?:job )?(?:openings|positions|vacancies|opportunities) (?:are )?(?:available |open )?"
+    r"(?:at the moment|at this time|right now|currently|for now|available)"
+    r"|nous n'avons (?:actuellement )?(?:pas|aucune?) (?:d'|de )?(?:offres?|postes?)(?: d'emploi)?(?: ouverts?| disponibles?)?"
+    r" (?:en ce moment|pour le moment|actuellement|pour l'instant|a pourvoir)"
+    r"|aucune offre (?:d'emploi |de stage )?(?:n'est |n'est actuellement )?(?:disponible|ouverte|en cours|a pourvoir)s?"
+    r" (?:pour le moment|en ce moment|actuellement|pour l'instant)"
+    r"|aucune offre (?:d'emploi |de stage )?(?:pour le moment|en ce moment|actuellement|pour l'instant)"
+    r"|(?:pas|aucun) (?:de )?postes? (?:n'est )?(?:ouverts?|disponibles?|a pourvoir) (?:pour le moment|en ce moment|"
+    r"actuellement|pour l'instant))")
+_HIDDEN_CLASS = re.compile(r"^(?:hidden|d-none|is-hidden|hide|invisible)$")
+
+
+def no_openings(soup) -> str:
+    """The sentence where a career page says it has no offer now, or ''. Hidden blocks are left out: a template may hold
+    its 'no openings' message next to a list its script fills."""
+    soup = BeautifulSoup(str(soup), PARSER)
+    for t in soup.find_all(["script", "style", "template", "noscript"]):
+        t.decompose()
+    for t in soup.find_all(lambda t: t.has_attr("hidden") or "display:none" in (t.get("style") or "").replace(" ", "")
+                           or any(_HIDDEN_CLASS.match(c) for c in t.get("class") or [])):
+        t.decompose()
+    text = re.sub(r"\s+", " ", norm(soup.get_text(" ", strip=True)))
+    m = _NO_OPENINGS.search(text)
+    return re.match(r"[^.!?]{0,100}", text[m.start():])[0].strip() if m else ""  # to the end of its sentence
+
+
 def _error_page(soup) -> bool:
     head = (soup.find("h1") or soup.title)
     return bool(head) and is_boilerplate_title(head.get_text(" ", strip=True)) and len(soup.get_text(" ", strip=True)) < 4000
@@ -582,6 +614,8 @@ def crawl_generic(f, url, cfg, known, st):
                         soup, jobs, links = soup2, jobs2, links2
                         st.announced = st.announced or announced_total(soup2)
                         f.note(f"page rendered with JavaScript: {len(jobs)} jobs, {len(links)} job links")
+            if n == 1 and not jobs and len(links) <= 2:  # an empty list (a spontaneous application link at most): the
+                st.no_openings = no_openings(soup)      # website may say so itself. Used only when no offer is found at all
             if jobs and links:
                 jobs = _real_links(jobs, links)
                 if (len(links) >= max(5, 2 * len(jobs)) and all(j.get("provenance") == "network-json" for j in jobs)
@@ -1522,6 +1556,11 @@ def _crawl_source(f, url, cfg, known, st):
         # offer). The AI browser would only find them again (checked on 7 websites: nothing new, 25-50 s each)
         f.note(f"the list's {st.skipped + st.abroad + listed_out} offers were read and left out (title, place or date): "
                "no AI browser")
+        return
+    if found == 0 and mode == "auto" and st.no_openings:
+        # the page says it has none ('We have no job openings at the moment!': Animaj, Fieldbox, Whitelab Genomics on
+        # 2026-11-12): the AI browser would only meet the same empty list
+        f.note(f"the website says it has no offer now ('{st.no_openings}'): no AI browser")
         return
     if found == 0 and mode in ("auto", "ai") and not known and cfg.get("_keys") is not None:
         if mode == "auto":

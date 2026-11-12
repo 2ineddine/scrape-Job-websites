@@ -172,7 +172,8 @@ def step_websites(running, n):
 
 
 READ_OUTCOME = {"offers_found": "offers found", "nothing_in_range": "read: nothing in the date range",
-                "no_offers_detected": "no offers detected", "partial": "possibly incomplete"}
+                "no_offers_detected": "no offers detected", "partial": "possibly incomplete",
+                "no_openings": "read: the website says it has no offers now"}
 
 
 def step_cv(running, n):

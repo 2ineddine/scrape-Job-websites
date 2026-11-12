@@ -20,7 +20,7 @@ from .classify import (analyze_title, classify_location, clean_location, clean_t
                        looks_like_date, offer_kinds_heading)
 from .config import HW_KEYWORDS_URL, LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
-from .dates import date_decision, refine_job_date, refine_raw_date
+from .dates import date_decision, range_start, refine_job_date, refine_raw_date
 from .store import (RECENT_HOURS, Job, MarketOffer, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers,
                     lock_scan, profile_key, restore_recent_offers, unlock_scan)
 from .web import AccessError, Fetcher, html_to_text, norm, normalize_url
@@ -97,6 +97,20 @@ def online_since(s, job):
     return min((x for x in days if x), default="")
 
 
+def _before(day, first_day) -> bool:
+    """'2026-11-05' (a day the app saw an offer online) is before the range's first day."""
+    return bool(day) and datetime.strptime(day, "%Y-%m-%d").date() < first_day
+
+
+def seen_before_range(s, job, cfg, now=None) -> str:
+    """An offer without a reliable publication date that the app already saw online before the date range began was
+    published that day or earlier: it is outside the range. -> that day ('YYYY-MM-DD'), or '' when unknown or inside.
+    (Scan of 2026-11-12, 'Last 24 hours': 145 of the 213 relevant offers had no date - Inria, Ensta, Davidson... - and,
+    without this, the same ones would come back every day.)"""
+    since = online_since(s, job)
+    return since if _before(since, range_start(cfg, now)) else ""
+
+
 def hide_out_of_range(s, job, why):
     """The job's real publication date is outside the range: it leaves every list, is never analysed and never shown
     (relevant or not). A tiny record stays so that the website is not re-opened for it."""
@@ -109,6 +123,7 @@ def apply_filters(s, cfg, profile, now=None, source_ids=None, merge=True):
     """Pipeline stages 5-7: date -> France location -> fast title filter. Records reason for every outcome.
     source_ids: only the offers of these websites (a website just read); merge: then merge the duplicates of every website."""
     now, st = now or utcnow(), Counter()
+    first_day = range_start(cfg, now)
     todo = s.query(Job).filter(Job.status == "new")
     if source_ids is not None:
         todo = todo.filter(Job.source_id.in_(list(source_ids)))
@@ -130,6 +145,13 @@ def apply_filters(s, cfg, profile, now=None, source_ids=None, merge=True):
             since = online_since(s, job)
             if since:
                 job.extra = ex = {**ex, "first_seen": since}
+            if _before(since, first_day):
+                # ...unless the app already saw it online before the range began: published that day or earlier, so it is
+                # outside the range like a dated offer (a wider range brings it back)
+                hide_out_of_range(s, job, f"not stated by the website, but online since {since}: published before "
+                                          f"'{cfg['date_preset']}'")
+                st["date_x"] += 1
+                continue
         if d is None and cfg["unknown_date_policy"] == "exclude":
             job.status, job.reason = "excluded", "date: " + why
             st["date_x"] += 1
@@ -359,7 +381,8 @@ def read_outcome(s, url, status, found, listed, st):
     if status != "completed":
         return "", ""
     whole = not st.stopped_by_date  # a list left early because of the dates is not comparable with a total
-    outcome = "offers_found" if found else "nothing_in_range" if listed else "no_offers_detected"
+    outcome = ("offers_found" if found else "nothing_in_range" if listed
+               else "no_openings" if st.no_openings else "no_offers_detected")  # no_openings: the website says it has none
     note = ""
     if whole and st.announced and listed < st.announced * 0.5:
         outcome, note = "partial", f"the website announces {st.announced} offers, {listed} were read"
@@ -437,6 +460,9 @@ def site_problem(src, scan_finished=True, respect_robots=True):
                                           "It is read again at the next scan")
         if re.search(r"HTTP 5\d\d|HTTP 429", why):
             return "Website error", why, "The website had a passing error: it is read again at the next scan"
+        if re.search(r"no api key|no ai model|api key", why, re.I):
+            return ("Website error", why, "Only the AI can read this website's offers: add an AI key in Settings > API keys "
+                                          "(or check that the keys file is next to app.py)")
         return "Website error", why or "reading failed", "It is read again at the next scan; if it keeps failing, check the address"
     if st_ == "partially_completed":
         return "Partly read", why or "the reading stopped early", ("The offers read are kept. The website is large or slow: "
@@ -469,15 +495,22 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         kept = restore_recent_offers(s, src, cfg.get("_profile_key"), cfg.get("_cv_key"))
         if kept:  # offers this website showed in the last 24 hours: not read again, not analysed again
             for job in kept:
-                if job.relevance_score is not None and gate(job.pub_date, job.date_conf or 0.0, job.pub_date_text or "") is False:
+                g = gate(job.pub_date, job.date_conf or 0.0, job.pub_date_text or "")
+                if job.relevance_score is not None and g is False:
                     hide_out_of_range(s, job, "outside the new date range")  # analysed before, now too old for the range
+                elif g is None and job.status not in ("out_of_range", "shortlisted") and (since := seen_before_range(s, job, cfg)):
+                    hide_out_of_range(s, job, f"not stated by the website, but online since {since}: before the new date range")
             shown = sum(1 for j in kept if j.status != "out_of_range")
             prog.inc("jobs", shown)
             prog.say(f"{label}: {len(kept)} offers kept from the last {RECENT_HOURS} h ({shown} in range): their pages are not "
                      "read again" + (", nor analysed again" if any(j.relevance_score is not None for j in kept) else ""))
-        for url_, status_, d_, c_, t_ in s.query(Job.url, Job.status, Job.pub_date, Job.date_conf, Job.pub_date_text).filter(Job.source_id == sid):
+        first_day = range_start(cfg)
+        for url_, status_, d_, c_, t_, ex_ in s.query(Job.url, Job.status, Job.pub_date, Job.date_conf, Job.pub_date_text,
+                                                      Job.extra).filter(Job.source_id == sid):
             if status_ == "out_of_range":
-                if gate(d_, c_ or 0.0, t_ or "") is False:  # still outside the (possibly changed) range: never re-opened
+                g = gate(d_, c_ or 0.0, t_ or "")
+                if g is False or (g is None and _before((ex_ or {}).get("first_seen"), first_day)):
+                    # still outside the (possibly changed) range, by its date or the day it was first seen: never re-opened
                     st.out_known.add(url_)
                     known.add(url_)
             else:
@@ -488,6 +521,13 @@ def scan_source(sid, cfg, fetcher, prog, t0):
         t_site = time.time()
         # one website's time; the Hellowork search with the profile's keywords reads about 40 lists: three times as long
         site_limit = cfg.get("max_site_duration", 1200) * (3 if normalize_url(src.url) == normalize_url(HW_KEYWORDS_URL) else 1)
+        # a website whose robots.txt asks a longer pause between requests (5 s: Neurones, Sii) gets its time stretched to
+        # match, up to 3 times: the pause it asks for must never cut its reading short
+        try:
+            asked = fetcher._robots(src.url).delay if hasattr(fetcher, "_robots") else 0.0
+        except Exception:
+            asked = 0.0
+        site_limit *= min(3.0, max(1.0, asked / max(float(cfg.get("delay") or 1.0), 0.1)))
         st.deadline = t_site + site_limit  # also stops job-page opening inside a list page
         try:
             for pg in crawl_source(fetcher, src.url, cfg, known, st):

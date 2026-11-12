@@ -788,7 +788,7 @@ def test_logo_heading_vague_age_and_error_page_redirect(monkeypatch):
     from jobfinder.config import CONFIG_DEFAULT, run_config
     f = Fetcher({**run_config(CONFIG_DEFAULT), "retries": 0, "timeout": 5}, lambda m: None)
     monkeypatch.setattr(f, "robots_ok", lambda u: True)
-    monkeypatch.setattr(f, "_wait", lambda h: None)
+    monkeypatch.setattr(f, "_wait", lambda h, asked=0.0: None)
     monkeypatch.setattr("jobfinder.web.check_url", lambda u: (True, ""))
     monkeypatch.setattr(f.s, "request", lambda m, u, **k: R(302, "https://rp.lisn.fr/403.html") if "403" not in u else R(200))
     try:
@@ -2132,9 +2132,9 @@ def test_an_analysis_made_with_older_rules_is_not_kept(monkeypatch):
     assert store.profile_key(PROFILE_DEFAULT) != before  # the app's rules changed: analysed again
 
 
-def test_an_undated_offer_seen_long_ago_is_returned_with_the_day_it_was_first_seen():
-    """No publication date: the offer is never hidden for its age; it shows the earliest day the app knows it was online
-    (its memory of the offers, or the statistics history), even outside the date range."""
+def _undated_case(preset, seen_days, market_days=None):
+    """An undated offer the app first saw `seen_days` ago (and the statistics history `market_days` ago), filtered with
+    `preset` -> (status, reason, review_flags, first_seen)."""
     from datetime import datetime, timedelta
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -2146,13 +2146,51 @@ def test_an_undated_offer_seen_long_ago_is_returned_with_the_day_it_was_first_se
     now = datetime.utcnow()
     with sessionmaker(bind=engine)() as s:
         j = store.Job(uid="u1", title="Ingénieur Machine Learning (H/F)", url="https://a.fr/1", status="new", pub_date=None,
-                      location_original="Paris, France", extra={"first_seen": f"{now - timedelta(days=20):%Y-%m-%d}"})
-        s.add_all([j, store.SeenOffer(uid="u1", first_seen=now - timedelta(days=20)),
-                   store.MarketOffer(uid="u1", seen=now - timedelta(days=45), title=j.title)])
+                      location_original="Paris, France", extra={"first_seen": f"{now - timedelta(days=seen_days):%Y-%m-%d}"})
+        s.add_all([j, store.SeenOffer(uid="u1", first_seen=now - timedelta(days=seen_days))]
+                  + ([store.MarketOffer(uid="u1", seen=now - timedelta(days=market_days), title=j.title)] if market_days else []))
         s.commit()
-        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT)
-        assert j.status == "candidate" and "publication_date_unknown" in j.review_flags
-        assert j.extra["first_seen"] == f"{now - timedelta(days=45):%Y-%m-%d}"  # the statistics history knew it earlier
+        apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": preset}), PROFILE_DEFAULT)
+        return j.status, j.reason, j.review_flags or "", (j.extra or {}).get("first_seen")
+
+
+def test_an_undated_offer_first_seen_inside_the_range_is_returned_with_that_day():
+    """No publication date, first seen yesterday: the offer is returned, marked 'date not stated', with the earliest day
+    the app knows it was online."""
+    from datetime import datetime, timedelta
+    status, _, flags, seen = _undated_case("Last 24 hours", 1)
+    assert status == "candidate" and "publication_date_unknown" in flags
+    assert seen == f"{datetime.utcnow() - timedelta(days=1):%Y-%m-%d}"
+
+
+def test_an_undated_offer_seen_before_the_range_began_is_outside_it():
+    """Online 20 days ago (45 days in the statistics history): published then or earlier, so outside 'Last 7 days' -
+    hidden like a dated offer of that age (scan of 2026-11-12: Inria, Davidson... came back every day)."""
+    from datetime import datetime, timedelta
+    status, reason, _, _ = _undated_case("Last 7 days", 20, market_days=45)
+    assert status == "out_of_range"
+    assert f"online since {datetime.utcnow() - timedelta(days=45):%Y-%m-%d}" in reason  # the history knew it earlier
+    assert _undated_case("Last 30 days", 20)[0] == "candidate"  # a wider range brings it back
+    assert _undated_case("All dates", 400)[0] == "candidate"
+
+
+def test_a_kept_undated_offer_seen_before_a_shorter_range_is_hidden():
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from jobfinder import store
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    from jobfinder.scan import seen_before_range
+    engine = create_engine("sqlite://")
+    store.Base.metadata.create_all(engine)
+    now = datetime.utcnow()
+    with sessionmaker(bind=engine)() as s:
+        j = store.Job(uid="u2", title="Data Scientist", url="https://a.fr/2", status="relevant", pub_date=None, extra={})
+        s.add_all([j, store.SeenOffer(uid="u2", first_seen=now - timedelta(days=5))])
+        s.commit()
+        assert seen_before_range(s, j, run_config({**CONFIG_DEFAULT, "date_preset": "Last 24 hours"})) == \
+            f"{now - timedelta(days=5):%Y-%m-%d}"
+        assert seen_before_range(s, j, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"})) == ""
 
 
 def _contract_case(monkeypatch, answer_kind, evidence, text):
@@ -2329,6 +2367,50 @@ def test_no_ai_browser_once_the_lists_offers_were_read_and_left_out(monkeypatch)
     jobs = [j for pg in crawl_source(F({"lighton.welcomekit.co": page}), "https://lighton.welcomekit.co/", {**CFG(), "_keys": {}},
                                      set(), st) for j in pg.jobs]
     assert jobs == [] and st.skipped == 1 and not started
+
+
+_WK_EMPTY = ('<html><h1>Animaj is hiring!</h1><h2>Our Job Openings</h2><p>We have no job openings at the moment!</p>'
+             "<h3>Don't see the position of your dreams?</h3><a href=\"/jobs/candidatures-spontanees\">Spontaneous Application</a>"
+             + "<p>About us, our values and our team.</p>" * 20 + "</html>")
+
+
+def test_a_page_that_says_it_has_no_offers_is_read_without_the_ai_browser(monkeypatch):
+    # Animaj, Fieldbox, Whitelab Genomics (Welcome Kit) on 2026-11-12: the AI browser ran 25-50 s each for the same empty
+    # list, and the websites were listed as 'No offer found' though they work
+    from jobfinder import browser, crawler, pagereader
+    from jobfinder.crawler import crawl_source
+    from jobfinder.scan import read_outcome, site_problem
+    monkeypatch.setattr(crawler, "render_js", lambda f, url, cfg: (None, []))
+    monkeypatch.setattr(pagereader, "read_page", lambda *a, **k: iter(()))
+    monkeypatch.setattr(crawler, "suggest_page", lambda f, url: "")
+    started = []
+    monkeypatch.setattr(browser, "crawl_ai", lambda *a, **k: started.append(1) or iter(()))
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    st = ScanState()
+    jobs = [j for pg in crawl_source(F({"animaj.welcomekit.co": _WK_EMPTY}), "https://animaj.welcomekit.co/", {**CFG(), "_keys": {}},
+                                     set(), st) for j in pg.jobs]
+    assert jobs == [] and not started and st.no_openings == "we have no job openings at the moment"
+    outcome, note = read_outcome(type("S", (), {"get": lambda self, *a: None, "add": lambda self, x: None})(),
+                                 "https://animaj.welcomekit.co/", "completed", 0, 0, st)
+    assert outcome == "no_openings" and not note
+    src = type("Src", (), {"status": "completed", "outcome": outcome, "last_error": "", "health": ""})()
+    assert site_problem(src) is None  # the website works: not in the list of websites that did not work
+
+
+def test_the_no_openings_sentence_is_recognised_only_where_the_page_says_so():
+    from jobfinder.crawler import no_openings
+    soup = lambda h: BeautifulSoup(h, "html.parser")
+    assert no_openings(soup("<p>Nos offres</p><p>Nous n’avons pas d’offres en ce moment !</p>"))
+    assert no_openings(soup("<p>Aucune offre disponible pour le moment.</p>"))
+    assert no_openings(soup("<div>There are currently no open positions.</div>"))
+    assert not no_openings(soup("<p>Aucune offre ne vous correspond ? Envoyez une candidature spontanée</p>"))
+    assert not no_openings(soup("<p>No job matches your search.</p>"))
+    # a template's message next to the list its script fills: hidden, so it says nothing
+    assert not no_openings(soup('<div class="empty d-none">No open positions at the moment</div><div id="list"></div>'))
+    assert not no_openings(soup('<div style="display: none">Aucune offre pour le moment</div>'))
 
 
 def test_a_teamtailor_feed_is_read_where_the_offers_live():

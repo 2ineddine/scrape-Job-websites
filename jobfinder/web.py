@@ -144,6 +144,11 @@ UA = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ch
 _ANTIBOT = re.compile(r"cf-challenge|are you a robot|verify you are human|checking your browser|perfdrive|captcha-delivery", re.I)
 
 
+# seconds: the longest 'Crawl-delay' kept. Neurones asks 10 s: its unsorted list then took the 20 minutes a website is
+# given and was cut short; at 5 s, with the website's time stretched to match (scan.scan_source), it is read whole
+ROBOTS_MAX_DELAY = 5.0
+
+
 class Robots:
     """robots.txt as RFC 9309 reads it: the group for our bot name (else '*'), the LONGEST matching rule wins, Allow wins
     a tie, '*' and '$' wildcards. (urllib.robotparser takes the first rule: 'Disallow: /' then 'Allow: /careers' would
@@ -170,6 +175,25 @@ class Robots:
                         groups[a].append((k == "allow", v))
         bot = BOT.lower()
         self.rules = next((r for a, r in groups.items() if a != "*" and a in bot), groups.get("*", []))
+        # 'Crawl-delay: 10': the pause the website asks between two requests (its group, else '*'), capped at ROBOTS_MAX_DELAY
+        delays, agents = {}, []
+        for line in text.splitlines():
+            k, _, v = line.split("#", 1)[0].partition(":")
+            k, v = k.strip().lower(), v.strip()
+            if k == "user-agent":
+                agents = agents if delays.get("_open") else []
+                agents.append(v.lower())
+                delays["_open"] = True
+            elif k == "crawl-delay" and agents:
+                try:
+                    for a in agents:
+                        delays[a] = float(v)
+                except ValueError:
+                    pass
+            elif k in ("allow", "disallow"):
+                delays["_open"] = False
+        mine = next((d for a, d in delays.items() if a not in ("*", "_open") and a in bot), delays.get("*"))
+        self.delay = min(float(mine), ROBOTS_MAX_DELAY) if mine else 0.0
 
     @staticmethod
     def _match(pattern, path):
@@ -206,8 +230,8 @@ class Fetcher:
         self.s.headers.update({"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
         self.robots = {}
 
-    def _wait(self, host):
-        key, delay = _server(host), self.cfg["delay"]
+    def _wait(self, host, asked=0.0):
+        key, delay = _server(host), max(self.cfg["delay"], asked)
         if delay <= 0:
             return
         with _PACE_LOCK:  # book the next free slot of this server, then wait for it outside the lock
@@ -259,7 +283,9 @@ class Fetcher:
                         raise requests.ConnectionError("the website's name could not be resolved (network or DNS problem)")
                     if not ok:
                         raise AccessError(f"access_restricted: {why}")
-                    self._wait(urlparse(cur).hostname)
+                    # the pause the website's robots.txt asks for is kept even when its rules are not applied: it costs
+                    # time, never an offer, and keeps the website open to the app
+                    self._wait(urlparse(cur).hostname, 0.0 if _robots else self._robots(cur).delay)
                     r = self.s.request(method, cur, timeout=self.cfg["timeout"], allow_redirects=False, **kw)
                     if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
                         cur, method = urljoin(cur, r.headers["Location"]), ("GET" if r.status_code == 303 else method)
@@ -296,6 +322,14 @@ class Fetcher:
 _DATA_REQUESTS = ("document", "xhr", "fetch")
 
 
+# advertising, analytics and tracking services a career page calls (the 40 that robots.txt kept out of the browser on
+# 2026-11-12, by family): never a job offer, so never loaded, whatever the robots.txt setting
+_AD_HOSTS = re.compile(r"(?:^|\.)(?:doubleclick\.net|googlesyndication\.com|googleadservices\.com|google-analytics\.com|"
+                       r"googletagmanager\.com|ads\.linkedin\.com|px\.ads\.linkedin\.com|analytics\.tiktok\.com|"
+                       r"facebook\.net|connect\.facebook\.com|hubapi\.com|hubspot\.com|hs-analytics\.net|zoominfo\.com|"
+                       r"axept\.io|hotjar\.com|clarity\.ms|bat\.bing\.com|criteo\.net|taboola\.com|outbrain\.com)$", re.I)
+
+
 def browser_guard(f):
     """Playwright route handler for every request a rendered page makes: public addresses only (SSRF), and the page's own
     DATA requests (documents, frames, XHR / fetch) are refused where robots.txt closes them, exactly as the app's own
@@ -308,6 +342,8 @@ def browser_guard(f):
             return route.continue_()
         if not syntactic_ok(u):
             return route.abort()
+        if req.resource_type in _DATA_REQUESTS and _AD_HOSTS.search(urlparse(u).hostname or ""):
+            return route.abort()  # advertising and tracking: never an offer (their own robots.txt closes them too)
         if f is not None and req.resource_type in _DATA_REQUESTS:
             try:
                 allowed = f.robots_ok(u)

@@ -195,3 +195,14 @@ def test_old_saved_settings_get_robots_txt_off_once(monkeypatch):
     assert changed and cfg["respect_robots"] is False
     chosen = {**cfg, "respect_robots": True}
     assert upgrade_config(_merge(CONFIG_DEFAULT, chosen)) == (_merge(CONFIG_DEFAULT, chosen), False)
+
+
+def test_what_robots_txt_gives_is_used_even_when_its_rules_are_not():
+    # rules off: no page is refused, but the pause the website asks for is kept (it costs time, never an offer), and a
+    # rendered page's advertising / tracking requests are never loaded
+    from jobfinder.web import Robots, _AD_HOSTS
+    r = Robots("User-agent: *\nCrawl-delay: 10\nDisallow: /jobs\n\nUser-agent: Googlebot\nCrawl-delay: 1\n")
+    assert r.delay == 5.0 and not r.allowed("https://x.fr/jobs/1")
+    assert Robots("User-agent: *\nCrawl-delay: 600\n").delay == 5.0 and Robots("").delay == 0.0
+    assert _AD_HOSTS.search("ad.doubleclick.net") and _AD_HOSTS.search("px.ads.linkedin.com") and _AD_HOSTS.search("api.hubapi.com")
+    assert not _AD_HOSTS.search("careers.smartrecruiters.com") and not _AD_HOSTS.search("api.lever.co")

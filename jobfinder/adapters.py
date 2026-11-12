@@ -81,6 +81,7 @@ class ScanState:
     platform_error: str = ""  # the website's job platform failed for a passing reason (HTTP 503, timeout)
     moved: str = ""  # the page is gone and the website's home page links its career page: this address is read instead
     order: list = field(default_factory=list)  # the dates of the website's offers in list order (see date_order)
+    no_openings: str = ""  # the website's own words for its empty list ('We have no job openings at the moment!')
 
 
 def _raw(title, url, **kw):

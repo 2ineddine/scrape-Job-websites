@@ -22,7 +22,8 @@ from .config import HW_KEYWORDS_URL, LOG, run_config, utcnow
 from .crawler import crawl_source, suggest_page
 from .dates import date_decision, range_start, refine_job_date, refine_raw_date
 from .store import (RECENT_HOURS, Job, MarketOffer, SeenOffer, SessionLocal, SiteMemory, Source, cv_key, keep_recent_offers,
-                    lock_scan, profile_key, restore_recent_offers, unlock_scan)
+                    lock_scan, profile_key, restore_recent_offers, scan_ended, scan_record, scan_started, scan_todo,
+                    unlock_scan)
 from .web import AccessError, Fetcher, html_to_text, norm, normalize_url
 
 
@@ -623,10 +624,12 @@ def scan_source(sid, cfg, fetcher, prog, t0):
 MERGE_EVERY = 120  # seconds: the duplicates are merged this often while websites are read, then once all are read
 
 
-def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
+def run_scan(source_ids, cfg, profile, prog: Progress, then=None, resume=None):
     """Crawl every page of every source and apply the date / France / title filters to each website as soon as it is read.
     then(prog, feed): the AI analysis. It starts with the scan and receives each website's remaining offers through `feed`
-    while the next websites are being read; it ends when the feed is closed (every website read) and empty."""
+    while the next websites are being read; it ends when the feed is closed (every website read) and empty.
+    resume: an unfinished scan (store.unfinished_scan); source_ids are then its websites still to read, and the offers its
+    other websites gave that the AI has not analysed yet are analysed first."""
     cfg = {**run_config(cfg), "_profile": profile}  # the crawler uses the profile to open relevant / doubtful jobs first
     cfg["_gate"] = make_gate(cfg)  # date_decision for the chosen range: True inside | False outside | None unknown
     prog.reset()
@@ -634,8 +637,22 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     lock_scan()
     prog.set(running=True, started=datetime.now(), sources_total=len(source_ids), task="crawling")
     t0 = time.time()
+    before = [x for x in (resume or {}).get("source_ids") or [] if x not in set(source_ids)]  # read before the resume
     with SessionLocal() as s:  # an analysis / a CV match kept from an earlier scan is reused only for the same profile / CVs
         cfg["_profile_key"], cfg["_cv_key"] = profile_key(profile), cv_key(s)
+        scan_started(s, source_ids, cfg, profile, resume)
+        if resume:
+            read = s.query(Source).filter(Source.id.in_(before)).all()
+            prog.set(sources_total=len(source_ids) + len(read), sources_done=len(read),
+                     jobs=sum(x.jobs_found or 0 for x in read))
+            for j in s.query(Job).filter(Job.source_id.in_(before), Job.relevance_score.isnot(None),
+                                         Job.status.notin_(["out_of_range", "shortlisted"])):
+                # resumed another day: an offer analysed then may now be older than the range
+                g = cfg["_gate"](j.pub_date, j.date_conf or 0.0, j.pub_date_text or "")
+                if g is False or (g is None and seen_before_range(s, j, cfg)):
+                    hide_out_of_range(s, j, "outside the date range when the scan was resumed")
+            prog.say(f"scan resumed: {len(read)} websites already read, {len(source_ids)} to read; the offers not analysed "
+                     "yet go to the AI first")
     feed, filtering, handed, merged_at = Feed(), threading.Lock(), set(), [time.time()]
 
     def hand_over(sids=None):
@@ -705,6 +722,8 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
     if ai:
         ai.start()
         prog.say("the AI analyses each website's offers as soon as the website is read")
+    if before:  # a resumed scan: the offers of the websites read before, not analysed yet, are filtered and analysed first
+        filters.submit(hand_over_safe, before)
     try:
         with ThreadPoolExecutor(max_workers=int(cfg["parallel_sites"])) as ex:
             list(ex.map(one, source_ids))
@@ -739,5 +758,23 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None):
             prog.say(f"{n} offers of the last {RECENT_HOURS} h kept for the next scans")
         except Exception as e:  # pragma: no cover - keeping them never fails a scan
             LOG.warning("offers not kept: %s", e)
+        try:  # finished, or not: what is left is offered to resume at the next launch (or now, on the Search page)
+            with SessionLocal() as s:
+                why = ["stopped with the Stop button"] if prog.cancel.is_set() else []
+                if time.time() - t0 > cfg["max_duration"]:
+                    why.append(f"time limit of {cfg['max_duration'] / 3600:g} hours reached")
+                if then and prog.snap()[0]["ai_msg"]:
+                    why.append(prog.snap()[0]["ai_msg"])  # 'AI analysis stopped: ...' (credits, quotas, no key)
+                todo, _, pending = scan_todo(s, scan_record(s))
+                pending = pending if then else 0  # without the AI analysis, no offer waits for it
+                if not why:  # no stop, no time limit, no AI message: what is left says it
+                    why = ([f"{len(todo)} websites not read"] if todo else []) + \
+                          ([f"{pending} offers not analysed (no AI model answered)"] if pending else [])
+                scan_ended(s, "; ".join(why) if todo or pending else "")
+                if todo or pending:
+                    prog.say(f"scan not finished ({'; '.join(why)}): {len(todo)} websites to read, {pending} offers to "
+                             "analyse - it can be resumed")
+        except Exception as e:  # pragma: no cover - the record never fails a scan
+            LOG.warning("scan state not saved: %s", e)
         unlock_scan()
         prog.set(running=False, finished=datetime.now(), task="done")

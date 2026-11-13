@@ -2001,7 +2001,8 @@ def guess_board(f, url):
     low, host = html.lower(), urlparse(url).hostname or ""
     soup = BeautifulSoup(html, PARSER)
     site = soup.find("meta", property="og:site_name")
-    words = re.split(r"[|\-–—:·,]", (site.get("content") if site else "") + "|" + (soup.title.get_text() if soup.title else ""))
+    # <meta property="og:site_name"> without a value (Rothschild & Co, 13 Nov 2026) made the whole website fail
+    words = re.split(r"[|\-–—:·,]", ((site.get("content") or "") if site else "") + "|" + (soup.title.get_text() if soup.title else ""))
     names = [re.sub(r"[^a-z0-9]", "", norm(w)) for w in words]
     names.append(host.split(".")[-2] if host.count(".") else "")
     names = [n for n in dict.fromkeys(names) if 3 <= len(n) <= 30 and n not in _NOT_BRAND]

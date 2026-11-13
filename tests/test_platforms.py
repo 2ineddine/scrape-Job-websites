@@ -127,6 +127,10 @@ def test_board_name_guessed_only_when_it_belongs_to_the_company():
     f = FakeFetcher({"careers.other.com": '<title>Careers | Datadog</title>',
                      "boards-api.greenhouse.io/v1/boards/datadog/": {"jobs": [{"absolute_url": "https://careers.datadoghq.com/detail/1"}]}})
     assert guess_board(f, "https://careers.other.com/") is None  # a board of ANOTHER company with the same name
+    # a site-name tag without a value (Rothschild & Co): the title is used, the website does not fail
+    f = FakeFetcher({"careers.datadoghq.com": '<html><head><meta property="og:site_name"><title>Careers | Datadog</title></head></html>',
+                     "boards-api.greenhouse.io/v1/boards/datadog/": {"jobs": [{"absolute_url": "https://careers.datadoghq.com/detail/1"}]}})
+    assert guess_board(f, "https://careers.datadoghq.com/all-jobs/") == ("greenhouse", "datadog")
 
 
 def test_card_title_and_card_location():
@@ -590,6 +594,17 @@ def test_list_page_found_from_a_careers_home_page():
     assert _list_page(BeautifulSoup('<a href="/en/about">About</a>', "html.parser"), "https://r.michelin.fr/en") == ""
     soup = BeautifulSoup('<a href="/en/jobsearch/application">How to apply</a><a href="/en/job-offer-result-list">Jobs</a>', "html.parser")
     assert _list_page(soup, "https://r.michelin.fr/en") == "https://r.michelin.fr/en/job-offer-result-list"
+
+
+def test_next_page_number_with_a_screen_reader_prefix():
+    # Crédit Agricole: '<span class="sr-only">Page : </span> 2' - only page 1 of 40 was read
+    from jobfinder.crawler import _next_page
+    html = ''.join(f'<li><a class="folio-item" data-page="{i}" href="https://ca.jobs/fr/nos-offres/page/{i}/">'
+                   f'<span class="sr-only">Page : </span> {i}</a></li>' for i in (1, 2, 3, 40))
+    soup = BeautifulSoup(f"<ul>{html}</ul>", "html.parser")
+    assert _next_page(soup, "https://ca.jobs/fr/nos-offres/", 1) == "https://ca.jobs/fr/nos-offres/page/2/"
+    assert _next_page(soup, "https://ca.jobs/fr/nos-offres/page/2/", 2) == "https://ca.jobs/fr/nos-offres/page/3/"
+    assert _next_page(BeautifulSoup('<a href="/x?p=12">12</a><a href="/x?p=2">2 offres</a>', "html.parser"), "https://a.fr/x", 1) is None
 
 
 def test_next_page_written_in_a_form_field():
@@ -2589,3 +2604,29 @@ def test_with_robots_txt_off_hellowork_s_search_is_read_page_after_page_until_th
     url = "https://www.hellowork.com/fr-fr/emploi/recherche.html?k=stage+deep+learning&l=Paris&c=Stage"
     assert len([j for pg in crawl_source(g, url, cfg, set(), ScanState()) for j in pg.jobs]) == 1
     assert "l=Paris" in g.calls[0] and "c=Stage" in g.calls[0] and "st=date" in g.calls[0]
+
+
+def test_a_list_announcing_more_offers_than_it_shows_is_completed_in_the_browser(monkeypatch):
+    # Crédit Mutuel: '523 offres', 15 shown, more behind a 'Plus de résultats' link run by a script (no next page)
+    from jobfinder import crawler
+    from jobfinder.crawler import _MORE_CONTROL, _NEXT_CONTROL, crawl_generic
+    cards = lambda r: "".join(f'<li><a href="/fr/offre/{i}-ingenieur-data-scientist.html">Ingénieur data scientist {i}</a></li>'  # noqa: E731
+                              for i in r)
+    asked = []
+
+    def fake_render(f, url, cfg):
+        asked.append(cfg.get("_more_clicks"))
+        return f"<html><body><p>523 offres</p><ul>{cards(range(40))}</ul></body></html>", []
+
+    monkeypatch.setattr(crawler, "render_js", fake_render)
+
+    class F(FakeFetcher):
+        def robots_ok(self, url):
+            return True
+    page = f"<html><body><p>523 offres</p><ul>{cards(range(15))}</ul><a href='#'>Plus de résultats</a></body></html>"
+    st = ScanState()
+    jobs = [j for pg in crawl_generic(F({"cm.fr": page}), "https://cm.fr/fr/nos_offres.html",
+                                      {**CFG(), "max_details_per_source": 0}, set(), st) for j in pg.jobs]
+    assert asked == [80] and len(jobs) == 40  # rendered to complete the list: 40 offers instead of 15
+    assert _MORE_CONTROL.search("Plus de résultats") and _NEXT_CONTROL.search("Suivant →") and _NEXT_CONTROL.search("Next")
+    assert not _NEXT_CONTROL.search("Next Slide") and not _NEXT_CONTROL.search("Suivant les étapes du recrutement")

@@ -236,3 +236,97 @@ def test_websites_that_did_not_work_are_explained():
     assert site_problem(site(status="not_started"))[0] == "Not reached" and site_problem(site(status="not_started"), False) is None
     assert site_problem(site()) is None and site_problem(site(outcome="nothing_in_range")) is None  # read normally
     assert all(site_problem(site(status=x, last_error="HTTP 500"))[0] in PROBLEM_ORDER for x in ("blocked", "failed"))
+
+
+def _resume_setup(db, monkeypatch, read):
+    with db() as s:
+        for k in range(3):
+            s.add(store.Source(url=f"https://site{k}.fr/careers", label=f"Site {k}"))
+        s.commit()
+        ids = [x.id for x in s.query(store.Source)]
+
+    def fake_source(sid, cfg, fetcher, prog, t0):  # what scan_source records: the website's offers, its end
+        read.append(sid)
+        with db() as s:
+            s.add(_job(1, status="new", source=sid, employer=f"Employer {sid}"))
+            src = s.get(store.Source, sid)
+            src.status, src.last_scan = "completed", datetime.utcnow()
+            s.commit()
+
+    monkeypatch.setattr(scan, "scan_source", fake_source)
+    for name in ("lock_scan", "unlock_scan"):
+        monkeypatch.setattr(scan, name, lambda: None)
+    monkeypatch.setattr(scan, "keep_recent_offers", lambda s: 0)
+    monkeypatch.setattr(store, "scan_owner", lambda: None)  # no scan running anywhere
+    return ids
+
+
+def test_a_scan_stopped_when_the_ai_credits_ran_out_is_resumed_with_the_offers_left(db, monkeypatch):
+    """Every website is read, but the AI credits run out: the scan is 'not finished', its offers wait. Resumed (credits
+    added), no website is read again and only the offers not analysed are sent to the AI."""
+    read, credits, asked = [], {"ok": False}, []
+
+    def fake_ai(user, schema, cfg, s, keys=None, system=None):
+        if not credits["ok"]:
+            raise llm.BudgetExceeded("the credits of the API key are used up")
+        asked.append(user)
+        return _answer(schema)
+
+    ids = _resume_setup(db, monkeypatch, read)
+    monkeypatch.setattr(analysis, "call_json", fake_ai)
+    cfg = {**CONFIG_DEFAULT, "date_preset": "Last 7 days"}
+    then = lambda pr, feed: analysis._pipeline(run_config(cfg), PROFILE_DEFAULT, {}, pr, None, feed)  # noqa: E731
+    scan.run_scan(ids, cfg, PROFILE_DEFAULT, scan.Progress(), then)
+    with db() as s:
+        left = store.unfinished_scan(s)
+        assert left and "credits" in left["why"] and left["todo"] == [] and left["done"] == 3 and left["pending"] == 3
+        assert left["cfg"]["date_preset"] == "Last 7 days" and "_keys" not in left["cfg"]
+    credits["ok"], read[:] = True, []
+    prog = scan.Progress()
+    scan.run_scan(left["todo"], cfg, PROFILE_DEFAULT, prog, then, resume=left)
+    assert read == [] and len(asked) == 3  # no website read again, the 3 offers analysed
+    with db() as s:
+        assert store.unfinished_scan(s) is None and store.scan_record(s)["state"] == "finished"
+        assert store.scan_record(s)["resumed"] == 1
+        assert {j.status for j in s.query(store.Job)} <= {"relevant", "excluded"}
+    d = prog.snap()[0]
+    assert d["sources_done"] == d["sources_total"] == 3
+
+
+def test_a_scan_cut_by_closing_the_app_reads_only_the_websites_not_read(db, monkeypatch):
+    """The app was closed (or the computer turned off) during the scan: its record still says 'running' and its process
+    is gone. The next launch offers to resume it: only the websites not read since it started are read."""
+    read = []
+    ids = _resume_setup(db, monkeypatch, read)
+    monkeypatch.setattr(analysis, "call_json", lambda user, schema, cfg, s, keys=None, system=None: _answer(schema))
+    cfg = {**CONFIG_DEFAULT, "date_preset": "Last 7 days"}
+    with db() as s:
+        store.scan_started(s, ids, cfg, PROFILE_DEFAULT)
+        src = s.get(store.Source, ids[0])  # the first website was read before the app was closed
+        src.status, src.last_scan = "completed", datetime.utcnow()
+        s.add(_job(1, status="candidate", source=ids[0], employer="Read before"))
+        s.commit()
+        left = store.unfinished_scan(s)
+        assert left["why"] == "the app was closed during the scan"
+        assert sorted(left["todo"]) == sorted(ids[1:]) and left["done"] == 1 and left["pending"] == 1
+    then = lambda pr, feed: analysis._pipeline(run_config(cfg), PROFILE_DEFAULT, {}, pr, None, feed)  # noqa: E731
+    scan.run_scan(left["todo"], cfg, PROFILE_DEFAULT, scan.Progress(), then, resume=left)
+    assert sorted(read) == sorted(ids[1:])
+    with db() as s:
+        assert store.unfinished_scan(s) is None
+        assert s.query(store.Job).filter(store.Job.relevance_score.is_(None),
+                                         store.Job.status.in_(["candidate", "review"])).count() == 0
+
+
+def test_start_again_clears_the_unfinished_scan_and_keeps_the_websites(db, monkeypatch):
+    read = []
+    ids = _resume_setup(db, monkeypatch, read)
+    monkeypatch.setattr(store, "keep_recent_offers", lambda s: 0)
+    with db() as s:
+        store.scan_started(s, ids, CONFIG_DEFAULT, PROFILE_DEFAULT)
+        s.add(_job(1, status="candidate", source=ids[0]))
+        s.commit()
+        assert store.unfinished_scan(s)
+        store.restart_session(s)
+        assert store.unfinished_scan(s) is None and s.query(store.Job).count() == 0
+        assert s.query(store.Source).count() == 3

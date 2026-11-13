@@ -96,7 +96,9 @@ def _next_page(soup, base, n):
                                                       r">|>>|›|»|→)\s*", label.strip()):
             return urljoin(base, a["href"])
     for a in soup.find_all("a", href=True):
-        if a.get_text(strip=True) == str(n + 1):
+        # '2', 'Page : 2' (a screen-reader prefix: Crédit Agricole, 1,304 offers of which only page 1 was read), data-page="2"
+        label = re.sub(r"^(?:page|p\.?)\s*:?\s*", "", norm(a.get_text(" ", strip=True)))
+        if label == str(n + 1) or a.get("data-page") == str(n + 1):
             return urljoin(base, a["href"])
     field = soup.find("input", attrs={"type": "hidden", "name": re.compile(r"^(pn|page|pageno|pagenum|pagenumber)$", re.I)})
     for a in soup.find_all("a") if field else ():  # CGI: 'javascript:gotopage(2)' + field 'pn'; CNRS: onclick="toPage('SearchForm', 2)"
@@ -130,6 +132,11 @@ def _form_post(soup, base, nxt):
     return urljoin(base, form.get("action") or base), data
 
 
+_COOKIE_OK = re.compile(r"^\s*(tout accepter|accepter( tout| et fermer)?|j'accepte|accept( all)?( cookies)?|allow all|"
+                        r"i agree|ok)\s*$", re.I)
+_MORE_CONTROL = re.compile(r"load more|show more|voir plus|charger plus|afficher plus|plus d'offres|plus d’offres|more jobs|"
+                           r"plus de r[ée]sultats", re.I)
+_NEXT_CONTROL = re.compile(r"^\s*(?:suivant(?:e)?|page suivante|next(?: page)?)\s*[→›»>]?\s*$|^\s*[›»→]\s*$", re.I)
 _BROWSERS = threading.Semaphore(2)  # many browsers at once on a small machine miss the data a page downloads late (IBM: 1 offer of 29)
 
 
@@ -165,26 +172,44 @@ def render_js(f, url, cfg):
             except Exception:
                 pass
             try:  # a cookie banner often covers the list and its buttons
-                ok = pg.get_by_role("button", name=re.compile(r"^(tout accepter|accepter( tout| et fermer)?|j'accepte|"
-                                                              r"accept( all)?( cookies)?|allow all|i agree|ok)$", re.I))
+                ok = pg.get_by_role("button", name=_COOKIE_OK)
+                if not ok.count():  # its accessible name differs from what it shows (Crédit Mutuel's 'Accepter')
+                    ok = pg.locator("button, [role=button]").filter(has_text=_COOKIE_OK)
                 if ok.count() and ok.first.is_visible():
                     ok.first.click(timeout=3000)
                     pg.wait_for_timeout(800)
             except Exception:
                 pass
-            clicks = True
-            for _ in range(8):
-                btn = pg.get_by_role("button", name=re.compile(r"load more|show more|voir plus|charger plus|afficher plus|"
-                                                               r"plus d'offres|more jobs|plus de r[ée]sultats", re.I))
+            # cfg['_more_clicks'] > 8: the list announces far more offers than it shows (Crédit Mutuel: 15 of 523, more with
+            # a 'Plus de résultats' LINK; Groupama: 10 of 581, pages '2', '3', 'Suivant →' run by a script): 'more' is
+            # clicked until the list stops growing, else 'next' page after page, each page kept
+            limit, clicks, pages, still, last = int(cfg.get("_more_clicks", 8)), True, [], 0, None
+            controls = "button, a, [role=button], [role=link], input[type=button], input[type=submit]"
+            for _ in range(limit):
+                btn = pg.locator(controls).filter(has_text=_MORE_CONTROL)
                 try:
                     if clicks and btn.count() and btn.first.is_visible():
                         btn.first.click(timeout=4000)
+                    elif limit > 8:
+                        step = pg.locator(controls).filter(has_text=_NEXT_CONTROL)
+                        if not (step.count() and step.first.is_visible()):
+                            break
+                        pages.append(pg.content())
+                        step.first.click(timeout=4000)
                     else:
                         pg.mouse.wheel(0, 4000)
                 except Exception:
                     clicks = False  # the button cannot be clicked (covered, disabled): scrolling only
-                pg.wait_for_timeout(700)
+                pg.wait_for_timeout(700 if limit <= 8 else 1800)  # a list loading its next offers can be slow
+                if limit > 8:  # the list stopped changing: its end
+                    sig = hash(tuple(pg.eval_on_selector_all("a[href]", "xs => xs.map(x => x.href)")))
+                    still, last = (still + 1 if sig == last else 0), sig
+                    if still >= 3:
+                        break
             html = pg.content()
+            if pages:  # every page of a list paged by a script, in one document
+                body = lambda h: (re.search(r"<body[^>]*>(.*)</body>", h, re.S | re.I) or [h, h])[1]  # noqa: E731
+                html = "<html><body>" + "\n".join(body(h) for h in pages + [html]) + "</body></html>"
             b.close()
             return html, found
     except Exception as e:
@@ -603,9 +628,12 @@ def crawl_generic(f, url, cfg, known, st):
                         f.note(f"full list not usable: {str(e)[:80]}")
             if n == 1 and not st.announced:
                 st.announced = announced_total(soup)
-            if not jobs and (len(links) < 3 or retry) and n == 1 and not rendered:  # (nearly) empty without JavaScript
+            # the page announces far more offers than it shows, with no next page to open: its 'more' / 'next' controls are
+            # run by a script, clicked in the browser until the list is complete
+            short = bool(st.announced) and len(links) < st.announced * 0.5 and not _next_page(soup, page_url, 1)
+            if not jobs and (len(links) < 3 or retry or short) and n == 1 and not rendered:  # (nearly) empty without JavaScript
                 rendered = True
-                html2, net = render_js(f, page_url, cfg)
+                html2, net = render_js(f, page_url, {**cfg, "_more_clicks": 80} if short else cfg)
                 if html2:
                     soup2 = BeautifulSoup(html2, PARSER)
                     jobs2 = _jsonld_jobs(soup2, page_url) or embedded_jobs(soup2, page_url) or net
@@ -614,6 +642,16 @@ def crawl_generic(f, url, cfg, known, st):
                         soup, jobs, links = soup2, jobs2, links2
                         st.announced = st.announced or announced_total(soup2)
                         f.note(f"page rendered with JavaScript: {len(jobs)} jobs, {len(links)} job links")
+                    if (not short and not jobs and st.announced and len(links) < st.announced * 0.5
+                            and not _next_page(soup, page_url, 1)):
+                        # the total shows only once rendered (Groupama: '581 offres', 10 shown, pages run by a script):
+                        # rendered once more, its 'more' / 'next' controls clicked until the list is complete
+                        html3, _ = render_js(f, page_url, {**cfg, "_more_clicks": 80})
+                        links3 = _job_links(BeautifulSoup(html3, PARSER), page_url, set()) if html3 else []
+                        if len(links3) > len(links):
+                            soup, links = BeautifulSoup(html3, PARSER), links3
+                            f.note(f"the list announces {st.announced} offers: its next pages were opened in the browser, "
+                                   f"{len(links)} job links")
             if n == 1 and not jobs and len(links) <= 2:  # an empty list (a spontaneous application link at most): the
                 st.no_openings = no_openings(soup)      # website may say so itself. Used only when no offer is found at all
             if jobs and links:

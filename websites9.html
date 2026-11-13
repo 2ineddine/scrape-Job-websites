@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Open Multiple Tabs</title>
+</head>
+<body>
+    <script>
+        // Add your URLs here
+        // Banks, insurers, asset managers, payment and credit fintechs, quant funds (tabular data science: risk, credit,
+        // pricing, fraud, actuarial), and the ESN / consulting firms not yet in websites.html to websites8.html. Checked
+        // 13 Nov 2026 with the app's reader, robots.txt not applied (the app's default): each address below gave offers,
+        // or reads its list to the end. The numbers are the offers its list showed that day.
+        const urls = [
+            // Banks and public finance
+            'https://groupecreditagricole.jobs/fr/nos-offres/',  // Crédit Agricole group (LCL, CACIB, Amundi...): every page, ~1,300 offers (about 9 min)
+            'https://recrutement.creditmutuel.fr/fr/nos_offres.html',  // Crédit Mutuel Alliance Fédérale, CIC: its 'Plus de résultats' clicked in the browser (~220 of ~520)
+            'https://cmarkea-recrute.talent-soft.com/offre-de-emploi/liste-offres.aspx',  // Crédit Mutuel Arkéa (~80)
+            'https://recrutement.bpce.fr/offres-emploi/',  // BPCE: Natixis, Banque Populaire, Caisse d'Epargne, Oney (its newest ~35, read by the AI page reader)
+            'https://www.recrutement.banque-france.fr/fr',  // Banque de France (Workday)
+            'https://talents.bpifrance.fr/',  // Bpifrance
+            'https://choisirleservicepublic.gouv.fr/nos-offres/filtres/organisme/17/',  // Caisse des Dépôts (its offers are on Choisir le service public)
+            'https://www.euronext.com/en/about/careers/open-positions',  // Euronext (~45)
+
+            // Asset management, investment banking, quantitative funds
+            'https://jobs.amundi.com/',  // Amundi (~120)
+            'https://www.rothschildandco.com/en/careers/',  // Rothschild & Co
+            'https://jobs.cfm.com/',  // Capital Fund Management (quant research, ML)
+            'https://www.qube-rt.com/careers/',  // Qube Research & Technologies (its Greenhouse board, ~210; robots.txt closes it when respected)
+            'https://jobs.lever.co/kpler',  // Kpler: commodity data (~110)
+
+            // Insurance
+            'https://careers.allianz.com/global/en/search-results',  // Allianz: every country, the app keeps France (~340)
+            'https://recrutement.maif.fr/',  // MAIF
+            'https://carrieres.malakoffhumanis.com/',  // Malakoff Humanis
+            'https://www.ag2rlamondiale.fr/recrutement',  // AG2R La Mondiale (Workday)
+            'https://www.coface.com/careers',  // Coface: credit insurance (SmartRecruiters)
+            'https://www.cnp.fr/le-groupe-cnp-assurances/candidats/espace-carrieres',  // CNP Assurances: its page shows only its latest offers
+            'https://www.groupama-gan-recrute.com/nos-offres/',  // Groupama Gan: only its first 10 of ~580 readable (its next pages are run by a script behind a window the app cannot close)
+
+            // Payments and credit fintechs
+            'https://jobs.worldline.com/',  // Worldline: payments, fraud (read by the AI browser: uses AI calls)
+            'https://careers.younited-credit.com/',  // Younited: consumer credit (Lever)
+            'https://swanio.teamtailor.com/jobs',  // Swan: banking as a service
+            'https://career.mangopay.com/jobs',  // Mangopay
+            'https://lemonwayjobcareers.recruitee.com/',  // Lemonway
+            'https://nickel.welcomekit.co/',  // Nickel (says it has no offer now)
+
+            // ESN, consulting, audit with data and actuarial teams
+            'https://recrutement-fr.forvismazars.com/offres-emploi',  // Forvis Mazars (SmartRecruiters, ~210)
+            'https://careers.ey.com/ey/search/?locationsearch=France',  // EY France
+            'https://www.deloitte.com/fr/fr/careers/content/job/results.html',  // Deloitte France: its results page
+            'https://jobs-collaborationbetterstheworld.icims.com/jobs/search?ss=1',  // CBTW (ex Positive Thinking Company): every country, the app keeps France
+            'https://kyndryl.wd5.myworkdayjobs.com/KyndrylProfessionalCareers',  // Kyndryl: every country, the app keeps France
+            'https://dxctechnology.wd1.myworkdayjobs.com/DXCJobs'  // DXC Technology: every country, the app keeps France
+        ];
+
+        // not screened (checked 13 Nov 2026), so not in the list above (addresses without quotes are not read):
+        //   BNP Paribas https://group.bnpparibas, MACIF https://www.macif.fr, Swiss Life https://www.swisslife.fr, PwC France
+        //   https://www.pwc.fr, Lincoln https://www.lincoln.fr: anti-bot page (HTTP 403), never got around
+        //   Société Générale https://careers.societegenerale.com: its offers are loaded by a script the app cannot read (2 readable)
+        //   Covéa https://www.covea.com, SCOR https://www.scor.com, Wakam https://www.wakam.com, Generali
+        //   https://www.generali.fr, April https://www.april.com, Advans Group https://www.advans-group.com: no list of
+        //   offers the app can read on their career page
+        //   Econocom https://www.econocom.com: the website did not answer
+        //   KPMG France, NTT DATA France, La Banque Postale, Cofidis, Edenred, Ayvens, Silvr, Defacto, Algoan, Quinten:
+        //   no readable French career site found (some only on Welcome to the Jungle, which the app cannot read)
+        //   Micropole: now part of Talan (already in websites.html); Zelros: now part of Earnix (Israel)
+
+        // Open each URL in a new tab
+        urls.forEach(url => {
+            window.open(url, '_blank');
+        });
+
+        // Close the original blank tab (optional)
+        window.close();
+    </script>
+</body>
+</html>

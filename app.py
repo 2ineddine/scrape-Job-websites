@@ -8,7 +8,7 @@ import os
 import threading
 from collections import Counter
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,8 +25,9 @@ from jobfinder.config import (APPLICANT_DEFAULT, CONFIG_DEFAULT, PRESET_DAYS, PR
                              upgrade_profile)
 from jobfinder.scan import PROBLEM_ORDER, Progress, run_scan, site_problem
 from jobfinder.store import (ENV_KEYS, CoverLetter, CVDocument, Job, SessionLocal, Source, ensure_gitignore, file_coverage,
-                             get_setting, init_db, keyword_sources, load_keys, load_new_sources, save_key, scan_running_elsewhere, set_setting,
-                             wipe_session_data, recent_count, forget_recent_offers)
+                             get_setting, init_db, keep_recent_offers, keyword_sources, load_keys, load_new_sources, save_key,
+                             scan_ended, scan_running_elsewhere, set_setting, wipe_session_data, recent_count,
+                             forget_recent_offers, restart_session, unfinished_scan)
 from jobfinder.web import extract_urls, offer_link, pasted_urls
 
 ASSETS = Path(__file__).parent / "assets"
@@ -38,12 +39,29 @@ st.html(f"<style>{(ASSETS / 'navy.css').read_text(encoding='utf-8')}</style>")
 
 @st.cache_resource
 def _launch():
-    """Runs once per launch: websites and offers from a previous run are deleted (fresh start)."""
-    wipe_session_data()  # the analysed offers are first copied into the market history
+    """Runs once per launch: websites and offers from a previous run are deleted (fresh start), unless the last scan did
+    not finish: its websites and results stay, and the Search page offers to resume it or to start again."""
+    p = Progress()
+    with SessionLocal() as s:
+        left = unfinished_scan(s)
+    if not left:
+        wipe_session_data()  # the analysed offers are first copied into the market history
     with SessionLocal() as s:
         market.run_if_due(s)  # the statistics, every 15 days
-    atexit.register(wipe_session_data)  # and again when the app is turned off
-    return Progress()
+
+    def on_exit():  # the app is turned off
+        if p.snap()[0]["running"]:  # during a scan: it stays to be resumed, with every offer read so far
+            with SessionLocal() as s:
+                keep_recent_offers(s)
+                scan_ended(s, "the app was closed during the scan")
+            return
+        with SessionLocal() as s:
+            if unfinished_scan(s):
+                return
+        wipe_session_data()
+
+    atexit.register(on_exit)
+    return p
 
 
 prog = _launch()
@@ -360,20 +378,56 @@ def step_analysis(running, n):
             st.rerun()
         if st.session_state.get("kept_msg"):
             st.toast(st.session_state.pop("kept_msg"))
+        with SessionLocal() as s:
+            left = None if running else unfinished_scan(s)
+        if left:
+            unfinished_box(left)
         x, y, _ = st.columns([1, 1, 3])
-        if x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:", width="stretch"):
-            with SessionLocal() as s:
-                keyword_sources(s, c)  # Hellowork searched with the profile's keywords (when ticked)
-                ids = [r.id for r in s.query(Source).all()]
-            cfg, prof, keys = json.loads(json.dumps(c)), json.loads(json.dumps(p)), dict(KEYS)
-            cfg["_keys"] = keys  # in memory only (never saved): lets the AI read pages and offers
-            threading.Thread(target=run_scan, args=(ids, cfg, prof, prog,
-                                                    lambda pr, feed: analyze_pipeline(cfg, prof, keys, pr, feed)),
-                             daemon=True).start()
-            st.rerun()
+        if not left and x.button("Start", type="primary", disabled=running or not n["sites"], icon=":material/play_arrow:",
+                                 width="stretch"):
+            start_scan()
         if y.button("Stop", disabled=not running, icon=":material/stop:", width="stretch"):
             prog.cancel.set()
         st.fragment(run_every=2 if running else None)(_monitor)()
+
+
+def start_scan(resume=None):
+    """A new scan of every website with today's settings, or the resumed one: its websites still to read, with its own
+    search settings and profile, and today's AI settings and keys (credits added in between are used)."""
+    if resume:
+        ids, cfg, prof = resume["todo"], {**c, **resume.get("cfg", {})}, resume.get("profile") or p
+    else:
+        with SessionLocal() as s:
+            keyword_sources(s, c)  # Hellowork searched with the profile's keywords (when ticked)
+            ids = [r.id for r in s.query(Source).all()]
+        cfg, prof = c, p
+    cfg, prof, keys = json.loads(json.dumps(cfg)), json.loads(json.dumps(prof)), dict(KEYS)
+    cfg["_keys"] = keys  # in memory only (never saved): lets the AI read pages and offers
+    threading.Thread(target=run_scan, args=(ids, cfg, prof, prog, lambda pr, feed: analyze_pipeline(cfg, prof, keys, pr, feed)),
+                     kwargs={"resume": resume}, daemon=True).start()
+    st.rerun()
+
+
+def unfinished_box(left):
+    """The last scan did not finish (Stop, time limit, AI credits, app closed): resume it, or start again."""
+    started = datetime.fromisoformat(left["started"]).replace(tzinfo=timezone.utc).astimezone()  # saved in UTC: local time
+    total = len(left.get("source_ids") or [])
+    with st.container(border=True, key="card_resume"):
+        st.markdown(f"**The last scan did not finish** — {html.escape(left.get('why') or 'stopped')}.")
+        st.caption(f"Started {started:%d %b %Y at %H:%M}, range “{left.get('cfg', {}).get('date_preset', '')}”: "
+                   f"{left['done']:,} of {total:,} websites read" + (f", {left['pending']:,} offers waiting for the AI analysis"
+                                                                     if left["pending"] else "") + ". "
+                   "**Resume** reads only the websites not read yet and analyses only the offers not analysed yet, with that "
+                   "scan's date range and search profile, and today's AI keys and models (add credits or a key in Settings "
+                   "first if they ran out). **Start again** reads every website from the first one; the offers read in the "
+                   "last 24 hours are not opened or analysed again.")
+        a, b, _ = st.columns([1, 1, 3])
+        if a.button("Resume", type="primary", icon=":material/play_arrow:", width="stretch", key="resume_scan"):
+            start_scan(resume=left)
+        if b.button("Start again", icon=":material/restart_alt:", width="stretch", key="restart_scan"):
+            with SessionLocal() as s:
+                restart_session(s)
+            start_scan()
 
 
 def page_search():

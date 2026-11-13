@@ -17,10 +17,12 @@ Optional: a LaTeX distribution (`latexmk`), to compile cover letters to PDF.
 
 ## Use
 
-1. **Websites**: upload one or more HTML files listing career-page URLs (`websites.html` to `websites8.html`;
+1. **Websites**: upload one or more HTML files listing career-page URLs (`websites.html` to `websites9.html`;
    `websites5.html` holds STATION F startups, `websites6.html` startups funded in 2025–2026, Next40 / French Tech 120
    scale-ups and large groups; `websites7.html` AI labs with Paris teams, deep-tech, scale-ups and more large groups;
-   `websites8.html` ESN, large to very small), or paste URLs. Addresses written without quotes, in comments, are not read.
+   `websites8.html` ESN, large to very small; `websites9.html` banks, insurers, asset managers, payment and credit
+   fintechs, quant funds and the consulting firms with data teams), or paste URLs. Addresses written without quotes, in
+   comments, are not read.
 2. **CV**: upload PDF CVs. A CV is sent to a hosted AI only after you tick the consent box.
 3. **Analysis**: choose the offer types and the date range (24 h to 30 days), then press **Start**. One bar per
    uploaded file shows how many of its websites were searched: read, partly read, blocked or failed, and not reached
@@ -90,7 +92,10 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   iCIMS, Phenom, Eightfold, Greenhouse, Lever, Ashby, Workable, SmartRecruiters, Teamtailor, Talentsoft, Welcome to the
   Jungle career sites, Personio, France Travail API…). Other websites go to a generic crawler that reads structured data, links,
   sitemaps and pages rendered with JavaScript once. Lab pages go to an AI page reader, and sites that need clicking go
-  to an AI browser.
+  to an AI browser. A list that announces far more offers than it shows, with no next-page link to open ("523 offres",
+  15 shown), is completed in the browser: its "more" button or link is clicked until the list stops growing, else its
+  "next" control page after page (Crédit Mutuel: about 220 offers read instead of 15). Page numbers with a hidden
+  "Page :" prefix are followed (Crédit Agricole: its 41 pages instead of the first one).
 - **Hellowork search with your keywords** (step 3, ticked by default): at each scan, the app reads Hellowork's open page
   of every keyword of the search profile, and its job-title page ("data scientist", "research engineer"). Their offers go
   through the same filters as any website, the date range first: an offer whose card is older than the range is not
@@ -151,6 +156,12 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   each website's robots.txt allows. Checked on the 372 websites on 2026-11-12: 336 have a robots.txt, and its rules
   close pages with offers on 20 of them. Either way the app keeps its own name, reads at most one page per second per
   website, never loads advertising or tracking requests, and never gets around an anti-bot page, a login or a captcha.
+- **A scan that did not finish is resumed**: stopped with the Stop button, cut by the 6-hour limit, stopped because the AI
+  credits or quotas ran out, or cut because the app was closed or the computer turned off. Its websites and results stay
+  until the next launch, and the Search page says why it did not finish and offers two choices. **Resume** reads only the
+  websites not read yet (and those cut short) and sends the offers not analysed yet to the AI first, with that scan's date
+  range and search profile but today's AI keys and models, so credits or a key added in Settings are used. **Start again**
+  reads every website from the first one (the offers read in the last 24 hours are still not opened or analysed again).
 - **Websites that did not work**: after each scan (and while it runs), the Search page lists every website that was
   blocked, not reachable, gone (page not found), partly read, read without any offer, possibly incomplete, changed since
   the last scan or moved, with the reason and what to do; the list downloads as CSV. A career page that says it has no

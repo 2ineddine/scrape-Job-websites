@@ -396,6 +396,7 @@ def wipe_session_data() -> bool:
             s.query(AICache).filter((AICache.kind.notin_(KEPT_AI_ANSWERS)) | (AICache.kind.is_(None))
                                     | (AICache.created < utcnow() - timedelta(days=30))).delete(synchronize_session=False)
             s.commit()
+            drop_scan_record(s)  # its websites are gone: nothing left to resume
     except Exception as e:  # pragma: no cover
         LOG.warning("wipe failed: %s", e)
     return True
@@ -496,7 +497,90 @@ def forget_recent_offers() -> int:
         s.query(CoverLetter).delete()
         s.query(Source).update({Source.status: "not_started", Source.jobs_found: 0, Source.last_error: ""})
         s.commit()
+        drop_scan_record(s)  # its results are gone: nothing left to resume
     return n
+
+
+# ---------------------------------------------------------------------------- an unfinished scan, resumed later
+# A scan that did not finish (Stop button, 6-hour limit, AI credits or quotas used up, app closed or computer turned off
+# during the scan) keeps its websites and results until the next launch, which offers to RESUME it (only the websites not
+# read yet, and the offers not analysed yet) or to START AGAIN. The search settings are the scan's own; the AI settings
+# and keys are today's (credits added in between are used).
+SCAN_KEYS = ("date_preset", "date_from", "date_to", "hellowork_keywords", "respect_robots", "min_relevance")
+
+
+def scan_record(s) -> dict:
+    return get_setting(s, "last_scan", {}) or {}
+
+
+def drop_scan_record(s):
+    set_setting(s, "last_scan", {})
+
+
+def scan_started(s, source_ids, cfg, profile, resume=None):
+    """Records the scan that starts or resumes: its websites, its search settings and profile (never a key)."""
+    if resume:
+        info = {k: v for k, v in resume.items() if k not in ("todo", "done", "pending")}
+        info["resumed"] = int(info.get("resumed") or 0) + 1
+    else:
+        info = {"started": utcnow().isoformat(), "source_ids": list(source_ids),
+                "cfg": {k: cfg[k] for k in SCAN_KEYS if k in cfg}, "profile": profile, "resumed": 0}
+    set_setting(s, "last_scan", {**info, "state": "running", "pid": os.getpid(), "why": ""})
+
+
+def scan_ended(s, why=""):
+    """The scan is over: finished (why ''), or not (why: the reason, shown with the offer to resume it)."""
+    info = scan_record(s)
+    if info:
+        set_setting(s, "last_scan", {**info, "state": "interrupted" if why else "finished", "why": why,
+                                     "ended": utcnow().isoformat()})
+
+
+def scan_todo(s, info) -> tuple[list[int], int, int]:
+    """What an unfinished scan still has to do -> (websites to read, websites read, offers waiting for the AI). A website
+    counts as read once it ended after the scan started; one cut short by its time limit is read again."""
+    started, ids = datetime.fromisoformat(info["started"]), list(info.get("source_ids") or [])
+    todo, done = [], 0
+    for x in s.query(Source).filter(Source.id.in_(ids)):
+        if x.last_scan is None or x.last_scan < started or x.status in ("not_started", "partially_completed"):
+            todo.append(x.id)
+        else:
+            done += 1
+    pending = s.query(Job).filter(Job.source_id.in_(ids), Job.status.in_(["new", "candidate", "review"]),
+                                  Job.relevance_score.is_(None)).count()
+    return todo, done, pending
+
+
+def unfinished_scan(s) -> dict | None:
+    """The last scan when it did not finish and is not running (here or in another window) -> its record with 'todo',
+    'done' and 'pending', else None. A scan whose process ended without saying so counts as interrupted."""
+    info = scan_record(s)
+    if info.get("state") == "running":
+        if scan_owner() is not None:
+            return None
+        info = {**info, "state": "interrupted", "why": "the app was closed during the scan"}
+        set_setting(s, "last_scan", info)
+    if info.get("state") != "interrupted" or not info.get("started"):
+        return None
+    todo, done, pending = scan_todo(s, info)
+    return {**info, "todo": todo, "done": done, "pending": pending} if todo or pending else None
+
+
+def restart_session(s):
+    """'Start again' after an unfinished scan: its offers are kept for 24 hours like any scan's (the new scan does not open
+    their pages again, nor analyse them again), then its results are cleared. The websites stay."""
+    try:
+        from .market import archive_offers
+        archive_offers(s)
+    except Exception as e:  # pragma: no cover - statistics never block a new scan
+        s.rollback()
+        LOG.warning("market history not updated: %s", e)
+    keep_recent_offers(s)
+    s.query(Job).delete()
+    s.query(CoverLetter).delete()
+    s.query(Source).update({Source.status: "not_started", Source.jobs_found: 0, Source.last_error: ""})
+    s.commit()
+    drop_scan_record(s)
 
 
 def load_new_sources(s, urls: list[str], origins: dict | None = None) -> int:

@@ -120,6 +120,12 @@ def hide_out_of_range(s, job, why):
     s.commit()
 
 
+# Filtering takes about 60 ms per offer and writes as it goes: one save for a whole website held SQLite's single write lock
+# for over a minute on a 1,365-offer website (Crédit Agricole, 17 Nov 2026), and another website's save, waiting more than
+# the 30 s allowed, failed with 'database is locked'. The offers are saved every FILTER_BATCH offers instead.
+FILTER_BATCH = 100
+
+
 def apply_filters(s, cfg, profile, now=None, source_ids=None, merge=True):
     """Pipeline stages 5-7: date -> France location -> fast title filter. Records reason for every outcome.
     source_ids: only the offers of these websites (a website just read); merge: then merge the duplicates of every website."""
@@ -128,7 +134,9 @@ def apply_filters(s, cfg, profile, now=None, source_ids=None, merge=True):
     todo = s.query(Job).filter(Job.status == "new")
     if source_ids is not None:
         todo = todo.filter(Job.source_id.in_(list(source_ids)))
-    for job in todo.all():
+    for n, job in enumerate(todo.all()):
+        if n and n % FILTER_BATCH == 0:
+            s.commit()  # the database is free for the other writers between batches (see FILTER_BATCH)
         flags, ex = [], job.extra or {}
         refine_job_date(job, now)  # the description may state the real publication date
         first = ex.get("first_seen")
@@ -698,16 +706,22 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None, resume=None):
         if prog.cancel.is_set() or time.time() - t0 > cfg["max_duration"]:
             return
         calm = {**cfg, "timeout": cfg["timeout"] * 2, "retries": 0}
-        scan_source(sid, calm, Fetcher(calm, prog.say), prog, t0)
+        try:  # like a first reading, one website's error stays its own: it never skips the end of the scan (17 Nov 2026)
+            scan_source(sid, calm, Fetcher(calm, prog.say), prog, t0)
+        except Exception as e:  # pragma: no cover - scan_source records its own errors
+            prog.say(f"website {sid} crashed on its second try: {e}")
         filters.submit(hand_over_safe, [sid])
 
     def explain_dead(sid):  # the page is gone: the website's home page may link its new address
-        with SessionLocal() as s:
-            src = s.get(Source, sid)
-            page = suggest_page(Fetcher(cfg, prog.say), src.url)
-            if page:
-                src.last_error = f"{src.last_error}; possible new address: {page}"
-                s.commit()
+        try:
+            with SessionLocal() as s:
+                src = s.get(Source, sid)
+                page = suggest_page(Fetcher(cfg, prog.say), src.url)
+                if page:
+                    src.last_error = f"{src.last_error}; possible new address: {page}"
+                    s.commit()
+        except Exception as e:  # pragma: no cover - a suggestion never stops the end of the scan
+            prog.say(f"no new address looked for website {sid}: {e}")
 
     def analyse():
         try:
@@ -725,21 +739,27 @@ def run_scan(source_ids, cfg, profile, prog: Progress, then=None, resume=None):
     if before:  # a resumed scan: the offers of the websites read before, not analysed yet, are filtered and analysed first
         filters.submit(hand_over_safe, before)
     try:
-        with ThreadPoolExecutor(max_workers=int(cfg["parallel_sites"])) as ex:
-            list(ex.map(one, source_ids))
+        try:  # the reading; whatever happens in it, the closing steps below still run (17 Nov 2026)
+            with ThreadPoolExecutor(max_workers=int(cfg["parallel_sites"])) as ex:
+                list(ex.map(one, source_ids))
+                with SessionLocal() as s:
+                    todo = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status.in_(["failed", "blocked"]))
+                            if _RETRY.search(x.last_error or "")]
+                prog.say(f"second try for {len(todo)} websites")
+                list(ex.map(again, todo))
+                with SessionLocal() as s:
+                    dead = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status == "failed")
+                            if re.search(r"HTTP (404|410|5\d\d)", x.last_error or "")]
+                list(ex.map(explain_dead, dead))
+        except Exception as e:  # never crash silently
+            prog.say(f"FATAL {e}")
+        try:
             with SessionLocal() as s:
-                todo = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status.in_(["failed", "blocked"]))
-                        if _RETRY.search(x.last_error or "")]
-            prog.say(f"second try for {len(todo)} websites")
-            list(ex.map(again, todo))
-            with SessionLocal() as s:
-                dead = [x.id for x in s.query(Source).filter(Source.id.in_(source_ids), Source.status == "failed")
-                        if re.search(r"HTTP (404|410|5\d\d)", x.last_error or "")]
-            list(ex.map(explain_dead, dead))
-        with SessionLocal() as s:
-            for src in s.query(Source).filter(Source.id.in_(source_ids)):
-                src.health = health_note(s, src, cfg["date_preset"])
-            s.commit()
+                for src in s.query(Source).filter(Source.id.in_(source_ids)):
+                    src.health = health_note(s, src, cfg["date_preset"])
+                s.commit()
+        except Exception as e:  # pragma: no cover - the notes never stop the last filters
+            prog.say(f"website notes not saved: {e}")
         prog.set(task="filtering")
         filters.shutdown(wait=True)
         hand_over(None)  # every offer still waiting, and the duplicates of every website merged

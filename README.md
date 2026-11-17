@@ -112,6 +112,19 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   shows it. A Teamtailor feed holds 100 offers; when it is full and still inside the date range, the rest is read on
   the career site. A career page that has moved is read at the address its home page links, with a note to update it.
   A job platform that fails for a moment (HTTP 503) makes the website fail, so the scan reads it again at the end.
+  Checked on 2026-11-17 against an independent reading of the same websites (their platforms' APIs, every list page in
+  a browser, Hellowork's search):
+  - a company page whose offers are on a job platform the app reads (Softy, Workable, Eightfold, Talentsoft,
+    SuccessFactors, JobAffinity, JOIN, and the others) is read on that platform, each offer with its own date
+    (Inserm: its Softy board's 152 offers instead of 13);
+  - one role posted in several cities is kept for each city (Alteca: "Business Analyst (H/F)" in Dijon and in Vannes);
+    only one page behind several links of the same name is kept once;
+  - an offer listed in the sitemap by a number only ("/nos-offres/892312", SNCF) is opened when its last change is inside
+    the range (its address names no title to judge);
+  - the offer's first publication date wins over a company page that shows another one as "posted": SmartRecruiters'
+    release date over Magellan's, Scalian's and Sopra Steria's pages, the "date de publication" written in Orange's
+    offers over their page data, WordPress's publication date over its "modified" date (Jems Group): not new offers;
+  - a secure connection cut by the network is tried again; only a certificate that does not verify is final.
 - **Filters, in order**:
   1. **Date**: from evidence only. Refresh, deadline and start dates are never used, nor the dates of other offers shown
      on an offer's page ("similar offers"): the page's text replaces the offer's own date only with an earlier one. An undated offer is
@@ -140,12 +153,20 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   An offer whose contract is not stated is kept ("contract: not stated"): the AI must quote the words that state a
   contract before an offer is set aside for its type, and the quote decides: "contrat CDD 6 mois" is a job (CDI / CDD),
   not an internship, while a PhD or post-doc stays one even though it is a fixed-term contract too.
+  A website's employment tags that name a training kind and a regular job together (Hellowork's "INTERN, FULL_TIME" on
+  some engineers' jobs) do not set an offer aside: the title, then the AI reading the text, tell the kind of offer.
   The same model can score the same offer 35 one time and 85 the next: an offer the AI turns down with a score of 25 or
   more is read a second time (with a low minimum relevance, the AI's "not relevant" decides, so this covers it too), and
   goes to "To check" ("AI readings disagree") when that reading finds it relevant.
 - **Duplicates**: the same offer on several websites, or posted twice on one website, is shown once.
 - **Unreachable job pages**: a website whose job pages do not answer twice in a row (candidat.francetravail.fr from
   some networks) is not opened again for 30 minutes; its offers are analysed with the text already read.
+- **A server that does not answer**: while a website is read, a page that did not answer is not asked again for 10
+  minutes, and a server that missed 3 pages in a row is left alone for 10 minutes (the offers stay, without their page).
+  On 2026-11-17, with Lever down, BlaBlaCar's reading opened the same 4 pages twice, 80 s each. The websites that failed
+  (down, refused, rate-limited) get a second try at the end of the scan; one website's error there never stops the
+  others' tries nor the end of the scan (the last filters, the duplicates merged, the notes), and the filters save
+  every 100 offers so that a big website (Crédit Agricole, 1,365 offers) never keeps the database locked.
 
 ## Safety
 
@@ -189,12 +210,19 @@ docker run -d -p 127.0.0.1:8501:8501 --env-file api_keys.txt -v job-finder-data:
   - welcometothejungle.com: its servers refuse automated browsers (use `<company>.welcomekit.co` or `jobs.stationf.co`
     instead);
   - JobTeaser and Glassdoor: anti-bot protection.
-- Workday may refuse requests for a few hours after several full scans in a row.
+- Workday may refuse requests for a few hours after several full scans in a row, and limits one reader across all its
+  servers: its websites share one pace (one request per second for all of them), and when it answers "too many requests"
+  (HTTP 429, 9 websites lost on 2026-11-17) the app waits the time it asks for (30 s otherwise, at most 2 minutes) before
+  asking Workday again, for every Workday website at once; a website still refused gets its second try at the end.
 - Hellowork, with robots.txt respected: its robots.txt closes its search engine, its date filter and every next page (any
   address with "?"). A company page shows its 30 newest offers, and a keyword or job-title page its 20 newest offers in
   France: for a broad word ("intelligence artificielle", 7,800 offers) that is a few hours of offers, for a narrow one
   ("computer vision") all of them. With **Respect robots.txt** off, Hellowork's search is read for every keyword, sorted
-  newest first and page after page until the offers are older than the date range, then the keyword pages (checked on
-  2026-11-12 with the profile's 42 keywords and "Last 24 hours": 231 offers of the day instead of 75, in about 10 minutes).
+  newest first, with Hellowork's own date filter that holds the range ("Depuis 3 jours" for "Last 24 hours", 1 week for 3
+  days, 1 month for 7 and 14 days), page after page, then the keyword pages (checked on 2026-11-12 with the profile's 42
+  keywords and "Last 24 hours": 231 offers of the day instead of 75, in about 10 minutes). Hellowork's "newest first" is
+  two lists one after the other: the offers naming the words in their title, then the others, each newest first. The
+  search goes on past the first list's old offers (up to 5 pages) to the second one, and ends when that one is past the
+  range too (2026-11-17, "data science": 134 offers of the last two days instead of 9).
   A Hellowork search address in a website file keeps its own filters (place, contract) the same way. Hellowork's company
   search stays closed: add a company's page by its address.

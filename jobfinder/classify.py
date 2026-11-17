@@ -744,8 +744,23 @@ class TitleInfo:
                                               "contract", "training", "verdict", "reason")}
 
 
-def _training(t, employment_type):
+# a regular job named in the website's employment type, beside a training kind or not
+_JOB_TYPE = re.compile(r"\b(full ?time|part ?time|cdi|cdd|permanent|temporary|fixed term|regular|temps plein|temps partiel|"
+                       r"freelance|interim)\b")
+
+
+def _stated_type(employment_type) -> str:
+    """The employment type, cleaned, when it states one kind of offer. Tags that name a training kind AND a regular job
+    ("['INTERN', 'FULL_TIME']": Hellowork tags some engineers' jobs that way, a Thales signal-processing engineer on 15 Nov
+    2026) say nothing either way: '' - the title, then the AI reading the text, tell the kind."""
     et = _clean(employment_type)
+    mixed = _JOB_TYPE.search(et) and (_APPRENTICE.search(et) or re.search(
+        r"\b(interns?|internships?|stage|stagiaire|trainee|co ?op|doctor\w*|phd|post ?doc\w*)\b", et))
+    return "" if mixed else et
+
+
+def _training(t, employment_type):
+    et = _stated_type(employment_type)
     if _APPRENTICE.search(et):
         return "apprenticeship", f"employment type '{employment_type}'"
     if re.search(r"\b(interns?|internships?|stage|stagiaire|trainee|co ?op)\b", et):
@@ -783,7 +798,7 @@ def analyze_title(title, dept="", profile=None, employment_type="") -> TitleInfo
         if _kw(x, t):
             info.role, info.role_family = x, fam
             break
-    info.contract = next((name for name, rx in _CONTRACTS if re.search(rx, t + " " + _clean(employment_type))), "")
+    info.contract = next((name for name, rx in _CONTRACTS if re.search(rx, t + " " + _stated_type(employment_type))), "")
     # shape: 'Thèse : <subject>' | '<role> – <subject>' | a subject with no role at all
     parts = re.split(r"\s+[-–—:|]\s+|\s*:\s+", clean, maxsplit=1)
     lead = _SUBJECT_LEAD.match(t)

@@ -25,8 +25,12 @@ from .config import HW_KEYWORDS_URL, utcnow
 from .urlclean import JOB_BOARDS, is_job_board
 from .web import PARSER, UA, AccessError, RobotsRefused, browser_guard, check_url, norm, normalize_url, syntactic_ok
 
-_ATS_HOSTS = ("greenhouse", "lever.co", "ashby", "smartrecruiters", "myworkdayjobs", "breezy.hr", "recruitee", "teamtailor",
-              "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters", "personio")
+# job platforms: their offer links count on a company's page whatever their address. Every platform the app reads must be
+# here: Inserm's page lists its 152 offers on its Softy board, and without 'softy.pro' the app kept none (17 Nov 2026)
+_ATS_HOSTS = ("greenhouse", "lever.co", "ashby", "smartrecruiters", "myworkdayjobs", "myworkdaysite", "breezy.hr", "recruitee",
+              "teamtailor", "icims", "welcomekit", "welcometothejungle", "jobteaser", "taleez", "flatchr", "digitalrecruiters",
+              "personio", "softy.pro", "workable.com", "eightfold.ai", "talent-soft.com", "successfactors", "jobaffinity",
+              "join.com")
 
 
 _GENDER = re.compile(r"[(\[]?\b(?:h\s*/\s*f|f\s*/\s*h|m\s*/\s*f|f\s*/\s*m|h\s*/\s*f\s*/\s*[xn]|f\s*/\s*h\s*/\s*[xn]|"
@@ -442,14 +446,27 @@ def _drop_odd_links(jobs):
 
 
 def _drop_listing_pages(jobs, listing_soup):
-    """Links that looked like jobs but opened a list / category page: the same heading on several 'jobs', or the
-    heading of the listing page itself ('Our jobs', 'Nos offres'). Structured jobs (JSON-LD, page data) are kept."""
+    """Links that looked like jobs but opened the listing page itself ('Our jobs', 'Nos offres') or a page that is no offer
+    are dropped, and one page behind several links (the same heading AND the same text) is kept once. Several offers with
+    one title are offers: an ESN posts one role in several cities (Alteca, 17 Nov 2026: 'Business Analyst (H/F)' in Dijon
+    and in Vannes, twice 'Ingénieur Développement Fullstack Java/Angular', all four dropped as 'one heading on several
+    pages'); their pages differ. Structured jobs (JSON-LD, page data) are kept."""
     head = lambda s: norm((s.find("h1") or s.title or s).get_text(" ", strip=True))[:120] if s else ""
     own = head(listing_soup)
-    jobs = [j for j in jobs if j.get("provenance") != "html-fallback" or looks_like_offer(j["description"])]
-    count = Counter(norm(j["title"]) for j in jobs if j.get("provenance") == "html-fallback")
-    return [j for j in jobs if not is_boilerplate_title(j["title"]) and (j.get("provenance") != "html-fallback"
-            or (count[norm(j["title"])] == 1 and norm(j["title"]) != own and len(norm(j["title"])) >= 4))]
+    out, pages = [], set()
+    for j in jobs:
+        if is_boilerplate_title(j["title"]):
+            continue
+        if j.get("provenance") == "html-fallback":
+            heading = norm(j.get("page_title") or j["title"])  # the page's own heading (the list card names the offer)
+            if not looks_like_offer(j["description"]) or own in (norm(j["title"]), heading) or len(norm(j["title"])) < 4:
+                continue
+            page = (norm(j["title"]), heading, norm(j["description"])[:3000])
+            if page in pages:
+                continue  # the same page behind another link of the same name
+            pages.add(page)
+        out.append(j)
+    return out
 
 
 # the website's own words for an empty list: 'We have no job openings at the moment!' (Welcome Kit), 'Nous n'avons pas
@@ -671,16 +688,35 @@ def crawl_generic(f, url, cfg, known, st):
                     f.note(f"the offers of this page are published on {plat[0]} ('{str(plat[1])[:40]}'): reading them there")
                     st.redirect, st.held = plat, jobs
                     return
+            if n == 1 and not jobs and links and not is_job_board(url):
+                # the page's offer LINKS lead to one job platform the app reads (Inserm's page, once rendered, links the 152
+                # offers of its Softy board; the AI page reader kept 13): read them there, each offer with its own date.
+                # Not when this page IS that platform (its reader failed and this is the fallback)
+                plats = [p for p in (detect_from_url(u) for u in links[:50]) if p and p[0] in ADAPTERS]
+                plat = plats[0] if plats else None
+                if (plat and sum(str(p) == str(plat) for p in plats) * 2 >= min(len(links), 50)
+                        and str(detect_from_url(page_url)) != str(plat) and str(detect_from_url(url)) != str(plat)):
+                    f.note(f"the {len(links)} offers of this page are published on {plat[0]} ('{str(plat[1])[:40]}'): "
+                           "reading them there")
+                    held = [_list_only(soup, page_url, lk, _card_title(soup, page_url, lk), None) for lk in links]
+                    st.redirect, st.held = plat, [x for x in held if x]
+                    return
             new_links = [u for u in links if u not in seen_links]
             seen_links.update(links)
             gate = cfg.get("_gate")
             page_out = sum(1 for u in links if u in st.out_known)  # already known to be too old
             page_seen = sum(1 for u in links if u in known and u not in st.out_known)
-            cards = _card_dates(soup, page_url, dayfirst=_dayfirst(soup)) if not jobs else {}
+            # the page's data may hold only part of its offers (Alteca, 17 Nov 2026: 48 offers in its data, 89 offer links; the
+            # 41 others, 4 of them published the day before, were never read): the links the data does not cover are read too
+            covered = {normalize_url(j["url"]) for j in jobs} | {normalize_url(j.get("apply_url") or "") for j in jobs}
+            todo_links = [u for u in new_links if u not in covered] if jobs else new_links
+            if jobs and todo_links:
+                f.note(f"the page's data gives {len(jobs)} offers, its links {len(todo_links)} more: those are read too")
+            cards = _card_dates(soup, page_url, dayfirst=_dayfirst(soup)) if todo_links else {}
             page_dates = []  # the dates of this page's offers in list order (cards, or the offers' own pages)
-            if not jobs:
+            if todo_links:
                 older, old_run = False, 0
-                for lk in new_links:
+                for lk in todo_links:
                     cd = cards.get(lk)
                     if cd:
                         page_dates.append(cd[0])
@@ -713,7 +749,7 @@ def crawl_generic(f, url, cfg, known, st):
                         job = _parse_detail(dhtml, lk, card=cd)
                         if job["provenance"] == "html-fallback" and title:
                             # the list knows the title; the job page's first heading may be the website's ('Découvrir l'Ircam')
-                            job["title"] = title
+                            job["page_title"], job["title"] = job["title"], title
                             if len(job["description"]) < 200 and _ID_IN_LINK.search(lk):
                                 job["provenance"] = "list-only"  # the job page needs JavaScript: the offer is kept as the list shows it
                         job["location"] = job["location"] or _card_location(soup, page_url, lk, job["title"])
@@ -863,8 +899,9 @@ def crawl_sitemap(f, url, cfg, known, st):
             out += 1  # last modified before the range: published before it too - and so is every next entry
             f.note("sitemap: the next offers were last modified before the range -> finished")
             break
-        if not worth_opening(cfg, {"title": _slug_title(u), "date": None}):
-            continue
+        if _slug_words(u) and not worth_opening(cfg, {"title": _slug_title(u), "date": None}):
+            continue  # the address names an offer outside the profile. An address of numbers names none: its page is read
+            # (SNCF, 17 Nov 2026: '/nos-offres/892312' was judged as the title 'nos offres', and every recent offer skipped)
         if details >= cfg["max_details_per_source"] or (st.deadline and time.time() > st.deadline):
             st.details_capped = True
             break
@@ -1149,16 +1186,30 @@ def crawl_hellowork_keywords(f, url, cfg, known, st):
 
 
 _HW_PAGE = 30  # offers per page of Hellowork's search
+# Hellowork's own filter 'Depuis 3 jours / 1 semaine / 1 mois' (d=d|w|m): the smallest that holds the whole date range (the
+# range counts calendar days: 'Last 24 hours' starts yesterday at 00:00, up to 48 hours back)
+_HW_SINCE = {"Last 24 hours": "d", "Last 3 days": "w", "Last 7 days": "m", "Last 14 days": "m"}
+_HW_LOOK_AHEAD = 5  # pages that end in old offers read before the second block is found ('traitement du signal': 3)
 
 
 def hellowork_search(f, url, cfg, seen, st):
     """Hellowork's search ('recherche.html?k=...', with the user's own place / contract filters when the address has them),
     sorted newest first ('st=date'), page after page ('p=2'...): read only when the user switched robots.txt off. The cards
-    are dated: an offer older than the range is never opened, and the first page that reaches such offers is the last one
-    (the list is checked to be in date order on that page). seen: the offers already read (by address), updated."""
+    are dated: an offer older than the range is never opened. seen: the offers already read (by address), updated.
+
+    'Newest first' is TWO lists one after the other (17 Nov 2026): first the offers naming the words in their title, then the
+    others, each newest first. The app stopped at the first block's old offers ('data science': page 1, 9 recent offers, 21
+    older ones), and the second block, from page 3, held 124 offers of the last 2 days. So Hellowork's own date filter is
+    applied, and the list is left at its old offers only once recent offers came back after older ones (the second block)
+    and then went past the range too; until then up to _HW_LOOK_AHEAD more pages are read to find that second block."""
     p = urlparse(url)
     q = [(k, v) for k, v in parse_qsl(p.query) if k not in ("p", "st")] + [("st", "date")]
+    since = _HW_SINCE.get(cfg.get("date_preset"))
+    if since and not any(k == "d" for k, _ in q):
+        q.append(("d", since))
     gate, budget = cfg.get("_gate"), _Budget(cfg, st)
+    went_out = back_in = False  # an offer older than the range seen / a recent one after it (the second block)
+    past = 0  # pages that ended in old offers before the second block was found
     for n in range(1, int(cfg["max_pages"]) + 1):
         page = urlunparse(p._replace(query=urlencode(q + ([("p", str(n))] if n > 1 else []))))
         soup = BeautifulSoup(f.get(page).text, PARSER)
@@ -1169,9 +1220,12 @@ def hellowork_search(f, url, cfg, seen, st):
         jobs, out, known_here = [], 0, 0
         for lk in links:
             cd = cards.get(lk)
-            if cd and gate and gate(cd[0], cd[1], cd[3]) is False:  # DATE FIRST: too old -> never opened
-                out += 1
+            verdict = gate(cd[0], cd[1], cd[3]) if cd and gate else None
+            if verdict is False:  # DATE FIRST: too old -> never opened
+                out, went_out = out + 1, True
                 continue
+            if verdict and went_out:
+                back_in = True  # a recent offer after older ones: the list's second block
             if lk in seen:
                 known_here += 1
                 continue
@@ -1197,11 +1251,15 @@ def hellowork_search(f, url, cfg, seen, st):
             except Exception as e:
                 f.note(f"job page not read {lk}: {str(e)[:100]}")
         yield Page(page, page, jobs, out=out, seen=known_here, ordered=False)
-        dates = [cards[x][0] for x in links if x in cards]
-        if out and date_order(dates) is not False:
-            return  # newest first: every next page is older than the range
         if len(links) < _HW_PAGE:
             return  # the last page
+        dates = [cards[x][0] for x in links if x in cards]
+        if out and date_order(dates) is not False:
+            if back_in:
+                return  # the second block, newest first, is past the range too: every next page is older
+            past += 1
+            if past > _HW_LOOK_AHEAD:
+                return  # no second block in sight
 
 
 # ---------------------------------------------------------------------------- offers published as PDF files

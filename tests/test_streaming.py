@@ -330,3 +330,61 @@ def test_start_again_clears_the_unfinished_scan_and_keeps_the_websites(db, monke
         store.restart_session(s)
         assert store.unfinished_scan(s) is None and s.query(store.Job).count() == 0
         assert s.query(store.Source).count() == 3
+
+
+def test_a_big_website_s_offers_are_saved_in_batches_while_they_are_filtered(db):
+    """17 Nov 2026: one save for Crédit Agricole's 1,365 offers held the database's single write lock for over a minute, and
+    another website's save, waiting more than 30 s, failed with 'database is locked'. The filters save every batch."""
+    from sqlalchemy import event
+    with db() as s:
+        s.add(store.Source(url="https://big.fr/jobs", label="Big"))
+        s.commit()
+        sid = s.query(store.Source).one().id
+        for i in range(2 * scan.FILTER_BATCH + 30):
+            s.add(_job(i, status="new", source=sid, employer="Big"))
+        s.commit()
+        saves = []
+        event.listen(s, "after_commit", lambda sess: saves.append(1))
+        scan.apply_filters(s, run_config({**CONFIG_DEFAULT, "date_preset": "Last 7 days"}), PROFILE_DEFAULT, merge=False)
+        assert len(saves) >= 3  # after each batch of FILTER_BATCH offers, and at the end
+        assert s.query(store.Job).filter(store.Job.status == "new").count() == 0
+
+
+def test_a_website_s_second_try_that_fails_never_skips_the_end_of_the_scan(db, monkeypatch):
+    """17 Nov 2026: a website's second try failed on 'database is locked' and that error skipped the end of the scan: the
+    duplicates of every website were never merged, the offers still waiting never filtered, the notes never written."""
+    import sqlite3
+    with db() as s:
+        for k in range(2):
+            s.add(store.Source(url=f"https://site{k}.fr/careers", label=f"Site {k}"))
+        s.commit()
+        ids = [x.id for x in s.query(store.Source)]
+    tries = []
+
+    def fake_source(sid, cfg, fetcher, prog, t0):
+        tries.append((sid, cfg["retries"]))
+        if sid == ids[0] and cfg["retries"] == 0:  # its second try (calm: no retries)
+            raise sqlite3.OperationalError("database is locked")
+        with db() as s:  # both websites publish the same offer: merged only once every website is read
+            s.add(_job(7, status="new", source=sid, employer="Same Company"))
+            src = s.get(store.Source, sid)
+            failed = sid == ids[0]
+            src.status, src.last_scan = ("failed" if failed else "completed"), datetime.utcnow()
+            src.last_error = "source_unreachable: ReadTimeout" if failed else ""
+            s.commit()
+
+    monkeypatch.setattr(scan, "scan_source", fake_source)
+    monkeypatch.setattr(scan, "MERGE_EVERY", 10 ** 9)  # no merge while websites are read: only the closing one
+    for name in ("lock_scan", "unlock_scan"):
+        monkeypatch.setattr(scan, name, lambda: None)
+    monkeypatch.setattr(scan, "keep_recent_offers", lambda s: 0)
+    monkeypatch.setattr(store, "scan_owner", lambda: None)
+    prog = scan.Progress()
+    scan.run_scan(ids, {**CONFIG_DEFAULT, "date_preset": "Last 7 days"}, PROFILE_DEFAULT, prog)
+    log = "\n".join(prog.snap()[1])
+    assert (ids[0], 0) in tries and "crashed on its second try" in log and "FATAL" not in log, log
+    with db() as s:
+        jobs = s.query(store.Job).all()
+        assert len(jobs) == 2 and not [j for j in jobs if j.status == "new"]
+        assert sum((j.reason or "").startswith("duplicate") for j in jobs) == 1  # the closing merge ran
+        assert all(x.health is not None for x in s.query(store.Source))  # the closing notes were written

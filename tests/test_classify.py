@@ -57,6 +57,23 @@ def test_offer_types():
     assert analyze_title("Ingénieur IA", "", {**P, "include_phd_postdoc": True}).verdict == "pass"  # older saved profile
 
 
+def test_mixed_employment_tags_do_not_make_a_job_an_internship():
+    # Hellowork tagged a Thales signal-processing engineer's job "['INTERN', 'FULL_TIME']" (15 Nov 2026): it was dropped as
+    # an internship before the AI read it. Tags naming a training kind and a regular job leave it to the title and the text.
+    jobs = {**P, "offer_types": ["job"]}
+    i = analyze_title("Ingénieur en Traitement du Signal et Pistage", "", jobs, "['INTERN', 'FULL_TIME']")
+    assert (i.verdict, i.training, i.contract) == ("pass", "", ""), i
+    assert analyze_title("Data Engineer", "", jobs, "['PART_TIME', 'APPRENTICESHIP']").verdict != "reject"
+    # the title still tells an internship, and tags that name only one kind still decide
+    assert analyze_title("Stage - Ingénieur IA", "", jobs, "['INTERN', 'FULL_TIME']").verdict == "reject"
+    assert analyze_title("Ingénieur IA", "", jobs, "INTERN").verdict == "reject"
+    assert analyze_title("Ingénieur IA", "", jobs, "Internship (stage)").verdict == "reject"
+    assert analyze_title("Ingénieur IA", "", jobs, "graduate intern").verdict == "reject"
+    assert analyze_title("Ingénieur IA", "", jobs, "Full-time, permanent (CDI)").contract == "cdi"
+    stages = {**P, "offer_types": ["internship"]}
+    assert analyze_title("Ingénieur IA", "", stages, "INTERN").verdict == "pass"
+
+
 def test_bilingual_topics_and_keywords():
     assert analyze_title("Ingénieur traitement du signal radar", "", P).topics == ["signal processing"]
     assert "computer vision" in analyze_title("Computer Vision Engineer", "", P).topics

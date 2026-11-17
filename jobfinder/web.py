@@ -214,13 +214,38 @@ class Robots:
 # The pause between two requests is kept PER SERVER for the whole application, not per website: websites read in parallel
 # often share one platform's servers (every Workday tenant of a cluster, SmartRecruiters' API for Alten, Devoteam, EPSA),
 # which would otherwise receive several requests a second and start refusing them (Workday: HTTP 403 for hours).
+# Workday limits a reader across ALL its clusters: on 17 Nov 2026 it answered HTTP 429 on wd3, wd5 and wd103 alike after 7
+# minutes of one scan (9 websites lost), each cluster then having its own pause. Its clusters now share one.
 _PACE, _PACE_LOCK = {}, threading.Lock()
-_SHARED_SERVERS = re.compile(r"(?:^|\.)(wd\d+\.myworkdayjobs\.com|wd\d+\.myworkdaysite\.com)$")
+_SHARED_SERVERS = re.compile(r"(?:^|\.)wd\d+\.(myworkdayjobs\.com|myworkdaysite\.com)$")
+# 'HTTP 429 Too Many Requests': the whole server waits (every website on it), the time it asks for ('Retry-After') or
+# _BUSY_WAIT seconds per try, at most _BUSY_MAX
+_BUSY_WAIT, _BUSY_MAX = 30, 120
 
 
 def _server(host: str) -> str:
     m = _SHARED_SERVERS.search(host or "")
     return m[1] if m else (host or "")
+
+
+def _busy(host, retry_after, attempt) -> float:
+    """A server answered 'too many requests': the next request to it (from any website) waits. -> the pause (seconds)."""
+    try:
+        wait = float(retry_after)
+    except (TypeError, ValueError):
+        wait = _BUSY_WAIT * (attempt + 1)
+    wait = min(max(wait, 1.0), _BUSY_MAX)
+    with _PACE_LOCK:
+        key = _server(host)
+        _PACE[key] = max(_PACE.get(key, 0.0), time.time() + wait)
+    return wait
+
+
+# A page that did not answer (every try timed out or the connection failed) is not asked again for a while, and a server
+# whose pages did not answer several times in a row is left alone for a while: when Lever stopped answering (17 Nov 2026)
+# BlaBlaCar's reading opened the same 4 offer pages twice, 80 s each, 11 of its 18 minutes. The offers stay, without
+# their page; a website's second try at the end of the scan has its own fresh session.
+_DEAD_FOR, _HOST_STRIKES = 600, 3
 
 
 class Fetcher:
@@ -229,15 +254,35 @@ class Fetcher:
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
         self.robots = {}
+        self.dead, self.down, self.strikes = {}, {}, {}  # page -> (when, why); server -> since when; server -> failures in a row
+
+    def _gone(self, method, url):
+        """The reason not to ask this page now ('' = ask it)."""
+        now, host = time.time(), (urlparse(url).hostname or "").lower()
+        since = self.down.get(host)
+        if since and now - since < _DEAD_FOR:
+            return (f"source_unreachable: {host} did not answer {_HOST_STRIKES} times in a row; its pages are not asked for "
+                    f"{_DEAD_FOR // 60} minutes")
+        when, why = self.dead.get((method, url), (0.0, ""))
+        return f"{why} (not asked again: it did not answer a few minutes ago)" if now - when < _DEAD_FOR else ""
+
+    def _unreachable(self, method, url, why):
+        host = (urlparse(url).hostname or "").lower()
+        self.dead[(method, url)] = (time.time(), why)
+        self.strikes[host] = self.strikes.get(host, 0) + 1
+        if self.strikes[host] >= _HOST_STRIKES and host not in self.down:
+            self.down[host] = time.time()
+            self.note(f"{host} did not answer {_HOST_STRIKES} times in a row: its other pages are not asked for "
+                      f"{_DEAD_FOR // 60} minutes (the offers stay, without their page)")
+        return ConnectionError(why)
 
     def _wait(self, host, asked=0.0):
         key, delay = _server(host), max(self.cfg["delay"], asked)
-        if delay <= 0:
-            return
         with _PACE_LOCK:  # book the next free slot of this server, then wait for it outside the lock
             now = time.time()
-            slot = max(now, _PACE.get(key, 0.0) + delay)
-            _PACE[key] = slot
+            slot = max(now, _PACE.get(key, 0.0) + delay)  # a pause the server asked for (HTTP 429) is kept even without delay
+            if delay > 0 or slot > now:
+                _PACE[key] = slot
         if slot > now:
             time.sleep(slot - now)
 
@@ -274,6 +319,9 @@ class Fetcher:
     def request(self, method, url, _robots=False, **kw) -> requests.Response:
         if not _robots and not self.robots_ok(url):
             raise RobotsRefused("access_restricted: disallowed by robots.txt")
+        gone = self._gone(method, url)
+        if gone:
+            raise ConnectionError(gone)
         for attempt in range(self.cfg["retries"] + 1):
             cur = url
             try:
@@ -301,22 +349,34 @@ class Fetcher:
                 # 999 is the non-standard 'request denied' of Workday and LinkedIn when they limit a reader
                 if r.status_code in (401, 403, 406, 999) or challenge or refused:
                     raise AccessError(f"access_restricted: HTTP {r.status_code} / anti-bot page - inspect manually")
-                if r.status_code in (429, 500, 502, 503, 504) and attempt < self.cfg["retries"]:
+                if r.status_code == 429 and attempt < self.cfg["retries"]:
+                    wait = _busy(urlparse(cur).hostname, r.headers.get("Retry-After"), attempt)
+                    self.note(f"{_server(urlparse(cur).hostname)} asks to slow down (HTTP 429): its next requests wait {wait:.0f} s")
+                    continue  # the wait itself is booked on the server: _wait() keeps it, for this website and the others
+                if r.status_code in (500, 502, 503, 504) and attempt < self.cfg["retries"]:
                     time.sleep(min(2 ** attempt * 2, 20))
                     continue
                 if r.status_code >= 400:
                     raise ConnectionError(f"HTTP {r.status_code}")
                 if "charset" not in (r.headers.get("content-type") or "").lower() and r.encoding in (None, "ISO-8859-1"):
                     r.encoding = r.apparent_encoding or "utf-8"  # no charset sent: guess from the bytes, not latin-1
+                self.strikes.pop((urlparse(url).hostname or "").lower(), None)  # the server answers: its count starts again
                 return r
             except requests.exceptions.SSLError as e:
-                raise ConnectionError("source_unreachable: invalid HTTPS certificate on the website") from e
+                # a certificate that does not verify is the website's own fault: final. Any other failure of the secure
+                # connection is the network's (17 Nov 2026: Renault's Workday site and UPMC failed in the same 2 seconds,
+                # both certificates valid): tried again like a timeout
+                if "certificate verify failed" in str(e).lower():
+                    raise ConnectionError("source_unreachable: invalid HTTPS certificate on the website") from e
+                if attempt >= self.cfg["retries"]:
+                    raise self._unreachable(method, url, "source_unreachable: the secure connection failed (network)") from e
+                time.sleep(min(2 ** attempt * 2, 20))
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt >= self.cfg["retries"]:
                     why = str(e) if "could not be resolved" in str(e) else type(e).__name__
-                    raise ConnectionError(f"source_unreachable: {why}") from e
+                    raise self._unreachable(method, url, f"source_unreachable: {why}") from e
                 time.sleep(min(2 ** attempt * 2, 20))
-        raise ConnectionError("source_unreachable")
+        raise self._unreachable(method, url, "source_unreachable")
 
 
 _DATA_REQUESTS = ("document", "xhr", "fetch")

@@ -206,3 +206,117 @@ def test_what_robots_txt_gives_is_used_even_when_its_rules_are_not():
     assert Robots("User-agent: *\nCrawl-delay: 600\n").delay == 5.0 and Robots("").delay == 0.0
     assert _AD_HOSTS.search("ad.doubleclick.net") and _AD_HOSTS.search("px.ads.linkedin.com") and _AD_HOSTS.search("api.hubapi.com")
     assert not _AD_HOSTS.search("careers.smartrecruiters.com") and not _AD_HOSTS.search("api.lever.co")
+
+
+def test_a_page_or_server_that_does_not_answer_is_not_asked_again_and_again(monkeypatch):
+    # 17 Nov 2026: Lever stopped answering and BlaBlaCar's reading opened the same 4 offer pages twice, 80 s each. A page that
+    # did not answer is not asked again for a while, and a server that missed 3 pages in a row is left alone for a while.
+    import requests
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    from jobfinder.web import Fetcher
+    calls, notes = [], []
+
+    class R:
+        status_code, headers, text, encoding = 200, {"content-type": "text/html; charset=utf-8"}, "<p>ok</p>", "utf-8"
+
+    def answer(method, url, **k):
+        calls.append(url)
+        if "down.example" in url:
+            raise requests.Timeout("no answer")
+        return R()
+    f = Fetcher({**run_config(CONFIG_DEFAULT), "retries": 1, "timeout": 1, "respect_robots": False}, notes.append)
+    monkeypatch.setattr(f, "_wait", lambda h, asked=0.0: None)
+    monkeypatch.setattr(f, "_robots", lambda u: type("Rb", (), {"delay": 0.0})())
+    monkeypatch.setattr("jobfinder.web.check_url", lambda u: (True, ""))
+    monkeypatch.setattr("jobfinder.web.time.sleep", lambda s: None)
+    monkeypatch.setattr(f.s, "request", answer)
+
+    def fails(url):
+        try:
+            f.get(url)
+        except ConnectionError as e:
+            return str(e)
+        return ""
+    assert "source_unreachable" in fails("https://down.example/job/1") and len(calls) == 2  # tried twice (retries=1)
+    assert "not asked again" in fails("https://down.example/job/1") and len(calls) == 2  # not asked a third time
+    assert f.get("https://up.example/job/1").status_code == 200  # another server is asked normally
+    fails("https://down.example/job/2"), fails("https://down.example/job/3")
+    assert len(calls) == 7 and any("did not answer 3 times in a row" in n for n in notes)
+    assert "times in a row" in fails("https://down.example/job/4") and len(calls) == 7  # the server is left alone
+    assert f.get("https://up.example/job/2").status_code == 200
+    # the pause is over: the server is asked again; a fresh session (the website's second try) asks at once
+    monkeypatch.setattr("jobfinder.web.time.time", lambda: 10 ** 10)
+    fails("https://down.example/job/4")
+    assert len(calls) == 10
+    g = Fetcher({**run_config(CONFIG_DEFAULT), "retries": 0, "timeout": 1, "respect_robots": False}, notes.append)
+    assert g._gone("GET", "https://down.example/job/1") == ""
+
+
+def test_a_server_that_asks_to_slow_down_is_given_its_pause_and_workday_is_one_server(monkeypatch):
+    # 17 Nov 2026: Workday answered 'HTTP 429' on wd3, wd5 and wd103 alike after 7 minutes of one scan; the app retried after
+    # 2 and 4 s and 9 websites were lost. Its clusters now share one pace, and a 429 pauses the server for every website.
+    from jobfinder import web
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+    assert web._server("ag.wd3.myworkdayjobs.com") == web._server("gevernova.wd5.myworkdayjobs.com") == "myworkdayjobs.com"
+    assert web._server("careers.example.fr") == "careers.example.fr"
+    now, slept, notes = [1000.0], [], []
+    monkeypatch.setattr(web.time, "time", lambda: now[0])
+    monkeypatch.setattr(web.time, "sleep", lambda s: (slept.append(s), now.__setitem__(0, now[0] + s)))
+    monkeypatch.setattr(web, "check_url", lambda u: (True, ""))
+    monkeypatch.setattr(web, "_PACE", {})
+
+    class R:
+        def __init__(self, code, after=None):
+            self.status_code, self.text, self.encoding = code, "<p>ok</p>", "utf-8"
+            self.headers = {"content-type": "text/html; charset=utf-8", **({"Retry-After": after} if after else {})}
+    answers = [R(429, "45"), R(200)]
+    f = web.Fetcher({**run_config(CONFIG_DEFAULT), "retries": 2, "delay": 0.0, "respect_robots": False}, notes.append)
+    monkeypatch.setattr(f, "_robots", lambda u: type("Rb", (), {"delay": 0.0})())
+    monkeypatch.setattr(f.s, "request", lambda m, u, **k: answers.pop(0))
+    assert f.get("https://murex.wd3.myworkdayjobs.com/wday/cxs/murex/x/jobs").status_code == 200
+    assert slept == [45.0] and any("HTTP 429" in n and "45 s" in n for n in notes)  # the pause asked for, then the retry
+    # the pause is the whole server's: another Workday website asked meanwhile waits for it too
+    answers[:] = [R(429), R(200)]
+    g = web.Fetcher({**run_config(CONFIG_DEFAULT), "retries": 2, "delay": 0.0, "respect_robots": False}, notes.append)
+    monkeypatch.setattr(g, "_robots", lambda u: type("Rb", (), {"delay": 0.0})())
+    monkeypatch.setattr(g.s, "request", lambda m, u, **k: answers.pop(0))
+    g.get("https://ipsen.wd103.myworkdayjobs.com/wday/cxs/ipsen/y/jobs")
+    assert slept[-1] == web._BUSY_WAIT  # no 'Retry-After': 30 s
+
+
+def test_a_secure_connection_cut_by_the_network_is_tried_again_and_a_bad_certificate_is_not(monkeypatch):
+    # 17 Nov 2026: two websites with valid certificates failed in the same 2 seconds as 'invalid HTTPS certificate', at once
+    import requests
+    from jobfinder import web
+    from jobfinder.config import CONFIG_DEFAULT, run_config
+
+    class R:
+        status_code, headers, text, encoding = 200, {"content-type": "text/html; charset=utf-8"}, "<p>ok</p>", "utf-8"
+    monkeypatch.setattr(web, "check_url", lambda u: (True, ""))
+    monkeypatch.setattr(web.time, "sleep", lambda s: None)
+
+    def fetcher(answers):
+        f = web.Fetcher({**run_config(CONFIG_DEFAULT), "retries": 2, "delay": 0.0, "respect_robots": False})
+        monkeypatch.setattr(f, "_robots", lambda u: type("Rb", (), {"delay": 0.0})())
+
+        def answer(m, u, **k):
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        monkeypatch.setattr(f.s, "request", answer)
+        return f
+    cut = requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2427)")
+    assert fetcher([cut, R()]).get("https://renault.example/jobs").status_code == 200  # tried again: it answers
+    bad = requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired")
+    answers = [bad, R()]
+    try:
+        fetcher(answers).get("https://expired.example/jobs")
+        assert False, "a bad certificate was accepted"
+    except ConnectionError as e:
+        assert "invalid HTTPS certificate" in str(e) and len(answers) == 1  # final at once: never tried again
+    try:
+        fetcher([cut, cut, cut]).get("https://flaky.example/jobs")
+        assert False
+    except ConnectionError as e:
+        assert "secure connection failed (network)" in str(e)  # not blamed on the website's certificate

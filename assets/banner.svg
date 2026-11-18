@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Job Finder: 400 career websites read, every offer dated, placed and ranked by AI">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1B33"/><stop offset="1" stop-color="#14305C"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2E5AAC"/><stop offset="1" stop-color="#12284A"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#8FB3F5"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <!-- faint grid -->
+  <g stroke="#FFFFFF" stroke-opacity="0.05">
+    <path d="M0 80H1280M0 160H1280M0 240H1280"/>
+    <path d="M160 0V320M320 0V320M480 0V320M640 0V320M800 0V320M960 0V320M1120 0V320"/>
+  </g>
+  <!-- logo -->
+  <g transform="translate(64 64) scale(1.9)">
+    <rect x="1" y="1" width="44" height="44" rx="12" fill="url(#tile)"/>
+    <path d="M17.5 15.5v-2.2a2.3 2.3 0 0 1 2.3-2.3h5.4a2.3 2.3 0 0 1 2.3 2.3v2.2" fill="none" stroke="#fff" stroke-width="2.4"/>
+    <rect x="9.5" y="15.5" width="26" height="17" rx="3.5" fill="none" stroke="#fff" stroke-width="2.4"/>
+    <path d="M9.5 22.5h11" stroke="#fff" stroke-width="2.4"/>
+    <circle cx="29.5" cy="29" r="7" fill="#0B1B33" stroke="#fff" stroke-width="2.6"/>
+    <path d="M34.6 34.1l3.6 3.6" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <text x="170" y="118" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="56" font-weight="800" fill="#FFFFFF">Job Finder</text>
+  <text x="64" y="196" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="26" fill="#C9D6EE">Hundreds of career websites, read every day.</text>
+  <text x="64" y="232" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="26" fill="#C9D6EE">Every offer dated, placed and ranked by AI against your CV.</text>
+  <!-- pipeline figure -->
+  <g font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" text-anchor="middle">
+    <rect x="780" y="70" width="190" height="52" rx="12" fill="#1C3A6B" stroke="#4A6FA8"/>
+    <text x="875" y="102" fill="#FFFFFF">400+ websites</text>
+    <rect x="780" y="156" width="190" height="52" rx="12" fill="#1C3A6B" stroke="#4A6FA8"/>
+    <text x="875" y="188" fill="#FFFFFF">date · France · title</text>
+    <rect x="1010" y="156" width="206" height="52" rx="12" fill="#2E5AAC" stroke="#8FB3F5"/>
+    <text x="1113" y="188" fill="#FFFFFF">AI relevance + CV</text>
+    <rect x="1010" y="242" width="206" height="52" rx="12" fill="#D29A3A" stroke="#F0C37A"/>
+    <text x="1113" y="274" fill="#0B1B33">your shortlist</text>
+    <path d="M875 122V150" stroke="#8FB3F5" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+    <path d="M970 182H1004" stroke="#8FB3F5" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+    <path d="M1113 208V236" stroke="#8FB3F5" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  </g>
+  <text x="64" y="284" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#8FB3F5">Python · Streamlit · Playwright · 20+ job-platform readers · any AI provider</text>
+</svg>

@@ -16,16 +16,16 @@
 </p>
 
 <p align="center">
-  <a href="#-quick-start">Quick start</a> ·
-  <a href="#-how-it-works">How it works</a> ·
-  <a href="#-proof-it-finds-the-offers">Results</a> ·
-  <a href="#-one-ai-key-is-enough">AI keys</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#proof-it-finds-the-offers">Results</a> ·
+  <a href="#one-ai-key-is-enough">AI keys</a> ·
   <a href="docs/HOW-IT-WORKS.md">Full reference</a>
 </p>
 
 ---
 
-## ✨ Why Job Finder
+## Why Job Finder
 
 Job boards miss offers, show them late, and drown the good ones in noise. The best research and engineering roles
 are published first on the companies' **own** career sites: hundreds of different pages, platforms and formats.
@@ -35,15 +35,15 @@ offer back with **evidence**: when it was published, where the job is, why it ma
 
 | | |
 |---|---|
-| 🌐 **Reads the source** | 400+ career sites in the lists provided: big groups, labs, start-ups, banks, ESN. 20+ job platforms read through their own data (Workday, SuccessFactors, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Teamtailor, Workable, Softy…), any other site through its pages, its sitemap or a real browser. |
-| 📅 **Dates you can trust** | A publication date is taken only from evidence: never a "refreshed", deadline or start date. An undated offer shows the first day it was seen online. |
-| 📍 **France, really** | Places are checked against official communes, departments and regions; multi-city and remote offers open to France are kept. |
-| 🧠 **AI that explains itself** | Each offer gets a relevance score, a reason, the quotes behind its date, place and contract, and a match score against your CVs. |
-| 🛡️ **Built to finish** | Websites that fail get a second try, a stopped scan resumes where it stopped, and a slow server never blocks the others. |
-| 📊 **Market insight** | Skills most asked for, skills missing from your CV, companies hiring, salaries stated, every 15 days. |
-| ✉️ **Cover letters** | Drafts a French cover letter in LaTeX for any offer. |
+| **Reads the source** | 400+ career sites in the lists provided: big groups, labs, start-ups, banks, ESN. 20+ job platforms read through their own data (Workday, SuccessFactors, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Teamtailor, Workable, Softy…), any other site through its pages, its sitemap or a real browser. |
+| **Dates you can trust** | A publication date is taken only from evidence: never a "refreshed", deadline or start date. An undated offer shows the first day it was seen online. |
+| **France, really** | Places are checked against official communes, departments and regions; multi-city and remote offers open to France are kept. |
+| **AI that explains itself** | Each offer gets a relevance score, a reason, the quotes behind its date, place and contract, and a match score against your CVs. |
+| **Built to finish** | Websites that fail get a second try, a stopped scan resumes where it stopped, and a slow server never blocks the others. |
+| **Market insight** | Skills most asked for, skills missing from your CV, companies hiring, salaries stated, every 15 days. |
+| **Cover letters** | Drafts a French cover letter in LaTeX for any offer. |
 
-## 🚀 Quick start
+## Quick start
 
 ```bash
 git clone https://github.com/2ineddine/scrape-Job-websites.git && cd scrape-Job-websites
@@ -70,7 +70,7 @@ docker run -d -p 127.0.0.1:8501:8501 --env-file api_keys.txt -v job-finder-data:
 The app has no login: keep it on `127.0.0.1`, or reach it through an SSH tunnel or a proxy with authentication.
 </details>
 
-## 🔑 One AI key is enough
+## One AI key is enough
 
 You do **not** need a collection of keys. **One key from one provider runs the whole analysis**, for example an
 **Anthropic** key:
@@ -96,7 +96,7 @@ flowchart LR
     A --> R["Relevance · date · place · contract<br/>+ CV match"]
 ```
 
-## 🧭 How it works
+## How it works
 
 ```mermaid
 flowchart LR
@@ -131,7 +131,7 @@ pie showData
     "To check (AI and rules disagree)" : 32
 ```
 
-## ✅ Proof it finds the offers
+## Proof it finds the offers
 
 On 17 November 2026 the app's scan was compared with an **independent reading** of the same websites: each job
 platform's own public API, every list page loaded in a real browser, and Hellowork's search.
@@ -147,7 +147,7 @@ platform's own public API, every list page loaded in a real browser, and Hellowo
 | Alteca (one role posted in several cities) | **9 → 14** |
 | SNCF (offers listed by number in its sitemap) | missed → found |
 
-## 🛡️ Reliability
+## Reliability
 
 ```mermaid
 stateDiagram-v2
@@ -169,7 +169,7 @@ stateDiagram-v2
   which saves time and AI quota.
 - **252 automated tests** (`python -m pytest -q`), each bug found in real scans pinned by its own test.
 
-## 🔒 Responsible use
+## Responsible use
 
 - The app identifies itself, reads **at most one page per second per server**, and **never gets around an anti-bot
   page, a login or a captcha**: such a website is reported as blocked, with what to do instead.
@@ -179,7 +179,7 @@ stateDiagram-v2
   exclude training, or a local Ollama model.
 - Text from websites is treated as untrusted; private network addresses are refused; LaTeX runs without shell escape.
 
-## 🗂️ Project layout
+## Project layout
 
 ```
 app.py              Streamlit app: Search, Results, Statistics, AI quota, Settings
@@ -198,22 +198,18 @@ docs/HOW-IT-WORKS.md   every rule in detail
 websites*.html      the career-site lists
 ```
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [ ] "Since my last scan" date range, so nothing published over a weekend is missed
 - [ ] Company name read from more job-board cards
 - [ ] Login for team deployments
 - [ ] More job-platform readers
 
-## 🤝 Contributing
+## Contributing
 
 Issues and pull requests are welcome: a career site the app reads badly, a job platform to add, a rule to improve.
 Please add a test with the fix (`tests/`), and run `python -m pytest -q` before opening the pull request.
 
-## 📄 License
+## License
 
 [Apache 2.0](LICENSE).
-
----
-
-<p align="center">If Job Finder saves you hours of refreshing career pages, <b>give it a ⭐</b> so others find it too.</p>

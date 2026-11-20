@@ -355,8 +355,24 @@ def _cfg_day(v):
     return d.date() if d else None
 
 
+_PARIS = None
+
+
+def paris_day(dt):
+    """The calendar day the user lives in (Paris) of a stored time (naive UTC): 23:49 UTC on the 17th is the 18th in
+    Paris. A date without a time of day (midnight: a website's '18/11/2026') keeps its day."""
+    global _PARIS
+    if dt.hour == dt.minute == dt.second == 0 and not dt.microsecond:
+        return dt.date()
+    if _PARIS is None:
+        from zoneinfo import ZoneInfo
+        _PARIS = ZoneInfo("Europe/Paris")
+    base = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return base.astimezone(_PARIS).date()
+
+
 def _window(cfg, now):
-    today, preset = now.date(), cfg["date_preset"]
+    today, preset = paris_day(now), cfg["date_preset"]
     if preset == "Custom date range":
         return (_cfg_day(cfg.get("date_from")) or datetime.min.date(), _cfg_day(cfg.get("date_to")) or today + timedelta(days=1))
     return today - timedelta(days=PRESET_DAYS.get(preset, 30)), today + timedelta(days=1)
@@ -399,9 +415,9 @@ def date_decision(pub, conf, cfg, now=None, text=None):
             if newest < _window(cfg, now)[0]:
                 return False, f"'{text}': published before {newest:%Y-%m-%d}, outside '{preset}'"
         return None, "publication date unknown"
-    if _in_window(pub.date(), cfg, now):
-        return True, f"published {pub:%Y-%m-%d}, inside window"
-    return False, f"published {pub:%Y-%m-%d}, outside '{preset}'"
+    if _in_window(paris_day(pub), cfg, now):  # Paris days, the user's (an offer of 00:49 Paris is that day's)
+        return True, f"published {paris_day(pub):%Y-%m-%d}, inside window"
+    return False, f"published {paris_day(pub):%Y-%m-%d}, outside '{preset}'"
 
 
 # ---- reconciling evidence --------------------------------------------------------------------------------------------

@@ -194,6 +194,27 @@ def generate_letter_content(s, job: Job, cv: CVDocument, cfg, keys=None) -> Lett
     return call_json(user, Letter, cfg, s, keys)
 
 
+class ShortMessage(BaseModel):
+    """The text pasted into an application form's cover-letter box: at most 3 sentences (with the greeting and the
+    signature, 5 lines at most)."""
+    lines: list[str] = Field(min_length=1)  # more than 3 are cut, never refused (apply.form_message)
+
+
+def generate_form_message(s, job: Job, cv: CVDocument, cfg, keys=None) -> ShortMessage:
+    require_cv_consent(cfg)
+    m = (job.match_json or {}).get(cv.name, {})
+    ev = "\n".join(f"- {e['requirement']}: {e['cv_evidence']}" for e in m.get("evidence", []))
+    user = ("Écris un message de candidature très court en français professionnel pour ce poste : 3 phrases au plus, une par "
+            "ligne, 180 caractères au plus chacune (pourquoi ce poste, l'expérience du CV qui y répond, la disponibilité pour "
+            "un entretien). Utilise UNIQUEMENT l'expérience réellement présente dans le CV. N'invente rien. Ne recopie pas "
+            "l'annonce. Pas de formule d'adresse ni de signature (elles sont ajoutées automatiquement).\n"
+            f"<untrusted>\nPOSTE: {job.title} - {job.employer} - {job.location_original}\n"
+            f"ANNONCE: {(job.description or '')[:4000]}\n</untrusted>\n"
+            f"<untrusted>\nCV:\n{cv.text[:9000]}\n</untrusted>\nPreuves déjà vérifiées:\n{ev}\n"
+            'JSON keys: lines[] (les phrases, une par ligne, 3 au plus)')
+    return call_json(user, ShortMessage, cfg, s, keys)
+
+
 def build_tex(applicant: dict, job: Job, letter: Letter, now: datetime | None = None) -> str:
     now = now or datetime.now()
     a = lambda k: tex(applicant.get(k, ""))

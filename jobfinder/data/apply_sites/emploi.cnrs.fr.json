@@ -1,0 +1,46 @@
+{
+ "9a211e7789321276": {
+  "plan": {
+   "button": "button|Se connecter",
+   "button_role": "sign_in",
+   "fields": [
+    {
+     "key": "input|checkbox|ckbRememberMe|ckbRememberMe|Rester connecté",
+     "role": "other"
+    },
+    {
+     "key": "input|checkbox|acceptcgu|acceptcgu|J’ai lu et j’accepte les CGU et la politique de protection des données.",
+     "role": "terms"
+    }
+   ],
+   "page_kind": "sign_in"
+  }
+ },
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler"
+   ]
+  },
+  "route": [
+   "email_code"
+  ]
+ },
+ "d12d942ec18c9b24": {
+  "plan": {
+   "button": "a|Créer un compte",
+   "button_role": "create_account",
+   "fields": [
+    {
+     "key": "input|checkbox|ckbRememberMe|ckbRememberMe|Rester connecté",
+     "role": "other"
+    },
+    {
+     "key": "input|checkbox|acceptcgu|acceptcgu|J’ai lu et j’accepte les CGU et la politique de protection des données.",
+     "role": "terms"
+    }
+   ],
+   "page_kind": "sign_up"
+  }
+ }
+}

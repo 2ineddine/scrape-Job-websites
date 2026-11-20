@@ -1,0 +1,28 @@
+{
+ "_learned": {
+  "buttons": {
+   "create_account": "Enregistrer mon nouveau mot de passe"
+  },
+  "route": [
+   "sign_up",
+   "sign_up"
+  ]
+ },
+ "ad29309e55c6750c": {
+  "plan": {
+   "button": "input|Lancer ma recherche",
+   "button_role": "continue",
+   "fields": [
+    {
+     "key": "input|text|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria_Keywords|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Keywords|Mots clés(ex : ingénieur commercial Paris)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria$Location$GeographicalAreaCollection|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Location_GeographicalAreaCollection|Localisation du poste Veuillez sélectionner une valeur Amériques / Caraibe (4) E",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ }
+}

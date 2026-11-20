@@ -168,6 +168,78 @@ Cloud. Not usable at all: GitHub Models (closed in July 2026) and Kaggle (no AI 
   others' tries nor the end of the scan (the last filters, the duplicates merged, the notes), and the filters save
   every 100 offers so that a big website (Crédit Agricole, 1,365 offers) never keeps the database locked.
 
+## Applying: "Open and fill the application"
+
+On an offer's detail (Results page), **Open and fill the application** opens the offer in a browser window that the app
+controls on your computer (a real Chrome window with its own profile in `data/apply_browser`), and fills its application
+form with your details from Search, step 2, "Your details": civility, first and last name, email, phone, address, postal
+code, city, country, LinkedIn, website, degree, school, field of study, graduation year, right to work in France and
+visa sponsorship (yes / no questions, only when you said), nationality, and how you heard about the offer (a list's
+"Company website" / "Site carrière" choice).
+
+**Getting to the form.** Step by step, the window reads each page (`jobfinder/apply.py`) and does what it asks:
+
+- *An offer page*: its "Postuler / Apply / Candidater / Jetzt bewerben" control, the surest first: Workday's "Apply
+  Manually", then the usual words, then a link whose address says "apply", "I'm interested" last. A control is pressed
+  once per page (a "Postuler" that opens a menu is not pressed again: the menu's link is next); the offer may be in a
+  frame (iCIMS). Never pressed: a button that SENDS a form (a submit button whose form has fields or a file field), a
+  sign-in with another website (LinkedIn, Google, Apple), "how to apply" pages, another offer, a spontaneous
+  application, a log-out link, a document link (PDF).
+- *A cookie banner*: its "refuse" choice ("Tout refuser", "Continuer sans accepter", "Reject all", "Required only"...),
+  never "accept". When something still covers a button, the click goes to the button itself.
+- *A page its scripts are still building* (Workday, SuccessFactors, Ashby): read again until it holds still, and a few
+  more seconds when nothing is there yet or a form is opening.
+- *A sign-in*: with the account the app holds on this website (below); "Sign in with email" when the website offers
+  several ways; the account email alone first when the website asks it first (iCIMS, Oracle, IBM). Without an account
+  yet: the website's "create an account" link.
+- *An account form*: filled with your details, the account email and a password made for this website (in every password
+  field); its terms box ticked only if you allowed it (Settings), a newsletter or partner-offers box never; then the
+  website's "create the account" button. An application form that also makes the account (a CV field beside the
+  password fields) is filled and never sent: the account is made when you send it.
+- *A code sent by email*: typed in the app (a box appears under the button), then sent. *A confirmation link*: click it
+  in your mailbox, then **Continue**. *A password the website made and emailed* (Talentsoft, MAIF): typed in the box
+  under the message, kept with the account; or *the email's link* (activate the account, set its password): pasted in the
+  box below it, opened in the app's window, where the password made for the website is typed for you. *A password the website refuses*: said plainly, with the same box (or use
+  the website's "Mot de passe perdu" and set the password shown in Settings). An account form is sent once: a second
+  press would make the website block the attempt.
+- *The application form*: filled (below), never sent.
+
+**Filling.** Fields are recognised by the browser's autofill names, their labels, names, placeholders, the words beside
+them when they have no label, their type (email, phone) and, for yes / no questions, the question's text, in French and
+English. A field about someone else or a company ("Nom de l'entreprise", "Nom du référent", a user name, a country code)
+is never filled; words naming two fields ("Prénom Nom" over a row) are never guessed. Only empty fields are filled; a
+value the website or you gave is never replaced. A list is chosen only when one option clearly says the value.
+
+**What the app says when there is no form to fill**: the offer is applied to by email (with the address), the website
+starts with your CV (drop it in the window, then **Continue**), the offer's page no longer exists, the website turns the
+window away (the app never gets around it: open the offer in your own browser), a captcha (you solve it in the window,
+then **Continue**).
+
+**Accounts.** One account per website (per company on hosts many companies share, such as SAP SuccessFactors'
+`career5.successfactors.eu`), with the account email you set (Search, step 2; your email by default) and a strong
+password made for that website alone. Kept in `data/accounts.json` on your computer only (readable by your user only,
+never in the repository); shown in "Your details", passwords hidden until you ask. The window's profile keeps you signed
+in between applications.
+
+**Each website's specifics.** What worked on a website is kept for the next visits, each step under the website it
+happened on, and only when the visit went the right way: the buttons pressed, the route to the form, the details of the
+fields read by the AI. This computer's in `data/apply_forms/<website>.json`; the specifics of known websites ship with the
+app in `jobfinder/data/apply_sites/` (page structures only: never your details, a page's address or a password;
+`claude_forms.export_specifics()` copies this computer's into it). A page no rule understands is read once by Claude
+(an Anthropic key) or, without one, by the free models of your other keys: only its structure (field labels and names,
+button texts) is sent, never your details or a password, and the answer is saved, so the page is not read again.
+
+- The cover-letter box gets a short message written by the AI for the offer: the greeting, 3 sentences at most, and your
+  name, **5 lines at most**, from your CV's real experience only. It is written once per offer
+  (`data/letters/<offer>_form.txt`) and shown under the button. The full LaTeX / PDF letter is the file you attach.
+- The CV: a CV field takes the CV the app matched best to the offer (sent as `CV_<First>_<Last>.pdf`); a website that
+  starts with the CV gets it first, reads it, then the app fills what is left. Never a letter or other file field.
+- Never done: submitting the application, getting around a captcha or a website's robot check. Workday takes no
+  'Create Account' from a window a program drives: there the app fills the account form and you press its button (or
+  create the account in your own browser with the password shown in Settings). SAP SuccessFactors makes the account
+  with the first application you send.
+- A screen is needed: on a server or in Docker the button is off ("Open the offer" still works).
+
 ## Safety
 
 - **Respect robots.txt** (step 3) is off by default: the client reads these websites under partner agreements. Off, no

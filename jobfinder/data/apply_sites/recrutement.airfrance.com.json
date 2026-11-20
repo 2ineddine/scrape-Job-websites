@@ -1,0 +1,44 @@
+{
+ "5a2db41e18959c98": {
+  "plan": {
+   "button": "input|Lancer ma recherche",
+   "button_role": "continue",
+   "fields": [
+    {
+     "key": "input|text|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria_Keywords|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Keywords|Mots clés(ex : Ingénieur aéronautique; Pilote)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl00$EngineCriteriaCollection$Contract|ctl00_ctl00_moteurRapideOffre_ctl00_EngineCriteriaCollection_Contract|Type de contrat Veuillez sélectionner une valeur Alternance et apprentissage (1)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl01$OfferCriteria$PrimaryProfile|ctl00_ctl00_moteurRapideOffre_ctl01_OfferCriteria_PrimaryProfile|Métier Veuillez sélectionner une valeur Communication (2) Communication externe ",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl01$OfferCriteria$Location$GeographicalAreaCollection|ctl00_ctl00_moteurRapideOffre_ctl01_OfferCriteria_Location_GeographicalAreaCollection|Localisation du poste Veuillez sélectionner une valeur France (107) Auvergne-Rhô",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl02$EngineCriteriaCollection$EducationLevel|ctl00_ctl00_moteurRapideOffre_ctl02_EngineCriteriaCollection_EducationLevel|Niveau d'études min. requis Veuillez sélectionner une valeur Bac + 1 (2) Bac + 2",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl02$EngineCriteriaCollection$OfferCustomBlock4$CustomCodeTableValue2|ctl00_ctl00_moteurRapideOffre_ctl02_EngineCriteriaCollection_OfferCustomBlock4_CustomCodeTableValue2|Entité Veuillez sélectionner une valeur Air France (85) Air France KLM (9) Bluel",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ },
+ "_learned": {
+  "buttons": {
+   "create_account": "Enregistrer mon nouveau mot de passe"
+  },
+  "route": [
+   "sign_up",
+   "sign_up"
+  ]
+ }
+}

@@ -1,0 +1,26 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler"
+   ]
+  },
+  "route": [
+   "offer_page",
+   "sign_in"
+  ]
+ },
+ "d858f0496198f9f7": {
+  "plan": {
+   "button": "input|J'accepte",
+   "button_role": "continue",
+   "fields": [
+    {
+     "key": "input|checkbox|accept-mentions|accept-mentions|J'ai lu et j'accepte les CGU du site emploi SNCF",
+     "role": "terms"
+    }
+   ],
+   "page_kind": "other"
+  }
+ }
+}

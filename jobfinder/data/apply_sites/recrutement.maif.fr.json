@@ -1,0 +1,45 @@
+{
+ "65af0b7d0c19b143": {
+  "plan": {
+   "button": "input|Lancer ma recherche",
+   "button_role": "none",
+   "fields": [
+    {
+     "key": "input|text|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria_Keywords|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Keywords|Mots clés(ex : ingénieur commercial Paris)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl00$EngineCriteriaCollection$Contract|ctl00_ctl00_moteurRapideOffre_ctl00_EngineCriteriaCollection_Contract|Type de contrat Veuillez sélectionner une valeur Contrat à durée déterminée (14)",
+     "role": "other"
+    }
+   ],
+   "page_kind": "offer_page"
+  }
+ },
+ "76ef819d709d1802": {
+  "plan": {
+   "button": "",
+   "button_role": "none",
+   "fields": [
+    {
+     "key": "input|text|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria_Keywords|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Keywords|Mots clés(ex : ingénieur commercial Paris)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl00$EngineCriteriaCollection$Contract|ctl00_ctl00_moteurRapideOffre_ctl00_EngineCriteriaCollection_Contract|Type de contrat Veuillez sélectionner une valeur Contrat à durée déterminée (14)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl01$OfferCriteria$PrimaryProfile|ctl00_ctl00_moteurRapideOffre_ctl01_OfferCriteria_PrimaryProfile|Fonctions Veuillez sélectionner une valeur ALTIMA (3) ALTIMA (3) COMPTABILITE - ",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ },
+ "_learned": {
+  "route": [
+   "sign_in"
+  ]
+ }
+}

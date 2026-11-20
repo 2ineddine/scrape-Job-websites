@@ -1,0 +1,12 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler maintenant"
+   ]
+  },
+  "route": [
+   "offer_page"
+  ]
+ }
+}

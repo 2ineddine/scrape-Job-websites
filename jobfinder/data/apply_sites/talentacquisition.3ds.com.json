@@ -1,0 +1,15 @@
+{
+ "6b34b8119ca68b10": {
+  "plan": {
+   "button": "button|Accept All",
+   "button_role": "continue",
+   "fields": [
+    {
+     "key": "select|select|dialogTemplate-dialogForm-StatementBeforeAuthentificationContent-j_id_id26pc6||",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ }
+}

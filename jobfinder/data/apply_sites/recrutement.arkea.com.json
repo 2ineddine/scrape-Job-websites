@@ -1,0 +1,17 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Je postule à cette offre"
+   ],
+   "create_account": "Je me crée un espace candidat",
+   "go_to_sign_up": "Je me crée un espace candidat",
+   "sign_in": "Se connecter"
+  },
+  "route": [
+   "offer_page",
+   "sign_up",
+   "sign_up"
+  ]
+ }
+}

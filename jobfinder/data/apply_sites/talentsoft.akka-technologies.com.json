@@ -1,0 +1,15 @@
+{
+ "09d569f446327583": {
+  "plan": {
+   "button": "input|Lancer ma recherche",
+   "button_role": "none",
+   "fields": [],
+   "page_kind": "other"
+  }
+ },
+ "_learned": {
+  "route": [
+   "sign_in"
+  ]
+ }
+}

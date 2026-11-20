@@ -55,6 +55,13 @@ def test_detect_from_url():
     assert detect_from_url("https://valeo.wd3.myworkdayjobs.com/en-EN/valeo_jobs")[0] == "workday"
     a = _workday_arg("https://onepoint.wd3.myworkdayjobs.com/fr-FR/OnepointFR?locationCountry=x")
     assert (a["tenant"], a["site"], a["prefix"]) == ("onepoint", "OnepointFR", "/fr-FR/OnepointFR")
+    # 'en-EN' is no locale Workday serves: an offer link keeping it opens the job search, not the offer (Valeo, 19 Nov)
+    assert _workday_arg("https://valeo.wd3.myworkdayjobs.com/en-EN/valeo_jobs")["prefix"] == "/valeo_jobs"
+    from jobfinder.adapters import _abs_url
+    assert _abs_url("/job/Angers/Supervisor_R1", "https://valeo.wd3.myworkdayjobs.com/en-EN/valeo_jobs") == \
+        "https://valeo.wd3.myworkdayjobs.com/valeo_jobs/job/Angers/Supervisor_R1"
+    assert _abs_url("/job/Lyon/X_R2", "https://sanofi.wd3.myworkdayjobs.com/fr-FR/SanofiCareers") == \
+        "https://sanofi.wd3.myworkdayjobs.com/fr-FR/SanofiCareers/job/Lyon/X_R2"
     assert detect_from_url("https://careers.smartrecruiters.com/NEXTON") == ("smartrecruiters", "NEXTON")
     assert detect_from_url("https://faac-group.breezy.hr/?&country=France#positions") == ("breezy", "https://faac-group.breezy.hr")
     assert detect_from_url("https://expleo-jobs-fr-fr.icims.com/jobs/search?hashed=1")[0] == "icims"

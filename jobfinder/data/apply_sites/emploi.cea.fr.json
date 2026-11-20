@@ -1,0 +1,40 @@
+{
+ "4e311f10b073ae81": {
+  "plan": {
+   "button": "input|Lancer ma recherche",
+   "button_role": "continue",
+   "fields": [
+    {
+     "key": "input|text|ctl00$ctl00$moteurRapideOffre$ctl00$OfferCriteria_Keywords|ctl00_ctl00_moteurRapideOffre_ctl00_OfferCriteria_Keywords|Mots clés (ex : informaticien)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl00$EngineCriteriaCollection$Contract|ctl00_ctl00_moteurRapideOffre_ctl00_EngineCriteriaCollection_Contract|Contrat Veuillez sélectionner une valeur CDI (203) CDD (130) Alternance (4) Post",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl01$OfferCriteria$PrimaryProfile|ctl00_ctl00_moteurRapideOffre_ctl01_OfferCriteria_PrimaryProfile|Domaine Veuillez sélectionner une valeur Administration d'entreprise et communic",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl01$OfferCriteria$Location$GeographicalAreaCollection|ctl00_ctl00_moteurRapideOffre_ctl01_OfferCriteria_Location_GeographicalAreaCollection|Localisation du poste Veuillez sélectionner une valeur Europe (804) France (804)",
+     "role": "other"
+    },
+    {
+     "key": "select|select|ctl00$ctl00$moteurRapideOffre$ctl02$EngineCriteriaCollection$ApplicantCriteria$CustomCodeTableValue3|ctl00_ctl00_moteurRapideOffre_ctl02_EngineCriteriaCollection_ApplicantCriteria_CustomCodeTableValue3|CDI/CDD pour alternants/stag. CEA Veuillez sélectionner une valeur Oui (117) Non",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ },
+ "_learned": {
+  "buttons": {
+   "create_account": "Enregistrer mon nouveau mot de passe"
+  },
+  "route": [
+   "sign_up",
+   "sign_up"
+  ]
+ }
+}

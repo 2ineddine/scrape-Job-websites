@@ -357,8 +357,10 @@ def _abs_url(u, base):
     host, path = urlparse(base).hostname or "", urlparse(base).path
     if host.endswith("myworkdayjobs.com") and u.startswith("/job/"):  # Workday: /<locale>/<site> + externalPath
         seg = [x for x in path.split("/") if x]
-        prefix = "/" + "/".join(seg[:2]) if len(seg) >= 2 and re.fullmatch(r"[a-z]{2}(-[A-Za-z]{2})?", seg[0]) \
-            else ("/" + seg[0] if seg else "")
+        if len(seg) >= 2 and re.fullmatch(r"[a-z]{2}(-[A-Za-z]{2})?", seg[0]):
+            prefix = "/" + "/".join(([_wd_locale(seg[0])] if _wd_locale(seg[0]) else []) + [seg[1]])
+        else:
+            prefix = "/" + seg[0] if seg else ""
         u = prefix + u
     return urljoin(base, u)
 
@@ -1072,6 +1074,18 @@ def crawl_smartrecruiters(f, company, cfg, known, st):
 
 
 _WD_LOCALE = re.compile(r"[a-z]{2}(-[A-Za-z]{2})?")
+# the locales Workday serves; a website address may carry another ('en-EN'): an offer link with it opens Workday's job
+# search instead of the offer, so it is left out (Workday then shows the offer in the website's own language)
+_WD_LOCALES = {"en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-IE", "en-SG", "fr-FR", "fr-CA", "fr-BE", "fr-CH", "de-DE",
+               "de-AT", "de-CH", "es-ES", "es-MX", "es-419", "it-IT", "it-CH", "nl-NL", "nl-BE", "pt-BR", "pt-PT", "pl-PL",
+               "sv-SE", "da-DK", "fi-FI", "nb-NO", "no-NO", "cs-CZ", "sk-SK", "hu-HU", "ro-RO", "bg-BG", "hr-HR", "sl-SI",
+               "sr-RS", "el-GR", "tr-TR", "ru-RU", "uk-UA", "ar-SA", "ar-AE", "he-IL", "ja-JP", "zh-CN", "zh-TW", "zh-HK",
+               "ko-KR", "th-TH", "vi-VN", "id-ID", "ms-MY", "lt-LT", "lv-LV", "et-EE"}
+
+
+def _wd_locale(seg: str) -> str:
+    """A Workday address's locale segment as an offer link may keep it: '' when Workday does not serve it."""
+    return seg if seg in _WD_LOCALES else ""
 
 
 def _workday_arg(url):
@@ -1084,6 +1098,7 @@ def _workday_arg(url):
             for k, v in parse_qsl(p.query):  # '?locations=f4ab...&locations=5885...': the website's own filters
                 if re.fullmatch(r"[A-Za-z_]+", k) and re.fullmatch(r"[0-9a-f]{32}", v):
                     facets.setdefault(k, []).append(v)
+            locale = _wd_locale(locale)
             return dict(host=host, tenant=host.split(".")[0], site=seg[0], facets=facets,
                         prefix=f"/{locale + '/' if locale else ''}{seg[0]}")
     if re.fullmatch(r"wd\d+\.myworkdaysite\.com", host) and len(seg) >= 3 and seg[0] == "recruiting":

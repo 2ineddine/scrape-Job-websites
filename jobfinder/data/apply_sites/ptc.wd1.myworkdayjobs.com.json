@@ -1,0 +1,24 @@
+{
+ "1c3a57da7ed867f4": {
+  "plan": {
+   "button": "",
+   "button_role": "none",
+   "fields": [],
+   "page_kind": "offer_page"
+  }
+ },
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler",
+    "Postuler manuellement"
+   ],
+   "sign_in_way": "Se connecter avec une adresse e-mail"
+  },
+  "route": [
+   "offer_page",
+   "offer_page",
+   "sign_in"
+  ]
+ }
+}

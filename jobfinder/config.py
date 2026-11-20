@@ -143,4 +143,18 @@ def upgrade_profile(profile: dict) -> tuple[dict, bool]:
             kws += [k for k in _KEYWORDS_ADDED[r] if k not in kws]
     return {**profile, "keywords": kws, "keywords_rev": PROFILE_DEFAULT["keywords_rev"]}, True
 APPLICANT_DEFAULT = {"name": "", "address": "", "email": "", "phone": "", "linkedin": "", "website": "",
-                     "signoff": "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées."}
+                     "signoff": "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées.",
+                     # application forms ('Open and fill the application'): never a password
+                     "civility": "", "first_name": "", "last_name": "", "postal_code": "", "city": "", "country": "France",
+                     "nationality": "", "degree": "", "school": "", "grad_year": "", "field_of_study": "",
+                     "work_authorization": "",  # 'yes' (allowed to work in France) | 'visa' (needs sponsorship) | '' (not said)
+                     "how_heard": "Site carrière de l'entreprise",
+                     # questions many forms ask (20 Nov 2026): '' leaves them to the user
+                     "salary_expectation": "",  # gross per year in euros, e.g. '38000'
+                     "availability": "",  # 'immediately' | '1 month' | '3 months'
+                     "english_level": "",  # 'B2' | 'C1' | 'C2'
+                     "current_position": "",  # current or last job title ('Poste actuel')
+
+                     # accounts the app creates on the websites (a password per website, in data/accounts.json)
+                     "account_email": "",  # '' = the email above
+                     "accept_terms": False}  # the app ticks a website's terms box only when the user allowed it

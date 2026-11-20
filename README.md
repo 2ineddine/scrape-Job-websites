@@ -42,6 +42,7 @@ offer back with **evidence**: when it was published, where the job is, why it ma
 | **Built to finish** | Websites that fail get a second try, a stopped scan resumes where it stopped, and a slow server never blocks the others. |
 | **Market insight** | Skills most asked for, skills missing from your CV, companies hiring, salaries stated, every 15 days. |
 | **Cover letters** | Drafts a French cover letter in LaTeX for any offer. |
+| **Apply in one click** | Opens the offer's application form in the app's own browser window and fills in your details and a short message written for the offer. You attach your CV and letter, and you submit. |
 
 ## Quick start
 
@@ -95,6 +96,29 @@ flowchart LR
     auto --> A
     A --> R["Relevance · date · place · contract<br/>+ CV match"]
 ```
+
+## Apply in one click
+
+On an offer, **Open and fill the application** opens its application form in a browser window of the app, on your
+computer, and fills in what you saved once on the Search page: civility, name, email, phone, address, LinkedIn, website,
+education, right to work, nationality, how you heard about the offer. The form's cover-letter box gets a **short message
+written for that offer (5 lines at most)**; the full letter is the file you attach.
+
+- **Gets to the form by itself**: the offer's *Postuler / Apply* button (in a frame or behind a menu too), Workday's
+  *Apply Manually* and *Sign in with email*, sign-ins that ask the email first, pages still being built by their scripts.
+  A cookie banner is answered with its *refuse* choice.
+- **Accounts**: when a website asks for one, the app signs in with the account it holds there, or creates it with your
+  account email and a strong password made for that website alone, kept in `data/accounts.json` on your computer only.
+  A code or a password sent by email is typed in the app; a confirmation link is clicked in your mailbox.
+- **Knows each website**: what worked on a website (its buttons, its route, its fields) is kept and used at the next
+  visit, and the specifics of known websites ship with the app (`jobfinder/data/apply_sites/`). A page no rule
+  understands is read once, by Claude with an Anthropic key or by the free models of your other keys, structure only.
+- **Says it plainly** when an offer is applied to by email (with the address), starts with your CV, is gone, or when the
+  website turns the window away.
+- **Your CV** goes into a form's CV field (the one matched best to the offer); the letter file stays yours.
+- **Never** submits the application, solves a captcha or ticks a newsletter box; a website's terms box only if you
+  allow it. You check and submit.
+- It needs a screen: it works when the app runs on your own computer, not on a server or in Docker.
 
 ## How it works
 
@@ -189,6 +213,7 @@ jobfinder/
   adapters.py       20+ job-platform readers and platform detection
   browser.py        AI browser and AI page reader
   analysis.py       AI analysis pipeline and CV matching
+  apply.py          'Open and fill the application': the form-filling window
   llm.py            one interface to every AI provider, automatic model switching
   dates.py          publication dates from evidence
   classify.py       France check, title rules, offer types

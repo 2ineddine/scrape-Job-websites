@@ -1,0 +1,16 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler",
+    "Postuler manuellement"
+   ],
+   "sign_in_way": "Se connecter avec une adresse e-mail"
+  },
+  "route": [
+   "offer_page",
+   "offer_page",
+   "sign_in"
+  ]
+ }
+}

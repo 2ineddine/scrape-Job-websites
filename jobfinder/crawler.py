@@ -1147,10 +1147,13 @@ def crawl_hellowork_keywords(f, url, cfg, known, st):
                 f.note(f"Hellowork: the time for this search is up at the keyword '{w}'")
                 st.details_capped = True
                 break
+            n_pages = n_kept = 0  # ('pages' is the keyword pages' list, read below)
             for pg in hellowork_search(f, "https://www.hellowork.com/fr-fr/emploi/recherche.html?" + urlencode({"k": w}),
                                        cfg, seen, st):
                 searched += len(pg.jobs) + pg.out + pg.seen
+                n_pages, n_kept = n_pages + 1, n_kept + len(pg.jobs)
                 yield pg
+            f.note(f"Hellowork search '{w}': {n_pages} page(s), {n_kept} offer(s) kept")
         # the keyword and job-title pages match offers differently from the search (40 more offers of the last 24 hours on
         # 2026-11-12, beside the search's 191): read them too, each offer once
         known = seen

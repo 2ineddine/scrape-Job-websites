@@ -28,7 +28,8 @@ html, body, .stApp, .stApp *, [data-baseweb="popover"] *, [data-baseweb="tooltip
 #vg-tooltip-element, #vg-tooltip-element * {
   font-family: var(--font) !important;
 }
-[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"], .stApp [data-testid="stIconMaterial"] {
+[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"], .stApp [data-testid="stIconMaterial"],
+.stApp [data-testid*="DynamicIcon"] {  /* an alert's icon (st.warning(..., icon=":material/...:")) */
   font-family: "Material Symbols Rounded" !important;
 }
 body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; }

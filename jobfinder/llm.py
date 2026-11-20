@@ -253,7 +253,8 @@ def chat(provider, model, system, user, cfg, keys=None):
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     # automatic switching: another model is ready, so a busy or slow one is not waited for (a slow model timed out twice on
     # long CV-match prompts, 90 s each, then was asked again a minute later)
-    post = partial(_post, retries=1, max_wait=5, timeout=60, max_timeouts=1) if cfg.get("auto_models") else _post
+    post = partial(_post, retries=1, max_wait=5, timeout=int(cfg.get("_timeout") or 60), max_timeouts=1) \
+        if cfg.get("auto_models") else _post  # cfg['_timeout']: a short request (a page's structure) waits less
     if provider == "ollama":
         d = post(f"{base}/api/chat", {}, {"model": model, "messages": msgs, "stream": False, "format": "json"})
         return d["message"]["content"], d.get("prompt_eval_count", 0), d.get("eval_count", 0)
@@ -635,6 +636,10 @@ def call_json(user, schema, cfg, s, keys=None, system=SYSTEM):
                 pause = (3600 if re.search(r"Authentication|HTTP 40[0-9]|month", str(e))
                          else 600 if "unreachable" in str(e) else 60)  # too slow / down: not asked again for 10 minutes
                 _EXHAUSTED[step] = time.time() + pause
+                if "unreachable" in str(e):  # the service itself is down or slow: the same model under the other keys too
+                    for other in chain:
+                        if other[:2] == step[:2]:
+                            _EXHAUSTED[other] = max(_EXHAUSTED.get(other, 0), time.time() + pause)
                 if re.search(r"HTTP 40[34]", str(e)) and _GONE.search(str(e)):
                     mark_gone(step, e)
             finally:

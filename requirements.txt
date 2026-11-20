@@ -8,6 +8,7 @@ SQLAlchemy>=2.0
 pydantic>=2.7
 PyMuPDF>=1.24
 playwright>=1.45
+anthropic>=2.10  # 'Open and fill': reads a page the rules do not know, once (only with an Anthropic key)
 
 # development (tests)
 pytest>=8.0

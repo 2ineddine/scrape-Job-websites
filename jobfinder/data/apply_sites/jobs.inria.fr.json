@@ -1,0 +1,16 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Postuler à cette offre"
+   ],
+   "create_account": "Créer un compte",
+   "go_to_sign_up": "Créer votre compte !",
+   "sign_in": "Se connecter"
+  },
+  "route": [
+   "offer_page",
+   "application_form"
+  ]
+ }
+}

@@ -1,0 +1,27 @@
+{
+ "73800d215f3dd179": {
+  "plan": {
+   "button": "",
+   "button_role": "none",
+   "fields": [
+    {
+     "key": "input|tel|year|agegate-year|YYYY",
+     "role": "other"
+    },
+    {
+     "key": "input|checkbox|noAgeInputCheckbox|agegate-no-age-input|I am 21, let me in.",
+     "role": "other"
+    },
+    {
+     "key": "input|checkbox|rememberMe|age-gate-rememberme|Remember me Remember me",
+     "role": "other"
+    },
+    {
+     "key": "select|select|agegate_change_country|agegate_change_country|Change language",
+     "role": "other"
+    }
+   ],
+   "page_kind": "other"
+  }
+ }
+}

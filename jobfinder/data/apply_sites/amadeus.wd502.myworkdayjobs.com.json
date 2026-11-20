@@ -1,0 +1,17 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Apply",
+    "Apply Manually"
+   ],
+   "create_account": "Create Account"
+  },
+  "route": [
+   "offer_page",
+   "offer_page",
+   "sign_up",
+   "sign_up"
+  ]
+ }
+}

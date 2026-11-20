@@ -5,6 +5,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import threading
 from collections import Counter
 import time
@@ -16,6 +17,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from jobfinder import apply as apply_form
 from jobfinder import cv as cvm
 from jobfinder import llm
 from jobfinder import market
@@ -225,12 +227,70 @@ def step_cv(running, n):
         elif c["model"]["provider"] in llm.PAID:
             c["send_cv_remote_ok"] = st.checkbox(f"Allow sending my CV text to {c['model']['provider']} (hosted model)",
                                                  c["send_cv_remote_ok"])
-        with st.expander("Your details (only for cover letters)"):
-            ap["name"] = st.text_input("Full name", ap["name"])
+        with st.expander("Your details (cover letters and application forms)"):
+            st.caption("Used to write your cover letters and to fill application forms ('Open and fill the application' on an "
+                       "offer). Kept only on this computer. No password is ever asked or stored: you sign in on each website "
+                       "yourself, once, in the application window.")
+            if not (ap["first_name"] or ap["last_name"]) and ap["name"]:
+                ap["first_name"], ap["last_name"] = apply_form.split_name(ap["name"])
+            civ = ["", "M.", "Mme"]
+            x, y, z = st.columns([1, 2, 2])
+            ap["civility"] = x.selectbox("Civility", civ, civ.index(ap["civility"]) if ap["civility"] in civ else 0)
+            ap["first_name"], ap["last_name"] = y.text_input("First name", ap["first_name"]), z.text_input("Last name", ap["last_name"])
+            ap["name"] = f"{ap['first_name']} {ap['last_name']}".strip()
             x, y = st.columns(2)
             ap["email"], ap["phone"] = x.text_input("Email", ap["email"]), y.text_input("Phone", ap["phone"])
-            ap["address"] = st.text_area("Address", ap["address"], height=68)
-            ap["linkedin"], ap["website"] = x.text_input("LinkedIn URL", ap["linkedin"]), y.text_input("Website", ap["website"])
+            ap["address"] = st.text_area("Address (as on your letters)", ap["address"], height=68)
+            x, y, z = st.columns(3)
+            ap["postal_code"] = x.text_input("Postal code", ap["postal_code"], help="Empty: taken from the address")
+            ap["city"] = y.text_input("City", ap["city"], help="Empty: taken from the address")
+            ap["country"] = z.text_input("Country", ap["country"])
+            x, y = st.columns(2)
+            ap["linkedin"], ap["website"] = x.text_input("LinkedIn URL", ap["linkedin"]), y.text_input("Website / GitHub", ap["website"])
+            st.markdown("**Education**")
+            x, y = st.columns(2)
+            ap["degree"], ap["school"] = x.text_input("Highest degree", ap["degree"], placeholder="Master / Bac+5"), \
+                y.text_input("School / university", ap["school"])
+            ap["field_of_study"], ap["grad_year"] = x.text_input("Field of study", ap["field_of_study"]), \
+                y.text_input("Graduation year", ap["grad_year"])
+            st.markdown("**Right to work and other questions**")
+            auth = {"": "Not said (left to me)", "yes": "Yes, I can work in France", "visa": "No, I need a visa sponsorship"}
+            x, y = st.columns(2)
+            ap["work_authorization"] = x.selectbox("Right to work in France", list(auth), list(auth).index(ap["work_authorization"])
+                                                   if ap["work_authorization"] in auth else 0, format_func=auth.get)
+            ap["nationality"] = y.text_input("Nationality", ap["nationality"])
+            ap["how_heard"] = st.text_input("How did you hear about the offer?", ap["how_heard"])
+            x, y, z = st.columns(3)
+            ap["salary_expectation"] = x.text_input("Salary expectation (gross / year, €)", ap.get("salary_expectation", ""),
+                                                    placeholder="38000", help="Empty: left to you on each form")
+            avail = {"": "Not said (left to me)", "immediately": "Immediately", "1 month": "Within 1 month",
+                     "3 months": "Within 3 months"}
+            ap["availability"] = y.selectbox("Available to start", list(avail), list(avail).index(ap.get("availability", ""))
+                                             if ap.get("availability", "") in avail else 0, format_func=avail.get)
+            lvl = {"": "Not said (left to me)", "B2": "Professional (B2)", "C1": "Fluent (C1)", "C2": "Bilingual (C2)"}
+            ap["english_level"] = z.selectbox("English level", list(lvl), list(lvl).index(ap.get("english_level", ""))
+                                              if ap.get("english_level", "") in lvl else 0, format_func=lvl.get)
+            ap["current_position"] = st.text_input("Current or last position (job title)", ap.get("current_position", ""),
+                                                   placeholder="Machine Learning Engineer", help="Empty: left to you")
+            st.markdown("**Accounts on the websites**")
+            st.caption("When a website asks you to sign in, the app signs in with the account it created there, or creates "
+                       "one: this email, and a strong password made for that website alone, kept only on this computer "
+                       "(data/accounts.json). Captchas and the codes sent by email stay yours.")
+            ap["account_email"] = st.text_input("Email for website accounts", ap["account_email"], placeholder=ap["email"],
+                                                help="Empty: the email above")
+            ap["accept_terms"] = st.checkbox(
+                "Let the app accept each website's terms of use (account forms) and tick the required consent box of "
+                "application forms", bool(ap["accept_terms"]),
+                help="Off: the app leaves every terms or consent box to you. A newsletter, job-alert or partner-offers box "
+                     "is never ticked, and no form is ever sent.")
+            accounts = apply_form.load_accounts()
+            if accounts:
+                show = st.toggle("Show the passwords", False, key="show_passwords")
+                st.dataframe(pd.DataFrame([{"website": k, "email": v.get("email", ""),
+                                            "password": v.get("password", "") if show else "••••••••",
+                                            "state": ACCOUNT_STATES.get(v.get("state"), v.get("state")),
+                                            "since": (v.get("created") or "")[:16].replace("T", " ")}
+                                           for k, v in sorted(accounts.items())]), hide_index=True, width="stretch")
 
 
 COVERAGE = (("read", "read", "green"), ("partial", "partly read", "amber"), ("failed", "blocked or failed", "red"),
@@ -532,6 +592,7 @@ def job_detail(uid):
                 l1.link_button("Open the offer", link, icon=":material/open_in_new:", width="stretch", type="primary")
             if web_link(j.apply_url) and j.apply_url not in (j.url, link) and "jboffer=" not in j.apply_url:
                 l2.link_button("Apply page", j.apply_url, icon=":material/send:", width="stretch")
+            _apply_controls(s, j, link)
             a, b = st.columns(2)
             seen = (j.extra or {}).get("first_seen")
             when = (f"{j.pub_date:%d %b %Y}" if j.pub_date else "not stated by the website" +
@@ -559,6 +620,153 @@ def job_detail(uid):
         with st.expander("Description"):
             st.write(j.description or "(none)")
         _cv_and_letter(s, j)
+
+
+ACCOUNT_STATES = {"created": "created", "sent": "sent to the website", "waiting_code": "waiting for the email code",
+                  "waiting_link": "waiting for you to click the link in the confirmation email",
+                  "creating": "form filled, not sent yet", "wrong_password": "the website refuses this password"}
+FIELD_NAMES = {"first_name": "first name", "last_name": "last name", "full_name": "full name", "email": "email",
+               "phone": "phone", "address": "address", "postal_code": "postal code", "city": "city", "country": "country",
+               "linkedin": "LinkedIn", "website": "website", "civility": "civility", "nationality": "nationality",
+               "degree": "degree", "school": "school", "grad_year": "graduation year", "field_of_study": "field of study",
+               "work_authorization": "right to work", "sponsorship": "visa sponsorship", "how_heard": "how you heard",
+               "cover_letter": "cover letter", "cv": "CV (attached)"}
+
+
+def _apply_letter(s, j):
+    """The text pasted into the form's cover-letter box: a short message of 5 lines at most (greeting, 3 sentences at most,
+    signature), written once for the offer with the AI and kept. The full letter (LaTeX / PDF, below) is the file the user
+    attaches. -> (text, where it comes from)"""
+    saved = apply_form.message_path(j.uid)
+    if saved.exists():
+        return apply_form.clamp_lines(saved.read_text(encoding="utf-8")), "the short message written for this offer"
+    cvs = [x for x in s.query(CVDocument).filter_by(enabled=True).all() if x.status == "ok"]
+    if not cvs:
+        return "", "no CV uploaded, so no message was written"
+    cv = next((x for x in cvs if x.name == j.best_cv), cvs[0])
+    try:
+        msg = cvm.generate_form_message(s, j, cv, run_config(c), KEYS)
+    except llm.AIError as e:
+        return "", f"no message written: {str(e)[:150]}"
+    text = apply_form.form_message(ap, msg.lines)
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(text, encoding="utf-8")
+    return text, f"short message written for this offer ({apply_form.MAX_LINES} lines at most)"
+
+
+def _free_page_reader():
+    """A page the rules do not understand, without an Anthropic key: read once by the free models of the user's other
+    keys (structure only), from the application window's thread with its own database session (the AI cache)."""
+    cfg, keys = {**run_config(c), "_timeout": 25, "_no_wait": True}, dict(KEYS)  # the user waits at the window
+
+    def ask(prompt, schema, system):
+        with SessionLocal() as s2:
+            return llm.call_json(prompt, schema, cfg, s2, keys, system=system)
+    return ask
+
+
+def _apply_cv(uid) -> str:
+    """The CV the form's CV field takes: the one that matches the offer best, else the first CV uploaded."""
+    with SessionLocal() as s:
+        j = s.query(Job).filter_by(uid=uid).first()
+        cvs = [x for x in s.query(CVDocument).filter_by(enabled=True).all() if x.status == "ok" and x.path]
+        cv = next((x for x in cvs if j is not None and x.name == j.best_cv), cvs[0] if cvs else None)
+        return str(cv.path) if cv and Path(cv.path).exists() else ""
+
+
+def _apply_letter_pdf(uid) -> str:
+    """The offer's latest cover letter as a PDF (written and compiled on its card), for a form's letter file field."""
+    with SessionLocal() as s:
+        for cl in s.query(CoverLetter).filter_by(job_uid=uid).order_by(CoverLetter.version.desc()).all():
+            if cl.pdf_path and Path(cl.pdf_path).exists():
+                return str(cl.pdf_path)
+    return ""
+
+
+def _apply_job(uid, code=""):
+    """What the application window needs: the details, the message, the CV, the account email, the user's choices, the
+    keys."""
+    text = st.session_state.get(f"apply_letter_{uid}", ("", ""))[0]
+    with SessionLocal() as s:
+        title = (s.query(Job.title).filter(Job.uid == uid).scalar() or "")
+    values = {**apply_form.form_values(ap), "position": re.sub(r"\s+", " ", title).strip()[:120]}  # 'Poste recherché'
+    return {"values": values, "letter": text, "email": ap["account_email"] or ap["email"],
+            "allow_terms": bool(ap["accept_terms"]), "ai_key": KEYS.get("anthropic", ""), "ai_free": _free_page_reader(),
+            "cv_path": _apply_cv(uid), "letter_path": _apply_letter_pdf(uid), "code": code}
+
+
+def _apply_status(uid):
+    stt = apply_form.WINDOW.status.get(uid)
+    if not stt:
+        return
+    msg = stt.get("message", "")
+    show = {"filled": st.success, "nothing": st.info, "no_form": st.warning, "needs_user": st.warning,
+            "needs_code": st.warning, "needs_link": st.warning, "wrong_password": st.warning, "blocked": st.warning, "gone": st.warning, "by_email": st.info,
+            "error": st.error}.get(stt.get("state"), st.info)
+    show(msg + (" Filled: " + ", ".join(FIELD_NAMES.get(k, k) for k in stt.get("filled", [])) + "." if stt.get("filled") else ""),
+         icon=":material/assignment_turned_in:")
+    if stt.get("state") == "needs_code":  # here, in the part that follows the window: the box shows as soon as it is asked
+        c1, c2 = st.columns([2, 1])
+        code = c1.text_input("Code from the email", key=f"code{uid}", label_visibility="collapsed",
+                             placeholder="Code received by email")
+        if c2.button("Send the code", key=f"sc{uid}", icon=":material/send:", width="stretch") and code.strip():
+            apply_form.WINDOW.resume(uid, _apply_job(uid, code.strip()))
+    if stt.get("state") in ("needs_link", "wrong_password") and stt.get("site"):
+        # some websites email a password they made (Talentsoft, MAIF): kept with the account, then the app signs in
+        c1, c2 = st.columns([2, 1])
+        given = c1.text_input("Password from the email", key=f"pw{uid}", type="password", label_visibility="collapsed",
+                              placeholder="Password from the website's email (if it sent one)")
+        if c2.button("Use this password", key=f"up{uid}", icon=":material/key:", width="stretch") and given.strip():
+            apply_form.set_account(stt["site"], None, password=given.strip(), state="created",
+                                   password_from="the website's email")
+            apply_form.WINDOW.resume(uid, _apply_job(uid))
+        l1, l2 = st.columns([2, 1])  # or the email's link (activate the account, set its password): opened in the window
+        link = l1.text_input("Link from the email", key=f"ln{uid}", label_visibility="collapsed",
+                             placeholder="…or paste the link from the website's email")
+        if l2.button("Open it in the window", key=f"ol{uid}", icon=":material/link:", width="stretch") and link.strip():
+            if link.strip().lower().startswith("https://"):
+                apply_form.WINDOW.open_link(uid, link.strip(), _apply_job(uid))
+            else:
+                st.warning("Paste the whole link, starting with https://")
+    acct = apply_form.load_accounts().get(stt.get("site", ""))
+    if acct:
+        st.caption(f"Account on {stt['site']}: {acct.get('email', '')} · "
+                   + ACCOUNT_STATES.get(acct.get("state"), acct.get("state", "")) + " (password: Search, step 2)")
+    if stt.get("steps"):
+        st.caption("Steps: " + " → ".join(stt["steps"]))
+    text, note = st.session_state.get(f"apply_letter_{uid}", ("", ""))
+    if note:
+        with st.expander(f"Cover letter pasted in the form: {note}" if text else f"Cover letter: {note}"):
+            if text:
+                st.code(text, language=None, wrap_lines=True)
+
+
+def _apply_controls(s, j, link):
+    """'Open and fill the application': the offer opened in the app's own browser window on this computer, signed in (or
+    an account created) when the website asks, its form filled with the user's details and a short message for the
+    offer. The user attaches the CV and the letter and submits."""
+    target = j.apply_url if web_link(j.apply_url) and "jboffer=" not in j.apply_url else link
+    if not target:
+        return
+    ok, why = apply_form.can_open_window()
+    x1, x2, x3 = st.columns([2, 1.2, 1.8])
+    if x1.button("Open and fill the application", key=f"ap{j.uid}", icon=":material/assignment_turned_in:", width="stretch",
+                 disabled=not ok, help=why or ("Opens the application in a browser window of the app on this computer, signs "
+                                               "in (or creates your account) when the website asks, and fills in your "
+                                               "details and a short message for this offer. You attach your CV and letter "
+                                               "and submit yourself.")):
+        if not (ap["first_name"] and ap["last_name"] and ap["email"]):
+            st.warning("Add your first name, last name and email first: Search page, step 2, 'Your details'.")
+        else:
+            with st.spinner("Preparing the message for this offer…"):
+                st.session_state[f"apply_letter_{j.uid}"] = _apply_letter(s, j)
+            apply_form.WINDOW.open(j.uid, target, _apply_job(j.uid))
+    stt = apply_form.WINDOW.status.get(j.uid)
+    if stt:
+        if x2.button("Continue", key=f"af{j.uid}", icon=":material/play_arrow:", width="stretch",
+                     help="After you acted in the window: signed in, solved a captcha, ticked a box, opened the next step"):
+            apply_form.WINDOW.resume(j.uid, _apply_job(j.uid))
+        st.fragment(run_every=2)(_apply_status)(j.uid)
 
 
 def _cv_and_letter(s, j):

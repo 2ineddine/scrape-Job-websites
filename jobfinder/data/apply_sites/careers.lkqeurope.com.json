@@ -1,0 +1,13 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "Bewerben Sie sich ohne Registrierung"
+   ]
+  },
+  "route": [
+   "offer_page",
+   "application_form"
+  ]
+ }
+}

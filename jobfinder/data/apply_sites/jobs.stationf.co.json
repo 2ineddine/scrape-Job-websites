@@ -1,0 +1,14 @@
+{
+ "_learned": {
+  "buttons": {
+   "apply": [
+    "POSTULER"
+   ]
+  },
+  "route": [
+   "offer_page",
+   "offer_page",
+   "application_form"
+  ]
+ }
+}

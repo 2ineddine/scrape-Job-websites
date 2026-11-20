@@ -267,3 +267,20 @@ def test_a_reading_by_a_better_model_never_waits_nor_uses_a_small_model(monkeypa
     except llm.QuotaExhausted:
         pass
     assert calls == [] and time.time() - t < 0.5
+
+
+def test_a_model_whose_service_cannot_be_reached_is_not_asked_again_under_the_other_keys(monkeypatch):
+    """19 Nov 2026: Gemini's service timed out, and the same model was asked again with each of the user's other Gemini
+    keys, 60 s each, while the user waited at the application window. An unreachable service is so for every key."""
+    llm, A, s, cfg, keys, calls = _ladder(monkeypatch, {})
+
+    def chat(prov, model, system, user, cfg, keys=None):
+        calls.append((prov, model, keys[prov]))
+        if (prov, model) == BEST[:2]:
+            raise llm.AIError("Provider unreachable (ReadTimeout). Is the service running / reachable?")
+        return '{"ok": true}', 1, 1
+
+    monkeypatch.setattr(llm, "chat", chat)
+    assert llm.call_json("u1", A, cfg, s, keys).ok
+    assert [c for c in calls if c[:2] == BEST[:2]] == [("gemini", "gemini-3.6-flash", "g1")]  # once, not once per key
+    assert calls[-1][:2] == ("gemini", "gemini-3.5-flash")  # the next model of the ladder answered
